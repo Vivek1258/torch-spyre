@@ -484,6 +484,23 @@ class TestOps(TestCase):
             y1, torch.softmax(x, dim=1), rtol=self.rtol, atol=self.atol
         )
 
+    def test_normal_randn(self):
+        gen = torch.Generator().manual_seed(42)
+
+        y_spyre = torch.randn(3, 5, device="spyre", generator=gen)
+
+        # torch.Generator is stateful, hence reset 
+        gen.manual_seed(42) 
+
+        y_cpu = torch.randn(3, 5, device="cpu", generator=gen)
+
+        torch.testing.assert_close(
+            y_spyre.to("cpu"),
+            y_cpu,
+            rtol=1e-1,
+            atol=1e-1
+        )
+
     @unittest.skip("TODO: Needs more debug")
     def test_all_ops(self):
         def test_op(declaration):
