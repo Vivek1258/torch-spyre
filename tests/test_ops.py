@@ -497,8 +497,8 @@ class TestOps(TestCase):
         torch.testing.assert_close(
             y_spyre.to("cpu"),
             y_cpu,
-            rtol=1e-1,
-            atol=1e-1
+            rtol=self.rtol,
+            atol=self.atol
         )
 
     @unittest.skip("TODO: Needs more debug")
