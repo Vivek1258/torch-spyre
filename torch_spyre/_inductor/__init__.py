@@ -65,8 +65,8 @@ def _autoload():
         **kwargs
     )
     orig_compile_to_module = torch._inductor.graph.GraphLowering.compile_to_module
-    torch._inductor.graph.GraphLowering.compile_to_module = (
-        lambda graph: spyre_compile_to_module(graph, orig_compile_to_module)
+    torch._inductor.graph.GraphLowering.compile_to_module = lambda graph: (
+        spyre_compile_to_module(graph, orig_compile_to_module)
     )
     import torch._inductor.compile_fx  # noqa: F401  # usort: skip
 
