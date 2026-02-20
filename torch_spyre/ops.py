@@ -48,7 +48,6 @@ def spyre__fill_scalar(
 
 @torch.library.register_kernel("aten::normal_", ["spyre"])
 def spyre__normal_(self, mean=0.0, std=1.0, *, generator=None):
-    # TODO : Implement a native Spyre RNG kernel.
 
     # "normal_" generates a random tensor, thus copying
     # "self" back from SPYRE to CPU is not needed.

@@ -482,7 +482,7 @@ class TestOps(TestCase):
         )
 
     def test_normal_randn(self):
-        gen = torch.Generator().manual_seed(42)
+        gen = torch.manual_seed(42)
 
         y_spyre = torch.randn(3, 5, device="spyre", generator=gen)
 
