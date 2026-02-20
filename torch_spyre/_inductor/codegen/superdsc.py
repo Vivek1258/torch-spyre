@@ -18,7 +18,7 @@ from torch_spyre._inductor.constants import (
     TRANSPOSE_OP,
     CLONE_OP,
 )
-from torch_spyre._inductor import Unsupported
+from torch_spyre._inductor.errors import Unsupported
 from .compute_ops import generate_sfp_op, generate_matmul, generate_bmm
 from .data_ops import (
     generate_slice,
@@ -30,10 +30,6 @@ from .data_ops import (
 
 
 def generate_sdsc(pointers, *, op, dimensions, inputs, outputs, reduction, **kwargs):
-    if len(dimensions) > 3 and (
-        op != BATCH_MATMUL_OP and op != TRANSPOSE_OP and op != CLONE_OP
-    ):
-        raise Unsupported(f"{op} on {len(dimensions)}-D tensor")
     if op == MATMUL_REDUCTION_OP:
         return generate_matmul(
             pointers,

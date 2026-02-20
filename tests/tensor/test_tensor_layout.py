@@ -16,7 +16,12 @@
 
 import torch
 from torch.testing._internal.common_utils import run_tests, TestCase
-from torch_spyre._C import SpyreTensorLayout, DataFormats, to_with_layout
+from torch_spyre._C import (
+    SpyreTensorLayout,
+    to_with_layout,
+    get_device_dtype,
+    compute_view_layout,
+)
 
 
 class TestSpyreTensorLayout(TestCase):
@@ -53,7 +58,9 @@ class TestSpyreTensorLayout(TestCase):
 
     def test_explicit_stl_constructor(self):
         stl_x = SpyreTensorLayout([512, 256], torch.float16)
-        stl_y = SpyreTensorLayout([4, 512, 64], [1, 0, 1], DataFormats.SEN169_FP16)
+        stl_y = SpyreTensorLayout(
+            [4, 512, 64], [1, 0, 1], get_device_dtype(torch.float16)
+        )
         self.assertEqual(stl_x.dim_map, stl_y.dim_map)
         self.assertEqual(stl_x.device_size, stl_y.device_size)
 
@@ -90,7 +97,9 @@ class TestSpyreTensorLayout(TestCase):
         self.assertEqual(x, x_dev.cpu())
 
         y = torch.rand([512, 512], dtype=torch.float16)
-        y_stl = SpyreTensorLayout([8, 512, 64], [1, 0, 1], DataFormats.SEN169_FP16)
+        y_stl = SpyreTensorLayout(
+            [8, 512, 64], [1, 0, 1], get_device_dtype(torch.float16)
+        )
         y_dev = to_with_layout(y, y_stl)
         self.assertEqual(y, y_dev.cpu())
 
@@ -127,6 +136,15 @@ class TestSpyreTensorLayout(TestCase):
         self.assertEqual(x, x_dev.cpu())
         self.assertEqual(x_stl.device_size, [256, 512, 64])
         self.assertEqual(x_stl.dim_map, [1, 0, -1])
+
+    def test_compute_view_layout(self):
+        stl = SpyreTensorLayout((3, 5, 128), torch.float16)
+        unsqueeze_stl = compute_view_layout((3, 5, 128), (3, 5, 1, 128), stl)
+        self.assertEqual(unsqueeze_stl.device_size, stl.device_size)
+        self.assertEqual(unsqueeze_stl.dim_map, [1, 3, 0, 3])
+        fused_stl = compute_view_layout((3, 5, 128), (15, 1, 128), stl)
+        self.assertEqual(fused_stl.device_size, stl.device_size)
+        self.assertEqual(fused_stl.dim_map, [0, 2, 0, 2])
 
 
 if __name__ == "__main__":
