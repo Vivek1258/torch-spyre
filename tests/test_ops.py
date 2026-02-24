@@ -139,10 +139,10 @@ class TestOps(TestCase):
         y = x.to("spyre").to("cpu")
         torch.testing.assert_close(y, x, rtol=self.rtol, atol=self.atol)
 
-    @unittest.skip("View tensors do not have SpyreTensorImpl")
     def test_t_1d(self):
         x = torch.tensor([1, -2, 3], dtype=self.dtype)
         x_spyre = x.to("spyre")
+        assert x_spyre.t().device_tensor_layout() is not None
         y = x_spyre.t().to("cpu")
         torch.testing.assert_close(y, x.t(), rtol=self.rtol, atol=self.atol)
 
@@ -167,7 +167,6 @@ class TestOps(TestCase):
         y = x_spyre.transpose(0, 1).to("cpu")
         torch.testing.assert_close(y, x.transpose(0, 1), rtol=self.rtol, atol=self.atol)
 
-    @unittest.skip("TODO: Implement permute properly on eager")
     def test_permute_2d(self):
         x = torch.tensor([[1, -2, 3], [4, 5, 6]], dtype=self.dtype)
         x_spyre = x.to("spyre")
@@ -387,7 +386,6 @@ class TestOps(TestCase):
         z = torch.mm(x_spyre, y_spyre).to("cpu")
         torch.testing.assert_close(z, torch.mm(x, y), rtol=self.rtol, atol=self.atol)
 
-    @unittest.skip("TODO: bmm.out not implemented yet in eager")
     def test_bmm_ab_bc(self):
         B = 1
         x = torch.randn(B * self.mm_a * self.mm_b, dtype=self.dtype).view(
@@ -401,7 +399,6 @@ class TestOps(TestCase):
         z = torch.bmm(x_spyre, y_spyre).to("cpu")
         torch.testing.assert_close(z, torch.bmm(x, y), rtol=self.rtol, atol=self.atol)
 
-    @unittest.skip("TODO: bmm.out not implemented yet in eager")
     def test_bmm_cb_ba(self):
         B = 1
         x = torch.randn(B * self.mm_c * self.mm_b, dtype=self.dtype).view(
@@ -497,6 +494,17 @@ class TestOps(TestCase):
             rtol=self.rtol,
             atol=self.atol
         )
+    def test_zeros(self):
+        x_spyre = torch.zeros(3, 64, device="spyre", dtype=self.dtype)
+        x = torch.zeros(3, 64, dtype=self.dtype)
+        torch.testing.assert_close(x_spyre.to("cpu"), x, rtol=self.rtol, atol=self.atol)
+
+    def test_zeros_padded_last_dim(self):
+        # Test zeros with last dimension requiring padding (not 64)
+        x_spyre = torch.zeros(3, 50, device="spyre", dtype=self.dtype)
+        x = torch.zeros(3, 50, dtype=self.dtype)
+        torch.testing.assert_close(x_spyre.to("cpu"), x, rtol=self.rtol, atol=self.atol)
+
     # --- View layout: identity ---
 
     def test_view_identity_2d(self):
