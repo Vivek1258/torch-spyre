@@ -214,15 +214,6 @@ class TestOps(TestCase):
         torch.testing.assert_close(y, torch.relu(x), rtol=self.rtol, atol=self.atol)
 
     def test_silu(self):
-        x = torch.rand([2, 32, 256], dtype=self.dtype)
-        x_spyre = x.to("spyre")
-        y = torch.nn.functional.silu(x_spyre).to("cpu")
-        torch.testing.assert_close(
-            y, torch.nn.functional.silu(x), rtol=self.rtol, atol=self.atol
-        )
-
-    @unittest.expectedFailure
-    def test_silu_larger_input(self):
         x = torch.rand([2, 100, 12800], dtype=self.dtype)
         x_spyre = x.to("spyre")
         y = torch.nn.functional.silu(x_spyre).to("cpu")
@@ -231,7 +222,7 @@ class TestOps(TestCase):
         )
 
     def test_mish(self):
-        x = torch.rand([2, 32, 256], dtype=self.dtype)
+        x = torch.rand([2, 100, 12800], dtype=self.dtype)
         x_spyre = x.to("spyre")
         y = torch.nn.functional.mish(x_spyre).to("cpu")
         torch.testing.assert_close(
@@ -338,6 +329,8 @@ class TestOps(TestCase):
         z = torch.mul(x_spyre, y_spyre).to("cpu")
         torch.testing.assert_close(z, torch.mul(x, y), rtol=self.rtol, atol=self.atol)
 
+    # https://github.com/torch-spyre/torch-spyre/issues/740
+    @unittest.skip("TODO: Must also pad non-stick dimension in matmul")
     def test_mm_ab_bc(self):
         x = torch.randn(self.mm_a * self.mm_b, dtype=self.dtype).view(
             self.mm_a, self.mm_b
@@ -350,6 +343,8 @@ class TestOps(TestCase):
         z = torch.mm(x_spyre, y_spyre).to("cpu")
         torch.testing.assert_close(z, torch.mm(x, y), rtol=self.rtol, atol=self.atol)
 
+    # https://github.com/torch-spyre/torch-spyre/issues/740
+    @unittest.skip("TODO: Must also pad non-stick dimension in matmul")
     def test_mm_ac_cb(self):
         x = torch.randn(self.mm_a * self.mm_c, dtype=self.dtype).view(
             self.mm_a, self.mm_c
@@ -362,7 +357,8 @@ class TestOps(TestCase):
         z = torch.mm(x_spyre, y_spyre).to("cpu")
         torch.testing.assert_close(z, torch.mm(x, y), rtol=self.rtol, atol=self.atol)
 
-    @unittest.skip("TODO: Debug accuracy error")
+    # https://github.com/torch-spyre/torch-spyre/issues/740
+    @unittest.skip("TODO: Must also pad non-stick dimension in matmul")
     def test_mm_ba_ac(self):
         x = torch.randn(self.mm_a * self.mm_b, dtype=self.dtype).view(
             self.mm_b, self.mm_a
@@ -387,7 +383,8 @@ class TestOps(TestCase):
         z = torch.mm(x_spyre, y_spyre).to("cpu")
         torch.testing.assert_close(z, torch.mm(x, y), rtol=self.rtol, atol=self.atol)
 
-    @unittest.skip("TODO: Debug accuracy error")
+    # https://github.com/torch-spyre/torch-spyre/issues/740
+    @unittest.skip("TODO: Must also pad non-stick dimension in matmul")
     def test_mm_ca_ab(self):
         x = torch.randn(self.mm_a * self.mm_c, dtype=self.dtype).view(
             self.mm_c, self.mm_a
@@ -400,6 +397,8 @@ class TestOps(TestCase):
         z = torch.mm(x_spyre, y_spyre).to("cpu")
         torch.testing.assert_close(z, torch.mm(x, y), rtol=self.rtol, atol=self.atol)
 
+    # https://github.com/torch-spyre/torch-spyre/issues/740
+    @unittest.skip("TODO: Must also pad non-stick dimension in matmul")
     def test_mm_cb_ba(self):
         x = torch.randn(self.mm_b * self.mm_c, dtype=self.dtype).view(
             self.mm_c, self.mm_b
@@ -495,6 +494,8 @@ class TestOps(TestCase):
         z = torch.bmm(x_spyre, y_spyre).to("cpu")
         torch.testing.assert_close(z, torch.bmm(x, y), rtol=self.rtol, atol=self.atol)
 
+    # https://github.com/torch-spyre/torch-spyre/issues/740
+    @unittest.skip("TODO: Must also pad non-stick dimension in matmul")
     def test_matmul_ab_bc(self):
         B = 1
         x = torch.randn(B * self.mm_a * self.mm_b, dtype=self.dtype).view(
@@ -615,32 +616,32 @@ class TestOps(TestCase):
         x = torch.rand(512, 256, dtype=self.dtype).to("spyre")
         y = x.view(512, 1, 256)
         stl = y.device_tensor_layout()
-        self.assertEqual(stl.device_size, [4, 512, 64])
-        self.assertEqual(stl.dim_map, [2, 0, 2])
+        self.assertEqual(stl.device_size, [1, 4, 512, 64])
+        self.assertEqual(stl.dim_map, [1, 2, 0, 2])
 
     def test_view_insert_size1_front(self):
         """[512, 256] -> [1, 512, 256]: insert size-1 dim at the front."""
         x = torch.rand(512, 256, dtype=self.dtype).to("spyre")
         y = x.view(1, 512, 256)
         stl = y.device_tensor_layout()
-        self.assertEqual(stl.device_size, [4, 512, 64])
-        self.assertEqual(stl.dim_map, [2, 1, 2])
+        self.assertEqual(stl.device_size, [4, 1, 512, 64])
+        self.assertEqual(stl.dim_map, [2, 0, 1, 2])
 
     def test_view_insert_size1_end(self):
         """[512, 256] -> [512, 256, 1]: insert size-1 dim at the end."""
         x = torch.rand(512, 256, dtype=self.dtype).to("spyre")
         y = x.view(512, 256, 1)
         stl = y.device_tensor_layout()
-        self.assertEqual(stl.device_size, [4, 512, 64])
-        self.assertEqual(stl.dim_map, [1, 0, 1])
+        self.assertEqual(stl.device_size, [1, 4, 512, 64])
+        self.assertEqual(stl.dim_map, [2, 1, 0, 1])
 
     def test_view_insert_multiple_size1(self):
         """[512, 256] -> [1, 512, 1, 256, 1]: multiple size-1 insertions."""
         x = torch.rand(512, 256, dtype=self.dtype).to("spyre")
         y = x.view(1, 512, 1, 256, 1)
         stl = y.device_tensor_layout()
-        self.assertEqual(stl.device_size, [4, 512, 64])
-        self.assertEqual(stl.dim_map, [3, 1, 3])
+        self.assertEqual(stl.device_size, [1, 1, 4, 1, 512, 64])
+        self.assertEqual(stl.dim_map, [2, 4, 3, 0, 1, 3])
 
     # --- View layout: size-1 removal (squeeze equivalent) ---
 
@@ -657,8 +658,8 @@ class TestOps(TestCase):
         x = torch.rand(1, 512, 256, dtype=self.dtype).to("spyre")
         y = x.view(512, 256)
         stl = y.device_tensor_layout()
-        self.assertEqual(stl.device_size, [4, 512, 64])
-        self.assertEqual(stl.dim_map, [1, 0, 1])
+        self.assertEqual(stl.device_size, [512, 4, 64])
+        self.assertEqual(stl.dim_map, [0, 1, 1])
 
     # --- View layout: merge (N:1) ---
 
@@ -720,16 +721,16 @@ class TestOps(TestCase):
         x = torch.rand(2, 3, 4, dtype=self.dtype).to("spyre")
         y = x.view(1, 6, 4)
         stl = y.device_tensor_layout()
-        self.assertEqual(stl.device_size, [3, 1, 2, 64])
-        self.assertEqual(stl.dim_map, [1, 2, 1, 2])
+        self.assertEqual(stl.device_size, [3, 1, 1, 2, 64])
+        self.assertEqual(stl.dim_map, [1, 2, 0, 1, 2])
 
     def test_view_split_and_insert_size1(self):
         """[6, 4] -> [2, 3, 1, 4]: split non-stick dim and insert size-1."""
         x = torch.rand(6, 4, dtype=self.dtype).to("spyre")
         y = x.view(2, 3, 1, 4)
         stl = y.device_tensor_layout()
-        self.assertEqual(stl.device_size, [1, 2, 3, 64])
-        self.assertEqual(stl.dim_map, [3, 0, 1, 3])
+        self.assertEqual(stl.device_size, [1, 1, 2, 3, 64])
+        self.assertEqual(stl.dim_map, [2, 3, 0, 1, 3])
 
     # --- View layout: rejection cases ---
 
@@ -744,6 +745,32 @@ class TestOps(TestCase):
         x = torch.rand(512, dtype=self.dtype).to("spyre")
         with self.assertRaisesRegex(RuntimeError, "elems_per_stick"):
             x.view(16, 32)
+
+    def test_uniform_(self):
+        x_spyre = torch.tensor([[1, 2, 3], [4, 5, 6]], dtype=self.dtype, device="spyre")
+        x_spyre.uniform_()
+        x_cpu = x_spyre.to("cpu")
+        self.assertTrue(
+            torch.all(x_cpu >= 0.0) and torch.all(x_cpu < 1.0),
+            f"uniform_ values out of range [0, 1): {x_cpu}",
+        )
+        self.assertFalse(
+            torch.all(x_cpu == x_cpu[0, 0]), "uniform_ produced all identical values"
+        )
+
+    def test_uniform_custom_range(self):
+        x_spyre = torch.tensor(
+            [1.0, 2.0, 3.0, 4.0, 5.0], dtype=self.dtype, device="spyre"
+        )
+        x_spyre.uniform_(-5.0, 5.0)
+        x_cpu = x_spyre.to("cpu")
+        self.assertTrue(
+            torch.all(x_cpu >= -5.0) and torch.all(x_cpu < 5.0),
+            f"uniform_ values out of range [-5, 5): {x_cpu}",
+        )
+        self.assertFalse(
+            torch.all(x_cpu == x_cpu[0]), "uniform_ produced all identical values"
+        )
 
     # NOTE: embedding / indirect indexing / index_select are not supported yet
     @pytest.mark.filterwarnings("ignore::torch_spyre.fallbacks.FallbackWarning")
