@@ -98,7 +98,6 @@ def spyre__fill_scalar(
 
 @torch.library.register_kernel("aten::normal_", ["spyre"])
 def spyre__normal_(self, mean=0.0, std=1.0, *, generator=None):
-
     # "normal_" generates a random tensor, thus copying
     # "self" back from SPYRE to CPU is not needed.
     # cpu_tmp = self.to("cpu")
@@ -108,6 +107,7 @@ def spyre__normal_(self, mean=0.0, std=1.0, *, generator=None):
     cpu_tmp.normal_(mean, std, generator=generator)
     self.copy_(cpu_tmp)
     return self
+
 
 @torch.library.register_kernel("aten::permute", ["spyre"])  # type:ignore
 def spyre__permute(self: torch.Tensor, dims: list[int]) -> torch.Tensor:
