@@ -34,6 +34,10 @@ from .errors import Unsupported
 from .constants import MATMUL_REDUCTION_OP, BATCH_MATMUL_OP
 from .ir import FixedTiledLayout
 from .pass_utils import SchedNodeArg, get_mem_deps
+from .logging_utils import get_inductor_logger
+import logging
+
+logger = get_inductor_logger("core_division")
 
 
 aten = torch.ops.aten
@@ -190,6 +194,13 @@ def divide_pointwise_op(n: SchedulerNode, args: list[SchedNodeArg], max_cores):
             (1 if i != stick_host_dim else num_cores) for i in range(ndim)
         ]
 
+        # Consolidated DEBUG log for pointwise work division
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                f"pointwise work_division {n.node.get_name()}: cores={num_cores}, "
+                f"stick_dim={stick_host_dim}, num_sticks={num_sticks}, op_dim_splits={n.op_dim_splits}"
+            )
+
 
 def divide_reduction_op(n: SchedulerNode, args: list[SchedNodeArg], max_cores):
     red: Reduction = n.node.data
@@ -219,6 +230,12 @@ def divide_reduction_op(n: SchedulerNode, args: list[SchedNodeArg], max_cores):
         # K (index 1, "in") is never split
         n.op_dim_splits = [splits[0], 1, splits[1]]  # [M_split, K=1, N_split]
 
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                f"matmul work_division: M={M}, N={N}, cores={n.n_cores_used}, "
+                f"splits=[M={splits[0]}, K=1, N={splits[1]}], op_dim_splits={n.op_dim_splits}"
+            )
+
     if red.reduction_type == BATCH_MATMUL_OP:
         assert len(args) == 2, "bmm has exactly 2 input args"
 
@@ -245,6 +262,12 @@ def divide_reduction_op(n: SchedulerNode, args: list[SchedNodeArg], max_cores):
             # Store op_dim_splits directly matching dim_labels = ["x", "mb", "in", "out"]
             # K (index 2, "in") is never split
             n.op_dim_splits = [splits[0], splits[1], 1, splits[2]]  # [B, M, K=1, N]
+
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    f"bmm_3d work_division: B={B}, M={M}, N={N}, cores={n.n_cores_used}, "
+                    f"splits=[B={splits[0]}, M={splits[1]}, K=1, N={splits[2]}], op_dim_splits={n.op_dim_splits}"
+                )
 
         elif num_dims == 4:
             # 4D BMM: [B1, B2, M, K] @ [B1, B2, K, N] --> [B1, B2, M, N]
@@ -274,6 +297,12 @@ def divide_reduction_op(n: SchedulerNode, args: list[SchedNodeArg], max_cores):
                 splits[3],
             ]  # [B1, B2, M, K=1, N]
 
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug(
+                    f"bmm_4d work_division: B1={B1}, B2={B2}, M={M}, N={N}, cores={n.n_cores_used}, "
+                    f"splits=[B1={splits[0]}, B2={splits[1]}, M={splits[2]}, K=1, N={splits[3]}], op_dim_splits={n.op_dim_splits}"
+                )
+
         else:
             raise RuntimeError(f"Unsupported BMM dimension count: {num_dims}")
 
@@ -281,7 +310,7 @@ def divide_reduction_op(n: SchedulerNode, args: list[SchedNodeArg], max_cores):
 def core_division_planning(
     nodes: list[BaseSchedulerNode],
 ) -> list[BaseSchedulerNode]:
-    # Nodes are in topological order (guarenteed by caller).
+    # Nodes are in topological order (guaranteed by caller).
     max_cores = int(os.getenv("SENCORES", "32"))
     if max_cores > 32 or max_cores < 1:
         raise Unsupported(f"invalid SENCORES value {max_cores}")
@@ -308,10 +337,10 @@ def core_division_planning(
                 # Core division not supported on fallback kernels
                 pass
             else:
-                print(f"Warning: unhandled node type {type(n.node)}")
+                logger.warning(f"unhandled node type {type(n.node)}")
         elif isinstance(n, NopKernelSchedulerNode):
             pass
         else:
-            print(f"Warning: unhandled scheduler node type {type(n)}")
+            logger.warning(f"unhandled scheduler node type {type(n)}")
 
     return nodes
