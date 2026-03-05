@@ -111,7 +111,7 @@ class UnimplementedOp(RValue):
 @dataclass(frozen=True)
 class DimensionInfo:
     var: sympy.Symbol
-    numel: int
+    numel: sympy.Expr
 
 
 class SpyreOpFuncs:
@@ -214,6 +214,24 @@ class SpyreOpFuncs:
 
     @staticmethod
     def softplus(x, beta, threshold):
+        # Debug tracing for dynamic shape propagation
+        print(f"\n{'='*80}")
+        print(f"[OPS_HANDLER] SpyreOpFuncs.softplus")
+        print(f"[OPS_HANDLER] x type: {type(x)}")
+        print(f"[OPS_HANDLER] beta: {beta}, type: {type(beta)}")
+        print(f"[OPS_HANDLER] threshold: {threshold}, type: {type(threshold)}")
+        
+        if hasattr(x, 'layout'):
+            print(f"[OPS_HANDLER] x.layout.size: {x.layout.size}")
+            print(f"[OPS_HANDLER] x.layout.size types: {[type(s) for s in x.layout.size]}")
+        
+        if hasattr(x, 'index'):
+            print(f"[OPS_HANDLER] x.index: {x.index}")
+            if hasattr(x.index, 'free_symbols'):
+                print(f"[OPS_HANDLER] x.index.free_symbols: {x.index.free_symbols}")
+        
+        print(f"{'='*80}\n")
+        
         op_info = {
             "constants": {
                 "softplusBeta": beta,
@@ -326,11 +344,22 @@ class SpyreKernelOpsHandler(DefaultHandler):
 def create_tensor_arg(
     is_input: bool, arg_index: int, layout: FixedTiledLayout
 ) -> TensorArg:
+    # Convert symbolic sizes to concrete values for TensorArg
+    from sympy import Expr
+    concrete_size = []
+    for dim in layout.size:
+        if isinstance(dim, Expr):
+            # Evaluate symbolic expression to concrete value
+            concrete_val = V.graph.sizevars.size_hint(dim)
+            concrete_size.append(concrete_val)
+        else:
+            concrete_size.append(int(dim))
+    
     return TensorArg(
         is_input,
         arg_index,
         layout.dtype,
-        layout.size,
+        torch.Size(concrete_size),
         layout.allocation,
         layout.device_layout,
     )
@@ -344,6 +373,22 @@ def create_kernel_spec(
     scales: list[list[int]],
     op_info: dict[str, Any],
 ) -> KernelSpec:
+    # Debug tracing
+    print(f"\n{'='*80}")
+    print(f"[CREATE_SPEC] create_kernel_spec")
+    print(f"[CREATE_SPEC] op: {op}")
+    print(f"[CREATE_SPEC] is_reduction: {is_reduction}")
+    print(f"[CREATE_SPEC] DimensionInfo list:")
+    for idx, dim in enumerate(dims):
+        print(f"[CREATE_SPEC]   dim[{idx}]: var={dim.var}, numel={dim.numel}, numel type={type(dim.numel)}")
+    print(f"[CREATE_SPEC] args count: {len(args)}")
+    print(f"[CREATE_SPEC] args types: {[type(arg) for arg in args]}") # KERNEL SPEC RECIEVES THE ACTUAL ARGS NOT CONSTANT ARGS 
+    
+    dimensions_list = [d.numel for d in dims]
+    print(f"[CREATE_SPEC] dimensions (from dims): {dimensions_list}")
+    print(f"[CREATE_SPEC] dimensions types: {[type(d) for d in dimensions_list]}")
+    print(f"{'='*80}\n")
+    
     for arg in args:
         if arg.dtype == torch.float32 and op not in SPYRE_FP32_OPS:
             raise Unsupported(f"{op} on {arg.dtype} dtype")
@@ -382,7 +427,24 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
         layout = buf.get_layout()
         if not isinstance(layout, FixedTiledLayout):
             raise Unsupported(f"{name} does not have FixedTiledLayout")
+        
+        # Debug tracing before sympy_subs
+        print(f"\n{'='*80}")
+        print(f"[KERNEL_LOAD] SpyreKernel.load")
+        print(f"[KERNEL_LOAD] buffer name: {name}")
+        print(f"[KERNEL_LOAD] index (before subs): {index}")
+        if hasattr(index, 'free_symbols'):
+            print(f"[KERNEL_LOAD] index.free_symbols: {index.free_symbols}")
+        print(f"[KERNEL_LOAD] layout.size: {layout.size}")
+        print(f"[KERNEL_LOAD] layout.size types: {[type(s) for s in layout.size]}")
+        
         index = sympy_subs(index, V.graph.sizevars.precomputed_replacements)
+        
+        # Debug tracing after sympy_subs
+        print(f"[KERNEL_LOAD] index (after subs): {index}")
+        if hasattr(index, 'free_symbols'):
+            print(f"[KERNEL_LOAD] index.free_symbols (after subs): {index.free_symbols}")
+        print(f"{'='*80}\n")
 
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(
@@ -404,6 +466,16 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
         layout = buf.get_layout()
         if not isinstance(layout, FixedTiledLayout):
             raise Unsupported(f"{name} does not have FixedTiledLayout")
+        
+        # Debug tracing
+        print(f"\n{'='*80}")
+        print(f"[KERNEL_STORE] SpyreKernel.store")
+        print(f"[KERNEL_STORE] buffer name: {name}")
+        print(f"[KERNEL_STORE] index: {index}")
+        print(f"[KERNEL_STORE] value type: {type(value)}")
+        print(f"[KERNEL_STORE] layout.size: {layout.size}")
+        print(f"[KERNEL_STORE] layout.size types: {[type(s) for s in layout.size]}")
+        
         index = sympy_subs(index, V.graph.sizevars.precomputed_replacements)
         dst = TensorAccess(name, index, layout).unsqueeze_if_sparse()
         actuals = self.args.python_argdefs()[1]
@@ -428,7 +500,15 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
             self.kernel_specs.append(value)
         elif isinstance(value, PointwiseOp):
             # Pointwise compute ops are defined by the output's index
+            print(f"[KERNEL_STORE] Processing PointwiseOp: {value.op}")
+            
             di = self.derive_dim_info(dst)
+            
+            print(f"[KERNEL_STORE] DimensionInfo from derive_dim_info:")
+            for idx, dim in enumerate(di):
+                print(f"[KERNEL_STORE]   dim[{idx}]: var={dim.var}, numel={dim.numel}, numel type={type(dim.numel)}")
+            print(f"{'='*80}\n")
+            
             args: list[TensorArg | ConstantArg] = []
             scales = []
             for input in value.arguments:
@@ -630,7 +710,7 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
                 if di_x == di_y[0:2]:
                     di = [
                         di_x[0],
-                        DimensionInfo(wildcard_symbol(1), 1),
+                        DimensionInfo(wildcard_symbol(1), sympy.Integer(1)),
                         di_x[1],
                         di_y[2],
                     ]
@@ -638,19 +718,19 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
                     di = [
                         di_x[0],
                         di_x[1],
-                        DimensionInfo(wildcard_symbol(1), 1),
+                        DimensionInfo(wildcard_symbol(1), sympy.Integer(1)),
                         di_y[2],
                     ]
                 else:
                     di = [
-                        DimensionInfo(wildcard_symbol(1), 1),
+                        DimensionInfo(wildcard_symbol(1), sympy.Integer(1)),
                         di_x[0],
                         di_x[1],
                         di_y[2],
                     ]
             elif len(di_x) == 3 and len(di_y) == 2:
                 if di_x[:2] == di_y:
-                    di = [di_x[0], di_x[1], di_x[2], DimensionInfo(self.wildcard, 1)]
+                    di = [di_x[0], di_x[1], di_x[2], DimensionInfo(self.wildcard, sympy.Integer(1))]
                 elif di_x[2] == di_y[0]:
                     di = [di_x[0], di_x[1], di_x[2], di_y[1]]
                 else:
@@ -659,20 +739,20 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
                 if di_x == di_y:
                     di = [
                         di_x[0],
-                        DimensionInfo(wildcard_symbol(1), 1),
+                        DimensionInfo(wildcard_symbol(1), sympy.Integer(1)),
                         di_x[1],
-                        DimensionInfo(wildcard_symbol(2), 1),
+                        DimensionInfo(wildcard_symbol(2), sympy.Integer(1)),
                     ]
                 elif di_x[0] == di_y[0]:
                     di = [
                         di_x[0],
                         di_x[1],
-                        DimensionInfo(wildcard_symbol(1), 1),
+                        DimensionInfo(wildcard_symbol(1), sympy.Integer(1)),
                         di_y[1],
                     ]
                 else:
                     di = [
-                        DimensionInfo(wildcard_symbol(1), 1),
+                        DimensionInfo(wildcard_symbol(1), sympy.Integer(1)),
                         di_x[0],
                         di_x[1],
                         di_y[1],
@@ -733,14 +813,36 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
         """
         Return the iteration space implied by the tensor access
         """
+        # Debug tracing
+        print(f"\n{'='*80}")
+        print(f"[DERIVE_DIM] derive_dim_info")
+        print(f"[DERIVE_DIM] access.name: {access.name}")
+        print(f"[DERIVE_DIM] access.index: {access.index}")
+        print(f"[DERIVE_DIM] access.layout.size: {access.layout.size}")
+        print(f"[DERIVE_DIM] access.layout.size types: {[type(s) for s in access.layout.size]}")
+        
         var_ranges = self.var_ranges()
+        print(f"[DERIVE_DIM] var_ranges: {var_ranges}")
+        print(f"[DERIVE_DIM] var_ranges types: {[(k, type(v)) for k, v in var_ranges.items()]}")
+        
         if var_ranges:
             dim_map = map_dims_to_vars(access.layout, access.index)
-            return [
-                DimensionInfo(dim_map[v], int(var_ranges.get(dim_map[v], 1)))
+            print(f"[DERIVE_DIM] dim_map: {dim_map}")
+            
+            result = [
+                DimensionInfo(dim_map[v], var_ranges[dim_map[v]])
                 for v in sorted(dim_map)
             ]
+            
+            print(f"[DERIVE_DIM] Final DimensionInfo list:")
+            for idx, dim in enumerate(result):
+                print(f"[DERIVE_DIM]   dim[{idx}]: var={dim.var}, numel={dim.numel}, numel type={type(dim.numel)}")
+            print(f"{'='*80}\n")
+            
+            return result
         else:
+            print(f"[DERIVE_DIM] No var_ranges, returning wildcard")
+            print(f"{'='*80}\n")
             return [DimensionInfo(wildcard_symbol(0), 1)]
 
     def codegen_kernel(self):
@@ -762,11 +864,22 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
         if isinstance(ks, UnimplementedOp):
             buf.writeline(f"UnimplementedOp(op='{ks.op}')")
         else:
+            # Convert symbolic dimensions to concrete values for code generation
+            from sympy import Expr
+            concrete_dims = []
+            for dim in ks.dimensions:
+                if isinstance(dim, Expr):
+                    # Evaluate symbolic expression to concrete value
+                    concrete_val = V.graph.sizevars.size_hint(dim)
+                    concrete_dims.append(concrete_val)
+                else:
+                    concrete_dims.append(int(dim))
+            
             buf.writeline("KernelSpec(")
             with buf.indent():
                 buf.writeline(f"op='{ks.op}',")
                 buf.writeline(f"is_reduction={ks.is_reduction},")
-                buf.writeline(f"dimensions={ks.dimensions!r},")
+                buf.writeline(f"dimensions={concrete_dims!r},")
                 buf.writeline(f"scales={ks.scales!r},")
                 buf.writeline(f"op_info={ks.op_info!r},")
                 buf.writeline("args=[")
