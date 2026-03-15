@@ -646,6 +646,35 @@ class TestOps(TestCase):
 
         torch.testing.assert_close(cpu_y, spyre_y, rtol=self.rtol, atol=self.atol)
 
+    def test_mul_out_zero_size_spyre_to_cpu(self):
+        x_spyre = torch.empty(0, dtype=self.dtype, device="spyre")
+        y_spyre = torch.empty(0, dtype=self.dtype, device="spyre")
+
+        out_spyre = torch.empty(0, dtype=self.dtype, device="spyre")
+
+        torch.ops.aten.mul.out(x_spyre, y_spyre, out=out_spyre)
+
+        # Trigger Spyre → CPU copy
+        out_cpu = out_spyre.to("cpu")
+
+        self.assertEqual(out_cpu.numel(), 0)
+
+    def test_mul_out_zero_size_cpu_to_spyre(self):
+        x = torch.empty(0, dtype=self.dtype)
+        y = torch.empty(0, dtype=self.dtype)
+
+        x_spyre = x.to("spyre")
+        y_spyre = y.to("spyre")
+
+        out_spyre = torch.empty(0, dtype=self.dtype, device="spyre")
+
+        torch.ops.aten.mul.out(x_spyre, y_spyre, out=out_spyre)
+
+        # Copy back to verify correctness
+        out_cpu = out_spyre.to("cpu")
+
+        self.assertEqual(out_cpu.numel(), 0)
+
     @unittest.skip("TODO: Needs more debug")
     def test_all_ops(self):
         def test_op(declaration):
