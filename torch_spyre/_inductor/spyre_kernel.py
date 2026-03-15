@@ -53,6 +53,16 @@ import logging
 logger = get_inductor_logger("spyre_kernel")
 
 
+def _codegen_sympy_expr(expr: sympy.Expr) -> str:
+    if isinstance(expr, sympy.Expr):
+        return f"sympy.sympify({str(expr)!r})"
+    return repr(expr)
+
+
+def _codegen_iteration_space(iteration_space: Sequence[sympy.Expr]) -> str:
+    return "[" + ", ".join(_codegen_sympy_expr(dim) for dim in iteration_space) + "]"
+
+
 class RValue(ABC):
     """
     An RValue is an expression that can appear on the right hand side of an assignment.
@@ -116,7 +126,7 @@ class UnimplementedOp(RValue):
 @dataclass(frozen=True)
 class DimensionInfo:
     var: sympy.Symbol
-    numel: int
+    numel: sympy.Expr
 
 
 class SpyreOpFuncs:
@@ -673,12 +683,18 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
     def derive_dim_info(self, access: TensorAccess) -> list[DimensionInfo]:
         """
         Return the iteration space implied by the tensor access
+        In case of symbolic shapes, 
+        access = TensorAccess(
+            name="arg2_1",
+            index=x0 + s98*x1,  # Index expression
+            layout=[s97, s98]    # Tensor shape
+        )
         """
         var_ranges = self.var_ranges()
         if var_ranges:
             dim_map = map_dims_to_vars(access.layout, access.index)
             return [
-                DimensionInfo(dim_map[v], int(var_ranges.get(dim_map[v], 1)))
+                DimensionInfo(dim_map[v], var_ranges.get(dim_map[v], 1))
                 for v in sorted(dim_map)
             ]
         else:
@@ -712,7 +728,9 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
                     with buf.indent():
                         buf.writeline(f"op='{op_spec.op}',")
                         buf.writeline(f"is_reduction={op_spec.is_reduction},")
-                        buf.writeline(f"iteration_space={op_spec.iteration_space!r},")
+                        buf.writeline(
+                            f"iteration_space={_codegen_iteration_space(op_spec.iteration_space)},"
+                        )
                         buf.writeline(f"op_info={op_spec.op_info!r},")
                         buf.writeline("args=[")
                         with buf.indent():

@@ -14,10 +14,13 @@
 
 import json
 import tempfile
+import sympy
+from sympy import Expr
 from typing import Any, Union
 import os
 import subprocess
 
+from torch._inductor.virtualized import V
 from torch._inductor.runtime.runtime_utils import cache_dir
 from torch_spyre._C import convert_artifacts
 from torch_spyre._inductor.codegen.superdsc import generate_sdsc
@@ -29,6 +32,70 @@ from .kernel_runner import SpyreSDSCKernelRunner, SpyreUnimplementedRunner
 logger = get_inductor_logger("sdsc_compile")
 
 _argument_names = ["arg0", "arg1", "arg2", "arg3", "arg4", "arg5", "arg6"]
+
+
+def _collect_sizevar_symbols_by_name() -> dict[str, sympy.Symbol]:
+    """
+    Collect the canonical sizevar symbols currently known to inductor, indexed by name.
+    """
+    symbols: dict[str, sympy.Symbol] = {}
+    sizevars = V.graph.sizevars
+
+    def _add_from_mapping(mapping):
+        if isinstance(mapping, dict):
+            for key in mapping.keys():
+                if isinstance(key, sympy.Symbol) and key.name not in symbols:
+                    symbols[key.name] = key
+
+    _add_from_mapping(getattr(sizevars, "var_to_val", None))
+    _add_from_mapping(getattr(sizevars, "precomputed_replacements", None))
+
+    shape_env = getattr(sizevars, "shape_env", None)
+    if shape_env is not None:
+        _add_from_mapping(getattr(shape_env, "var_to_val", None))
+        _add_from_mapping(getattr(shape_env, "replacements", None))
+
+    return symbols
+
+
+def _concretize_dimension(dim: Expr | int) -> int:
+    if not isinstance(dim, Expr):
+        return int(dim)
+
+    sizevars = V.graph.sizevars
+    expr: Expr = dim
+
+    if expr.free_symbols:
+        known_symbols = _collect_sizevar_symbols_by_name()
+        replacements = {
+            sym: known_symbols[sym.name]
+            for sym in expr.free_symbols
+            if sym.name in known_symbols
+        }
+        if replacements:
+            expr = expr.xreplace(replacements)
+
+    try:
+        return int(sizevars.size_hint(expr))
+    except Exception:
+        pass
+
+    if not expr.free_symbols:
+        return int(expr)
+
+    symbol_hints: dict[sympy.Symbol, int] = {}
+    for sym in expr.free_symbols:
+        try:
+            symbol_hints[sym] = int(sizevars.size_hint(sym))
+        except Exception:
+            continue
+
+    if symbol_hints:
+        reduced = expr.subs(symbol_hints)
+        if not reduced.free_symbols:
+            return int(reduced)
+
+    raise TypeError(f"Cannot concretize symbolic iteration dimension: {expr}")
 
 
 def get_output_dir(kernel_name: str):
@@ -82,11 +149,17 @@ class SpyreAsyncCompile:
                         }
                     )
                     arg_map.append(ts.arg_index)
+
+            # Convert symbolic dimensions to concrete integers for JSON serialization
+            concrete_dimensions = []
+            for dim in ks.iteration_space:
+                concrete_dimensions.append(_concretize_dimension(dim))
+
             kernel_descriptor = {
                 "name": kernel_name,
                 "reduction": ks.is_reduction,
                 "op": ks.op,
-                "dimensions": ks.iteration_space,
+                "dimensions": concrete_dimensions,
                 "inputs": inputs,
                 "outputs": outputs,
             }
