@@ -419,6 +419,11 @@ auto create_dma_graph(const at::Tensor& self, const at::Tensor& dst,
 }
 
 auto copy_host_to_device(const at::Tensor& self, const at::Tensor& dst) {
+  // Empty tensors require no host->device backend transfer.
+  if (self.numel() == 0 || dst.numel() == 0) {
+    return;
+  }
+
   std::shared_ptr<sendnn::GraphLoader> gl = create_dma_graph(self, dst, true);
   if (!gl) {
     DEBUGINFO("GraphLoader is null!");
@@ -438,6 +443,11 @@ auto copy_host_to_device(const at::Tensor& self, const at::Tensor& dst) {
 }
 
 auto copy_device_to_host(const at::Tensor& self, const at::Tensor& dst) {
+  // Empty tensors require no device->host backend transfer.
+  if (self.numel() == 0 || dst.numel() == 0) {
+    return;
+  }
+
   std::shared_ptr<sendnn::GraphLoader> gl = create_dma_graph(self, dst, false);
   // execute
   constexpr int sn_idx = 0;
@@ -673,6 +683,11 @@ at::Tensor spyre_copy_from(const at::Tensor& self, const at::Tensor& dst,
   TORCH_CHECK(
       self.scalar_type() == dst.scalar_type(),
       "Spyre backend does not support type conversion yet during copy.");
+
+  // Preserve copy semantics for empty tensors and skip backend transfer.
+  if (self.numel() == 0) {
+    return dst;
+  }
 
   if (self.is_cpu() && dst.is_privateuseone()) {
     if (self.dim() == 0) {
