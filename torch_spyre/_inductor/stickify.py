@@ -15,7 +15,7 @@
 import logging
 
 from sympy import Symbol
-
+import sympy
 
 import torch
 from .logging_utils import get_inductor_logger

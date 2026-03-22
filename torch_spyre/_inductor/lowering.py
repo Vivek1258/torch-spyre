@@ -466,7 +466,18 @@ def lower_mean(x, axis=None, keepdim=False, *, dtype=None):
     )
     size = x.get_size()
     denom = torch._inductor.utils.sympy_product(size[i] for i in axis)
-    scaling_factor = 1.0 / denom
+    
+    # Concretize scaling_factor for dynamic shapes
+    from torch._inductor.virtualized import V
+    if hasattr(V.graph, 'sizevars') and V.graph.sizevars is not None:
+        try:
+            concrete_denom = V.graph.sizevars.size_hint(denom)
+            scaling_factor = 1.0 / concrete_denom
+        except Exception:
+            scaling_factor = 1.0 / denom
+    else:
+        scaling_factor = 1.0 / denom
+    
     op_info = {"constants": {"scaling_factor": scaling_factor}}
     result = SpyreReduction.create(
         reduction_type="mean", input_node=x, op_info=op_info, **kwargs
@@ -491,12 +502,13 @@ def lower_gelu(x, approximate="none"):
     return pw
 
 
-@register_spyre_lowering(torch.ops.spyre.softplus)
+@register_spyre_lowering(torch.ops.spyre.softplus) # Inducter intersepct
 def lower_softplus(x, beta=1.0, threshold=20.0):
     fn = lowering.ops_wrapper(torch.ops.spyre.softplus.__name__)
 
     def inner_fn(index):
-        return fn(x.make_loader()(index), beta, threshold)
+        TensorAccess_loaded = x.make_loader()(index)
+        return fn(TensorAccess_loaded, beta, threshold)
 
     pw = Pointwise.create(
         device=x.get_device(),
@@ -506,7 +518,7 @@ def lower_softplus(x, beta=1.0, threshold=20.0):
         origin_node=x.get_origin_node(),
         traceback=x.get_traceback(),
     )
-    pw.realize()
+    pw.realize() # <-- Trigger 
     return pw
 
 

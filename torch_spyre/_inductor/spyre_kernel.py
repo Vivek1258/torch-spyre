@@ -119,7 +119,7 @@ class UnimplementedOp(RValue):
 @dataclass(frozen=True)
 class DimensionInfo:
     var: sympy.Symbol
-    numel: int
+    numel: sympy.Expr
 
 
 class SpyreOpFuncs:
@@ -412,9 +412,11 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
         _ = self.args.input(name)
         buf = V.graph.get_buffer(name)
         layout = buf.get_layout()
-        if not isinstance(layout, FixedTiledLayout):
+        if not isinstance(layout, FixedTiledLayout): # It needs Spyre Tensors 
             raise Unsupported(f"{name} does not have FixedTiledLayout")
+        # BEFORE : index = x0 * Symbol('s97') + x1
         index = sympy_subs(index, V.graph.sizevars.precomputed_replacements)
+        # AFTER : index = x0 * 128 + x1    
 
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(
@@ -679,9 +681,23 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
         """
         var_ranges = self.var_ranges()
         if var_ranges:
-            dim_map = map_dims_to_vars(access.layout, access.index)
+            # Concretize layout before calling map_dims_to_vars to avoid symbolic comparison errors
+            from torch_spyre._inductor.pass_utils import _concretize_expr
+            from torch._inductor.ir import FixedLayout
+            
+            concrete_size = [_concretize_expr(s) for s in access.layout.size]
+            concrete_stride = [_concretize_expr(s) for s in access.layout.stride]
+            concrete_layout = FixedLayout(
+                device=access.layout.device,
+                dtype=access.layout.dtype,
+                size=concrete_size,
+                stride=concrete_stride,
+                offset=access.layout.offset if hasattr(access.layout, 'offset') else 0
+            )
+            
+            dim_map = map_dims_to_vars(concrete_layout, access.index)
             return [
-                DimensionInfo(dim_map[v], int(var_ranges.get(dim_map[v], 1)))
+                DimensionInfo(dim_map[v], var_ranges.get(dim_map[v], 1))
                 for v in sorted(dim_map)
             ]
         else:
@@ -694,6 +710,15 @@ class SpyreKernel(SIMDKernel[CSEVariable]):
         actuals = self.args.python_argdefs()[1]
         for name, tensor_arg in self.spyre_kernel_args:
             tensor_arg.arg_index = actuals.index(name)
+
+        # Convert symbolic dimensions to concrete integers before code generation
+        from torch_spyre.execution.async_compile import _concretize_dimension
+        for op_spec in self.op_specs:
+            if not isinstance(op_spec, UnimplementedOp):
+                concrete_iteration_space = []
+                for dim in op_spec.iteration_space:
+                    concrete_iteration_space.append(_concretize_dimension(dim))
+                op_spec.iteration_space = concrete_iteration_space
 
         buf = IndentedBuffer()
         buf.writeline("[")

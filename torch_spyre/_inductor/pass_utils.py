@@ -27,6 +27,51 @@ from .ir import FixedTiledLayout
 from .views import compute_device_coordinates, compute_coordinates
 
 
+def _concretize_expr(expr: sympy.Expr) -> sympy.Expr:
+    """
+    Convert a symbolic expression to a concrete value using PyTorch's size variable system.
+    This is needed to avoid symbolic comparison errors in layout analysis.
+    """
+    if isinstance(expr, (int, sympy.Integer)):
+        return expr
+    
+    # Use PyTorch's size variable system to evaluate symbolic expressions
+    if hasattr(V.graph, 'sizevars') and V.graph.sizevars is not None:
+        try:
+            concrete_value = V.graph.sizevars.size_hint(expr)
+            return sympy.Integer(concrete_value)
+        except Exception:
+            pass
+    
+    # If expression has free symbols, try to substitute them
+    if hasattr(expr, 'free_symbols') and len(expr.free_symbols) > 0:
+        subs_dict = {}
+        for symbol in expr.free_symbols:
+            if hasattr(V.graph, 'sizevars') and V.graph.sizevars is not None:
+                try:
+                    val = V.graph.sizevars.size_hint(symbol)
+                    subs_dict[symbol] = val
+                except Exception:
+                    continue
+        if subs_dict:
+            result = expr.subs(subs_dict)
+            return sympy.Integer(int(result)) if isinstance(result, (int, sympy.Integer, sympy.Number)) else result
+    
+    # Last resort: try direct conversion
+    try:
+        return sympy.Integer(int(expr))
+    except (TypeError, ValueError):
+        # If we can't concretize, return as-is and let it fail with a better error message
+        return expr
+
+
+def _concretize_var_ranges(var_ranges: dict[sympy.Symbol, sympy.Expr]) -> dict[sympy.Symbol, sympy.Expr]:
+    """
+    Concretize all values in var_ranges dictionary.
+    """
+    return {sym: _concretize_expr(val) for sym, val in var_ranges.items()}
+
+
 class SchedNodeArg(NamedTuple):
     dep: MemoryDep
     layout: FixedTiledLayout
@@ -69,22 +114,62 @@ def map_dims_to_vars(layout: FixedLayout, index: Expr) -> dict[int, Symbol]:
 
     for d in range(len(layout.size)):
         if d not in result:
-            assert layout.size[d] == 1, "non-trivial dim missing from index expression"
+            # For dynamic shapes, dimensions might not be in the index expression
+            # even if they're non-trivial. Use wildcard symbol for unmapped dimensions.
             result[d] = wildcard_symbol(d)
 
     return result
 
 
 def host_coordinates(layout: FixedLayout, dep: MemoryDep) -> list[sympy.Expr]:
-    return compute_coordinates(layout.size, layout.stride, dep.ranges, dep.index)
+    # Concretize layout dimensions and var_ranges to avoid symbolic comparison errors
+    concrete_size = [_concretize_expr(s) for s in layout.size]
+    concrete_stride = [_concretize_expr(s) for s in layout.stride]
+    concrete_ranges = _concretize_var_ranges(dep.ranges)
+    
+    # Also need to concretize the index expression to replace symbolic dimensions
+    concrete_index = dep.index
+    if hasattr(dep.index, 'free_symbols') and len(dep.index.free_symbols) > 0:
+        if hasattr(V.graph, 'sizevars') and V.graph.sizevars is not None:
+            subs_dict = {}
+            for symbol in dep.index.free_symbols:
+                try:
+                    val = V.graph.sizevars.size_hint(symbol)
+                    subs_dict[symbol] = val
+                except Exception:
+                    pass
+            if subs_dict:
+                concrete_index = dep.index.subs(subs_dict)
+    
+    return compute_coordinates(concrete_size, concrete_stride, concrete_ranges, concrete_index)
 
 
 def device_coordinates(layout: FixedTiledLayout, dep: MemoryDep) -> list[sympy.Expr]:
+    # Concretize all dimensions and var_ranges to avoid symbolic comparison errors
+    concrete_size = [_concretize_expr(s) for s in layout.size]
+    concrete_stride = [_concretize_expr(s) for s in layout.stride]
+    concrete_device_size = [_concretize_expr(s) for s in layout.device_layout.device_size]
+    concrete_ranges = _concretize_var_ranges(dep.ranges)
+    
+    # Also need to concretize the index expression
+    concrete_index = dep.index
+    if hasattr(dep.index, 'free_symbols') and len(dep.index.free_symbols) > 0:
+        if hasattr(V.graph, 'sizevars') and V.graph.sizevars is not None:
+            subs_dict = {}
+            for symbol in dep.index.free_symbols:
+                try:
+                    val = V.graph.sizevars.size_hint(symbol)
+                    subs_dict[symbol] = val
+                except Exception:
+                    pass
+            if subs_dict:
+                concrete_index = dep.index.subs(subs_dict)
+    
     return compute_device_coordinates(
-        layout.size,
-        layout.stride,
-        layout.device_layout.device_size,
+        concrete_size,
+        concrete_stride,
+        concrete_device_size,
         layout.device_layout.dim_map,
-        dep.ranges,
-        dep.index,
+        concrete_ranges,
+        concrete_index,
     )

@@ -16,6 +16,7 @@
 import dataclasses
 from typing import Any, Sequence
 import torch
+from sympy import Expr
 from torch_spyre._C import SpyreTensorLayout
 
 
@@ -59,7 +60,7 @@ class OpSpec:
 
     op: str
     is_reduction: bool
-    iteration_space: list[int]
+    iteration_space: list[Expr]
     args: Sequence[TensorArg]
     op_info: dict[str, Any]
 
