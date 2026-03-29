@@ -93,10 +93,9 @@ def _serialize_value(v):
     ``float`` so the generated code never depends on sympy names (``Mul``,
     ``Float``, ``Pow``, etc.) being in scope.
 
-    This is the correct Phase-1 behavior: op_info constants flow into SDSC
-    generation, which requires concrete values.  Keeping them symbolic here
-    would only be needed once SDSC generation itself supports symbolic
-    expressions (Phase 2).
+    SDSC generation at this point requires concrete values.  Keeping them
+    symbolic here would only be needed once SDSC generation itself supports symbolic
+    expressions.
     """
     if isinstance(v, sympy.Integer):
         return repr(int(v))
