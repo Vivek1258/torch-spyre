@@ -37,10 +37,10 @@ from .constants import MATMUL_REDUCTION_OP, BATCH_MATMUL_OP
 from .ir import FixedTiledLayout
 from .pass_utils import (
     SchedNodeArg,
-    get_mem_deps_from_rw,
+    concretize_expr,
+    get_mem_deps,
     device_coordinates,
-    iteration_space_from_op,
-    splits_by_index_coeff,
+    iteration_space,
 )
 from .logging_utils import get_inductor_logger
 from . import config
@@ -133,7 +133,9 @@ def multi_dim_iteration_space_split(
         if n_cores_remaining <= 1:
             break
 
-        best_split = core_split(iteration_space[v], n_cores_remaining)
+        best_split = core_split(
+            concretize_expr(iteration_space[v]), n_cores_remaining, min_slice
+        )
         if best_split > 1:
             splits[v] = best_split
             n_cores_remaining = n_cores_remaining // best_split
@@ -414,7 +416,10 @@ def plan_splits(
 ) -> tuple[dict[Symbol, int], dict[Symbol, Expr], list[Symbol], dict[Symbol, int]]:
     """Compute core splits for an op's iteration space.
 
-    Returns (splits, it_space_adjusted, priorities, min_splits).
+    it_space = iteration_space(n)
+    # Core division needs concrete sizes for modular arithmetic.
+    it_space = {k: concretize_expr(v) for k, v in it_space.items()}
+    output_td = TensorDep(next(iter(n.read_writes.writes)), n.node.get_layout())
 
     When exclude_reduction is True, asserts that no reduction variable appears
     in min_splits — callers are responsible for only passing exclude_reduction=True
@@ -455,27 +460,9 @@ def plan_splits(
     return splits, it_space_adjusted, priorities, min_splits
 
 
-def _resolve_layout(op: ComputedBuffer) -> "FixedTiledLayout":
-    """Return the FixedTiledLayout for op, unwrapping MutationLayoutSHOULDREMOVE.
-
-    Mutation ops keep MutationLayoutSHOULDREMOVE at pre-scheduler time so the
-    scheduler can identify them as in-place writes.  Their target buffer already
-    has a FixedTiledLayout assigned by propagate_spyre_tensor_layouts, so
-    real_layout() gives us the correct device layout for core division.
-    """
-    layout = op.get_layout()
-    if isinstance(layout, MutationLayoutSHOULDREMOVE):
-        layout = layout.real_layout()
-    assert isinstance(layout, FixedTiledLayout), (
-        f"Expected FixedTiledLayout for {op.get_name()}, got {type(layout)}"
-    )
-    return layout
-
-
-def collect_tensor_deps(
-    op: ComputedBuffer, args: list[SchedNodeArg]
-) -> tuple[list[TensorDep], TensorDep]:
-    """Build TensorDep lists for inputs and the output of op."""
+    it_space = iteration_space(n)
+    # Core division needs concrete sizes for modular arithmetic.
+    it_space = {k: concretize_expr(v) for k, v in it_space.items()}
     input_tds = [TensorDep(a.dep, a.layout) for a in args]
     rw = op.get_read_writes()
     output_td = TensorDep(next(iter(rw.writes)), _resolve_layout(op))

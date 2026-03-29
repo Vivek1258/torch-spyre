@@ -39,10 +39,7 @@ from .constants import (
 )
 from .errors import Unsupported
 from .ir import FixedTiledLayout
-from .pass_utils import (
-    apply_splits_from_index_coeff,
-    iteration_space,
-)
+from .pass_utils import concretize_expr, iteration_space
 from .views import compute_coordinates, align_tensors
 from .logging_utils import get_inductor_logger
 from .op_spec import OpSpec, TensorArg
@@ -87,6 +84,47 @@ class ReductionOp(RValue):
 @dataclass
 class UnimplementedOp(RValue):
     op: str
+
+
+def _serialize_value(v):
+    """Serialize a value for code generation, handling symbolic expressions.
+
+    Produces valid Python source text.  All sympy expressions—including
+    symbolic ones with free symbols—are concretized to Python ``int`` /
+    ``float`` so the generated code never depends on sympy names (``Mul``,
+    ``Float``, ``Pow``, etc.) being in scope.
+
+    This is the correct Phase-1 behavior: op_info constants flow into SDSC
+    generation, which requires concrete values.  Keeping them symbolic here
+    would only be needed once SDSC generation itself supports symbolic
+    expressions (Phase 2).
+    """
+    if isinstance(v, sympy.Integer):
+        return repr(int(v))
+    elif isinstance(v, sympy.Basic):
+        # Concretize: first try direct float conversion for concrete numerics,
+        # then fall back to substituting size_hints for symbolic expressions.
+        if hasattr(v, "free_symbols") and v.free_symbols:
+            # Substitute each symbol individually (size_hint handles simple
+            # Symbol lookups reliably), then evaluate.  This works for float
+            # expressions like 1.0/s97 where size_hint on the whole expression
+            # might not handle the float division correctly.
+            subs = {
+                s: V.graph.sizevars.size_hint(s) for s in v.free_symbols
+            }
+            concrete = float(v.subs(subs))
+            return repr(concrete)
+        try:
+            return repr(float(v))
+        except (TypeError, ValueError):
+            return repr(V.graph.sizevars.size_hint(v))
+    elif isinstance(v, dict):
+        items = ", ".join(
+            f"{repr(k)}: {_serialize_value(val)}" for k, val in v.items()
+        )
+        return "{" + items + "}"
+    else:
+        return repr(v)
 
 
 class SpyreOpFuncs:
@@ -408,7 +446,7 @@ class SpyreKernel(Kernel[CSEVariable]):
 
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(
-                f"kernel_load: {name}, shape={[int(s) for s in layout.size]}, "
+                f"kernel_load: {name}, shape={[concretize_expr(s) for s in layout.size]}, "
                 f"device_size={list(layout.device_layout.device_size)}"
             )
 
@@ -436,7 +474,7 @@ class SpyreKernel(Kernel[CSEVariable]):
         if logger.isEnabledFor(logging.DEBUG):
             value_type = type(value).__name__
             logger.debug(
-                f"kernel_store: {name} (type: {value_type}), shape={[int(s) for s in layout.size]}, "
+                f"kernel_store: {name} (type: {value_type}), shape={[concretize_expr(s) for s in layout.size]}, "
                 f"device_size={list(layout.device_layout.device_size)}, op_info={op_info}"
             )
 
@@ -503,7 +541,7 @@ class SpyreKernel(Kernel[CSEVariable]):
 
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(
-                f"kernel_store_reduction: {name} (op: {value.op}), shape={[int(s) for s in layout.size]}, "
+                f"kernel_store_reduction: {name} (op: {value.op}), shape={[concretize_expr(s) for s in layout.size]}, "
                 f"device_size={list(layout.device_layout.device_size)}, op_info={op_info}"
             )
 
@@ -584,7 +622,9 @@ class SpyreKernel(Kernel[CSEVariable]):
                             )
                             + "},"
                         )
-                        buf.writeline(f"op_info={op_spec.op_info!r},")
+                        buf.writeline(
+                            f"op_info={_serialize_value(op_spec.op_info)},"
+                        )
                         buf.writeline("args=[")
                         with buf.indent():
                             for arg in op_spec.args:

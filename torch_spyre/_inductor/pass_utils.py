@@ -12,16 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Callable, NamedTuple, TypeVar
+from typing import NamedTuple, Union
 
 
 import sympy
-from torch._inductor.ir import (
-    ComputedBuffer,
-    FixedLayout,
-    Pointwise,
-    Reduction,
-)
+from sympy import Expr, Symbol
+from torch._inductor.ir import FixedLayout, Pointwise, Reduction
 from torch._inductor.scheduler import SchedulerNode
 from torch._inductor.dependencies import MemoryDep, ReadWrites
 from torch._inductor.virtualized import V
@@ -48,23 +44,36 @@ def get_mem_deps(n: SchedulerNode) -> list[SchedNodeArg]:
     return res
 
 
-def get_mem_deps_from_rw(read_writes: ReadWrites) -> list[SchedNodeArg]:
-    res: list[SchedNodeArg] = []
-    for arg in read_writes.reads:
-        if isinstance(arg, MemoryDep):
-            buf = V.graph.get_buffer(arg.name)
-            layout = buf.get_layout()
-            if not isinstance(layout, FixedTiledLayout):
-                raise RuntimeError(f"{buf} does not have FixedTiledLayout")
-            res.append(SchedNodeArg(arg, layout))
-    return res
+def concretize_expr(expr: Union[Expr, int]) -> int:
+    """Concretize a sympy expression to a Python int.
+
+    Used at boundaries where concrete values are required (C++ constructors,
+    comparison operators inside algorithms).  Symbolic loop variables in
+    coordinate *output* expressions are never affected—only the structural
+    parameters (sizes, strides) are concretized so that the algorithm can
+    make branching decisions.
+    """
+    if isinstance(expr, int):
+        return expr
+    if isinstance(expr, sympy.Integer):
+        return int(expr)
+    if hasattr(expr, "free_symbols") and expr.free_symbols:
+        return V.graph.sizevars.size_hint(expr)
+    return int(expr)
 
 
 def host_coordinates(layout: FixedLayout, dep: MemoryDep) -> list[sympy.Expr]:
-    return compute_coordinates(layout.size, layout.stride, dep.ranges, dep.index)
+    # Concretize size/stride for the compute_coordinates algorithm (needs
+    # concrete values for comparison operators).  The var_ranges and index
+    # stay symbolic so that coordinate *output* expressions remain symbolic.
+    concrete_size = [concretize_expr(s) for s in layout.size]
+    concrete_stride = [concretize_expr(s) for s in layout.stride]
+    return compute_coordinates(concrete_size, concrete_stride, dep.ranges, dep.index)
 
 
 def device_coordinates(layout: FixedTiledLayout, dep: MemoryDep) -> list[sympy.Expr]:
+    # device_size and stride_map come from the C++ SpyreTensorLayout and are
+    # already concrete, so no concretization is needed here.
     return compute_coordinates(
         layout.device_layout.device_size,
         layout.device_layout.stride_map,
