@@ -109,9 +109,7 @@ def _serialize_value(v):
             # Symbol lookups reliably), then evaluate.  This works for float
             # expressions like 1.0/s97 where size_hint on the whole expression
             # might not handle the float division correctly.
-            subs = {
-                s: V.graph.sizevars.size_hint(s) for s in v.free_symbols
-            }
+            subs = {s: V.graph.sizevars.size_hint(s) for s in v.free_symbols}
             concrete = float(v.subs(subs))
             return repr(concrete)
         try:
@@ -119,9 +117,7 @@ def _serialize_value(v):
         except (TypeError, ValueError):
             return repr(V.graph.sizevars.size_hint(v))
     elif isinstance(v, dict):
-        items = ", ".join(
-            f"{repr(k)}: {_serialize_value(val)}" for k, val in v.items()
-        )
+        items = ", ".join(f"{repr(k)}: {_serialize_value(val)}" for k, val in v.items())
         return "{" + items + "}"
     else:
         return repr(v)
@@ -622,9 +618,7 @@ class SpyreKernel(Kernel[CSEVariable]):
                             )
                             + "},"
                         )
-                        buf.writeline(
-                            f"op_info={_serialize_value(op_spec.op_info)},"
-                        )
+                        buf.writeline(f"op_info={_serialize_value(op_spec.op_info)},")
                         buf.writeline("args=[")
                         with buf.indent():
                             for arg in op_spec.args:

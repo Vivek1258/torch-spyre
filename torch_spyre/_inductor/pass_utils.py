@@ -16,7 +16,7 @@ from typing import NamedTuple, Union
 
 
 import sympy
-from sympy import Expr, Symbol
+from sympy import Expr
 from torch._inductor.ir import FixedLayout, Pointwise, Reduction
 from torch._inductor.scheduler import SchedulerNode
 from torch._inductor.dependencies import MemoryDep, ReadWrites

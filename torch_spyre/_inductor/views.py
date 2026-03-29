@@ -294,7 +294,9 @@ def align_tensors(iteration_space, tensors):
     # sorting, math.gcd, and integer division that require concrete ints.
     # Coordinate *expressions* remain symbolic (they reference loop variable
     # Symbols, not range values).
-    var_ranges = {var: _concretize_for_cmp(val[0]) for var, val in iteration_space.items()}
+    var_ranges = {
+        var: _concretize_for_cmp(val[0]) for var, val in iteration_space.items()
+    }
     op_it_space_splits = {var: val[1] for var, val in iteration_space.items()}
 
     # for each variable collect bounds (den and mod) for all terms involving variable
