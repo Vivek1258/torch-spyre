@@ -18,6 +18,24 @@ import math
 import sympy
 from typing import Optional, Sequence
 
+from torch._inductor.virtualized import V
+
+
+def _concretize_for_cmp(expr: sympy.Expr) -> int:
+    """Return a concrete int for use in comparison operators only.
+
+    It is only used for the branching decisions inside
+    ``compute_coordinates`` (e.g. choosing which dimension a loop variable
+    maps to).
+    """
+    if isinstance(expr, (int, float)):
+        return int(expr)
+    if isinstance(expr, sympy.Integer):
+        return int(expr)
+    if hasattr(expr, "free_symbols") and expr.free_symbols:
+        return V.graph.sizevars.size_hint(expr)
+    return int(expr)
+
 
 def compute_coordinates(
     size: Sequence[sympy.Expr],
@@ -30,6 +48,12 @@ def compute_coordinates(
 
     Stride and index must be relative to the same storage (both host or device).
     Stride values<=0 are ignored.
+
+    ``size`` and ``stride`` should be concrete (int) when possible—callers
+    such as ``host_coordinates`` concretize them before calling.  ``var_ranges``
+    may contain symbolic expressions (e.g. a dynamic batch dimension); the
+    algorithm concretizes range values only for comparison logic, while the
+    output coordinate expressions remain symbolic.
     """
     # find stride immediately strictly larger that dim stride
     n = len(size)
@@ -43,13 +67,29 @@ def compute_coordinates(
     coordinates = [sympy.S.Zero] * n
     vars = index.free_symbols
     for var in vars:
-        if var_ranges[var] <= 1:
-            continue  # ignore var with trivial range
+        # Skip symbols that are not loop variables (e.g. size symbols like
+        if var not in var_ranges:
+            continue
+
+        range_val = var_ranges[var]
+
+        # Skip vars with trivial range.  For symbolic ranges we cannot
+        # statically determine triviality, so we assume they are non-trivial.
+        if isinstance(range_val, (int, sympy.Integer)) and int(range_val) <= 1:
+            continue
+
         # isolate current var
         term = index.subs({v: 0 for v in vars - {var}})
         # compute index({var=1}) and index({var=var_ranges[var]})
         step = term.subs(var, 1)
-        limit = term.subs(var, var_ranges[var])
+        limit = term.subs(var, range_val)
+
+        # Concretize step and limit for comparison logic only.
+        # step is typically concrete (single-variable substitution with 1),
+        # but limit can be symbolic when range_val is symbolic.
+        concrete_step = _concretize_for_cmp(step)
+        concrete_limit = _concretize_for_cmp(limit)
+
         # find primary dim with largest stride less than or equal to step
         primary_stride = 0
         primary_dim = -1
@@ -57,25 +97,26 @@ def compute_coordinates(
             if size[dim] == 1:
                 continue  # ignore dim with size 1
             st = stride[dim]
-            if st <= step and st > primary_stride:
+            if st <= concrete_step and st > primary_stride:
                 # found candidate primary dim
                 primary_stride = st
                 primary_dim = dim
-            elif st > step and st < limit:
+            elif st > concrete_step and st < concrete_limit:
                 # var range intersects dim, add term
-                if next_stride[dim] < limit:
+                if next_stride[dim] < concrete_limit:
                     # var range overflows dim
                     coordinates[dim] += var * step % next_stride[dim] // st
                 else:
                     coordinates[dim] += var * step // st
         # add term for primary dim
-        if next_stride[primary_dim] < limit:
-            coordinates[primary_dim] += (
-                # var range overflows primary dim
-                var * step % next_stride[primary_dim] // primary_stride
-            )
-        else:
-            coordinates[primary_dim] += var * step // primary_stride
+        if primary_stride > 0:
+            if next_stride[primary_dim] < concrete_limit:
+                coordinates[primary_dim] += (
+                    # var range overflows primary dim
+                    var * step % next_stride[primary_dim] // primary_stride
+                )
+            else:
+                coordinates[primary_dim] += var * step // primary_stride
     return coordinates
 
 
@@ -180,7 +221,11 @@ def normalize_coordinates(var_ranges, size, coordinates):
 
 
 def align_tensors(iteration_space, tensors):
-    var_ranges = {var: val[0] for var, val in iteration_space.items()}
+    # Concretize range values for the algorithm: align_tensors performs
+    # sorting, math.gcd, and integer division that require concrete ints.
+    # Coordinate *expressions* remain symbolic (they reference loop variable
+    # Symbols, not range values).
+    var_ranges = {var: _concretize_for_cmp(val[0]) for var, val in iteration_space.items()}
     op_it_space_splits = {var: val[1] for var, val in iteration_space.items()}
 
     splits = {var: set() for var in var_ranges.keys()}

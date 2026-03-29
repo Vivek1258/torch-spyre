@@ -38,7 +38,13 @@ from torch._inductor.dependencies import MemoryDep
 from .errors import Unsupported
 from .constants import MATMUL_REDUCTION_OP, BATCH_MATMUL_OP
 from .ir import FixedTiledLayout
-from .pass_utils import SchedNodeArg, get_mem_deps, device_coordinates, iteration_space
+from .pass_utils import (
+    SchedNodeArg,
+    concretize_expr,
+    get_mem_deps,
+    device_coordinates,
+    iteration_space,
+)
 from .logging_utils import get_inductor_logger
 import logging
 
@@ -139,7 +145,9 @@ def multi_dim_iteration_space_split(
         if min_splits and v in min_splits:
             continue  # Already handled in first pass
 
-        best_split = core_split(iteration_space[v], n_cores_remaining, min_slice)
+        best_split = core_split(
+            concretize_expr(iteration_space[v]), n_cores_remaining, min_slice
+        )
         if best_split > 1:
             splits[v] = best_split
             n_cores_remaining = n_cores_remaining // best_split
@@ -287,6 +295,8 @@ def divide_pointwise_op(n: SchedulerNode, args: list[SchedNodeArg], max_cores):
         return
 
     it_space = iteration_space(n)
+    # Core division needs concrete sizes for modular arithmetic.
+    it_space = {k: concretize_expr(v) for k, v in it_space.items()}
     output_td = TensorDep(next(iter(n.read_writes.writes)), n.node.get_layout())
 
     adjust_it_space_for_sticks(it_space, [output_td])
@@ -325,6 +335,8 @@ def divide_reduction_op(n: SchedulerNode, args: list[SchedNodeArg], max_cores):
         return
 
     it_space = iteration_space(n)
+    # Core division needs concrete sizes for modular arithmetic.
+    it_space = {k: concretize_expr(v) for k, v in it_space.items()}
     input_tds = [TensorDep(a.dep, a.layout) for a in args]
     output_td = TensorDep(next(iter(n.read_writes.writes)), n.node.get_layout())
 

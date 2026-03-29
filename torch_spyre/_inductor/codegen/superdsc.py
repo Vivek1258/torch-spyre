@@ -16,8 +16,10 @@ import dataclasses
 import math
 from typing import Any
 
+import sympy
 from sympy import Integer, Symbol, Expr, Mod, floor
 
+from torch._inductor.virtualized import V
 from torch_spyre._C import DataFormats
 from torch_spyre._inductor.constants import (
     IDENTITY_OP,
@@ -314,6 +316,22 @@ def _get_op_func(op: str, is_reduction: bool, output_scales: dict) -> str:
     return op
 
 
+def _concretize_for_sdsc(expr: Expr) -> int:
+    """Concretize a symbolic expression at the SDSC generation boundary.
+
+    SDSC generation (and the downstream backend compiler) requires all
+    iteration space sizes to be concrete integers.  Once symbolic SDSC
+    generation is implemented, this function can be removed.
+    """
+    if isinstance(expr, int):
+        return expr
+    if isinstance(expr, Integer):
+        return int(expr)
+    if hasattr(expr, "free_symbols") and expr.free_symbols:
+        return V.graph.sizevars.size_hint(expr)
+    return int(expr)
+
+
 def parse_op_spec(op_spec: OpSpec) -> SDSCSpec:
     is_matmul = _is_matmul(op_spec.op)
     ndim = len(op_spec.iteration_space)
@@ -328,7 +346,7 @@ def parse_op_spec(op_spec: OpSpec) -> SDSCSpec:
     )
 
     sdsc_iteration_space = {
-        symbol_mapping[sym]: (size.p if isinstance(size, Integer) else size)
+        symbol_mapping[sym]: _concretize_for_sdsc(size)
         for sym, (size, _) in op_spec.iteration_space.items()
     }
 
