@@ -16,7 +16,6 @@ import dataclasses
 import math
 from typing import Any
 
-import sympy
 from sympy import Integer, Symbol, Expr, Mod, floor
 
 from torch._inductor.virtualized import V
