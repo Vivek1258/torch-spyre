@@ -290,6 +290,7 @@ def normalize_coordinates(
 
     return fused_terms
 
+
 def align_tensors(
     iteration_space: Dict[sympy.Symbol, Tuple[sympy.Expr, int]],
     tensors: Sequence[Dict[str, Sequence[sympy.Expr]]],
@@ -299,12 +300,12 @@ def align_tensors(
     """
     Transform op iteration space and tensor arguments to satisfy codegen requirements.
     """
-    
+
     # Concretize range values for the algorithm: align_tensors performs
     # sorting, math.gcd, and integer division that require concrete ints.
     # Coordinate *expressions* remain symbolic (they reference loop variable
     # Symbols, not range values).
- 
+
     var_ranges = {
         var: _concretize_for_cmp(val[0]) for var, val in iteration_space.items()
     }

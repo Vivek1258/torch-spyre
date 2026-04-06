@@ -389,7 +389,8 @@ def _concretize_for_sdsc(expr: Expr) -> int:
     if hasattr(expr, "free_symbols") and expr.free_symbols:
         return V.graph.sizevars.size_hint(expr)
     return int(expr)
-  
+
+
 def _ref_arg(op_spec):
     if op_spec.is_reduction:
         return op_spec.args[0]
