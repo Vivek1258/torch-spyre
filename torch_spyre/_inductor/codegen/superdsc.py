@@ -48,6 +48,8 @@ class SDSCArgs:
     max_dim_sizes: dict[Symbol, Any]
     allocation: dict[str, Any]
     start_address: int | Symbol
+    backGap: dict[Symbol, int]
+    offset: int
 
     def __str__(self) -> str:
         scales = ", ".join(f"{k}={v}" for k, v in self.scales.items())
@@ -65,6 +67,8 @@ class SDSCArgs:
             f"  max_dim_sizes=[{max_dim_sizes}],\n"
             f"  allocation=[{allocation}],\n"
             f"  start_address={self.start_address}\n"
+            f"  backGap={self.backGap}\n"
+            f"  offset={self.offset}\n"
             f")"
         )
 
@@ -250,20 +254,44 @@ def _create_sdsc_tensors(
     iteration_space: dict,
     op_dim_order: list[Symbol],
     op_stick_dim: Symbol | None,
-) -> tuple[list[SDSCArgs], dict]:
+) -> tuple[list[SDSCArgs], dict, Symbol | None]:
     dims = list(iteration_space.keys())
     layouts: dict = {}
     use_op_dims = not _is_matmul(op_spec.op)
 
+    output_offset = 0
+    gap = 0
+    device_stride = None
+    missing_dim = None
+    backGap = {}
+    op_info = dict(op_spec.op_info.get("overwrite_info", {})) if op_spec.op_info else {}
+    adjusted_output_size = op_spec.args[-1].device_size.copy()
+    if op_info and (
+        "gap" in op_info and "device_offset" in op_info and "device_stride" in op_info
+    ):
+        device_stride = op_info["device_stride"]
+        gap = op_info["gap"]
+        output_offset = op_info["device_offset"] * device_stride
+        output = op_spec.args[-1]
+        dim_order, stick_dim = _get_device_dim_order(output, symbol_mapping)
+        for dim_idx, dim in enumerate(reversed(dim_order)):
+            if device_stride == math.prod(output.device_size[dim_idx + 1 :]):
+                dim_size = iteration_space.get(dim, 1)
+                adjusted_output_size[dim_idx] = (
+                    dim_size // output.device_dtype.elems_per_stick()
+                    if dim == stick_dim
+                    else dim_size
+                )
     sdsc_args: list[SDSCArgs] = []
-    for arg, addr in zip(op_spec.args, SEGMENT_OFFSETS):
+    for arg in op_spec.args:
+        addr = None if arg.arg_index < 0 else SEGMENT_OFFSETS[arg.arg_index]
         dim_order, stick_dim = _get_device_dim_order(arg, symbol_mapping)
         scales: dict = {}
         strides: dict = {}
         offsets: dict = {}
         max_dim_sizes: dict = {}
         reduced_dims: list = []
-
+        use_adjusted_size = op_spec.op == "overwrite" and not arg.is_input
         if use_op_dims and dim_order != dims:
             reduced_dims = [d for d in op_dim_order if d not in dim_order]
             dim_order = dim_order + reduced_dims
@@ -280,7 +308,16 @@ def _create_sdsc_tensors(
                 scales[dim] = -2 if (dim is stick_dim) else -1
             else:
                 scales[dim] = 1
-            strides[dim] = _calculate_device_stride(dim_idx, arg.device_size)
+            strides[dim] = _calculate_device_stride(
+                dim_idx,
+                arg.device_size if not use_adjusted_size else adjusted_output_size,
+            )
+            if (
+                device_stride == math.prod(arg.device_size[-dim_idx - 1 :])
+                and not arg.is_input
+            ):
+                backGap[dim] = gap
+                use_adjusted_size = False
             offsets[dim] = 0
             max_dim_sizes[dim] = -1
 
@@ -302,13 +339,36 @@ def _create_sdsc_tensors(
                 max_dim_sizes=max_dim_sizes,
                 allocation=arg.allocation,
                 start_address=addr,
+                backGap=backGap if not arg.is_input else {},
+                offset=output_offset if not arg.is_input else 0,
             )
         )
-    return sdsc_args, layouts
+
+    if not backGap and "gap" in op_info:
+        # Size of the dim with gap is 1 and was absent from the iteration space - add it
+        missing_dim = Symbol(INPUT_DIM_LABELS[len(op_dim_order)])
+        iteration_space[missing_dim] = 1
+        backGap[missing_dim] = gap
+        for sdsc_arg, src_arg in zip(sdsc_args, op_spec.args):
+            dim_idx = len(sdsc_arg.scales)
+            sdsc_arg.scales[missing_dim] = 1
+            sdsc_arg.offsets[missing_dim] = 0
+            sdsc_arg.max_dim_sizes[missing_dim] = -1
+            sdsc_arg.strides[missing_dim] = _calculate_device_stride(
+                dim_idx, src_arg.device_size
+            )
+            if not src_arg.is_input:
+                sdsc_arg.backGap[missing_dim] = gap
+            if missing_dim not in layouts[sdsc_arg.layout]["dim_order"]:
+                layouts[sdsc_arg.layout]["dim_order"] = layouts[sdsc_arg.layout][
+                    "dim_order"
+                ] + [missing_dim]
+
+    return sdsc_args, layouts, missing_dim
 
 
 def _get_op_func(op: str, is_reduction: bool, output_scales: dict) -> str:
-    if op == "to_dtype":
+    if op == "to_dtype" or op == "overwrite":
         return IDENTITY_OP
     if is_reduction and not _is_matmul(op) and -2 not in output_scales.values():
         return op + "nonstick"
@@ -329,6 +389,12 @@ def _concretize_for_sdsc(expr: Expr) -> int:
     if hasattr(expr, "free_symbols") and expr.free_symbols:
         return V.graph.sizevars.size_hint(expr)
     return int(expr)
+  
+def _ref_arg(op_spec):
+    if op_spec.is_reduction:
+        return op_spec.args[0]
+
+    return op_spec.args[-1]
 
 
 def parse_op_spec(op_spec: OpSpec) -> SDSCSpec:
@@ -359,7 +425,7 @@ def parse_op_spec(op_spec: OpSpec) -> SDSCSpec:
         for sym, (_, wk_slice) in op_spec.iteration_space.items()
     }
 
-    ref_arg = op_spec.args[0] if op_spec.is_reduction else op_spec.args[-1]
+    ref_arg = _ref_arg(op_spec)
     op_dim_order, op_stick_dim = _get_device_dim_order(ref_arg, symbol_mapping)
 
     if op_stick_dim is None:
@@ -368,20 +434,27 @@ def parse_op_spec(op_spec: OpSpec) -> SDSCSpec:
         work_slices[stick_sym] = 1
         dim_splits[stick_sym] = 1
 
-    args, layouts = _create_sdsc_tensors(
-        op_spec, symbol_mapping, sdsc_iteration_space, op_dim_order, op_stick_dim
+    args, layouts, missing_dim = _create_sdsc_tensors(
+        op_spec,
+        symbol_mapping,
+        sdsc_iteration_space,
+        op_dim_order,
+        op_stick_dim,
     )
+    if missing_dim is not None:
+        # A dimension was added to the iteration space, update splits and work slices
+        dim_splits[missing_dim] = 1
+        work_slices[missing_dim] = 1
 
     if is_matmul:
         pad_args, pad_sdsc_args = list(op_spec.args), args
-    elif op_spec.is_reduction:
+    elif op_spec.is_reduction or op_spec.op == "overwrite":
         pad_args, pad_sdsc_args = [op_spec.args[0]], [args[0]]
     else:
         pad_args, pad_sdsc_args = [op_spec.args[-1]], [args[-1]]
     padding = _get_padded_iteration_space(
         pad_args, pad_sdsc_args, sdsc_iteration_space, layouts
     )
-
     constants = dict(op_spec.op_info.get("constants", {})) if op_spec.op_info else {}
     coordinate_masking = _get_coordinate_mask(sdsc_iteration_space, args[-1], padding)
     if coordinate_masking:
@@ -410,10 +483,7 @@ def parse_op_spec(op_spec: OpSpec) -> SDSCSpec:
     )
 
 
-def compile_op_spec(kernel_name: str, op_spec: OpSpec) -> tuple[Any, list[int]]:
+def compile_op_spec(kernel_name: str, op_spec: OpSpec) -> Any:
     sdsc_spec = parse_op_spec(op_spec)
     logger.debug("%s", sdsc_spec)
-
-    arg_map = [ts.arg_index for ts in op_spec.args]
-    dt_sdsc = generate_sdsc(sdsc_spec)
-    return dt_sdsc, arg_map
+    return generate_sdsc(sdsc_spec)
