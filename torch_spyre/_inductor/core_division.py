@@ -133,9 +133,7 @@ def multi_dim_iteration_space_split(
         if n_cores_remaining <= 1:
             break
 
-        best_split = core_split(
-            concretize_expr(iteration_space[v]), n_cores_remaining, min_slice
-        )
+        best_split = core_split(concretize_expr(iteration_space[v]), n_cores_remaining)
         if best_split > 1:
             splits[v] = best_split
             n_cores_remaining = n_cores_remaining // best_split

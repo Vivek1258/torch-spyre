@@ -413,6 +413,13 @@ def _concretize_for_sdsc(expr: Expr) -> int:
     return int(expr)
 
 
+def _ref_arg(op_spec):
+    if op_spec.is_reduction:
+        return op_spec.args[0]
+
+    return op_spec.args[-1]
+
+
 def parse_op_spec(op_spec: OpSpec) -> SDSCSpec:
     is_matmul = _is_matmul(op_spec.op)
     ndim = len(op_spec.iteration_space)
