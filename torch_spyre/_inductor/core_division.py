@@ -135,7 +135,8 @@ def multi_dim_iteration_space_split(
     for v in priorities:
         if n_cores_remaining <= 1:
             break
-
+        # TODO(issue#1372): with bucketed core division, keep iteration_space[v]
+        #              symbolic and compute splits per bucket.
         best_split = core_split(concretize_expr(iteration_space[v]), n_cores_remaining)
         if best_split > 1:
             splits[v] = best_split
@@ -312,6 +313,7 @@ def divide_pointwise_op(n: SchedulerNode, args: list[SchedNodeArg], max_cores):
 
     it_space = iteration_space(n)
     # Core division needs concrete sizes for modular arithmetic.
+    # TODO(issue#1372): replace with bucketed split strategy for symbolic shapes.
     it_space = {k: concretize_expr(v) for k, v in it_space.items()}
     input_tds = [TensorDep(a.dep, a.layout) for a in args]
     output_td = TensorDep(next(iter(n.read_writes.writes)), n.node.get_layout())
@@ -348,6 +350,7 @@ def divide_reduction_op(n: SchedulerNode, args: list[SchedNodeArg], max_cores):
 
     it_space = iteration_space(n)
     # Core division needs concrete sizes for modular arithmetic.
+    # TODO(issue#1372): replace with bucketed split strategy for symbolic shapes.
     it_space = {k: concretize_expr(v) for k, v in it_space.items()}
     input_tds = [TensorDep(a.dep, a.layout) for a in args]
     output_td = TensorDep(next(iter(n.read_writes.writes)), n.node.get_layout())

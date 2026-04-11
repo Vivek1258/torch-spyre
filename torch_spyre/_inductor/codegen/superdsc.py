@@ -379,9 +379,15 @@ def _get_op_func(op: str, is_reduction: bool, output_scales: dict) -> str:
 def _concretize_for_sdsc(expr: Expr) -> int:
     """Concretize a symbolic expression at the SDSC generation boundary.
 
-    SDSC generation (and the downstream backend compiler) requires all
-    iteration space sizes to be concrete integers.  Once symbolic SDSC
-    generation is implemented, this function can be removed.
+    SDSC generation (and the downstream DeepTools backend compiler) currently
+    requires all iteration-space sizes to be concrete integers.  This is the
+    final concretization point in the pipeline: everything upstream may be
+    symbolic, but the SDSC JSON emitted here is fully concrete.
+
+    TODO(issue#220): once SDSC generation emits ``symbolDefinitions_`` and
+    ``symbolicDimInfo_`` for the DeepTools VariableDefinition DAG, this
+    function can be replaced with symbolic expression serialisation and
+    iteration-space sizes can remain symbolic all the way through.
     """
     if isinstance(expr, int):
         return expr

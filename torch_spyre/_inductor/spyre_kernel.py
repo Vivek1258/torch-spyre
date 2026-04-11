@@ -89,14 +89,18 @@ class UnimplementedOp(RValue):
 def _serialize_value(v):
     """Serialize a value for code generation, handling symbolic expressions.
 
-    Produces valid Python source text.  All sympy expressions—including
-    symbolic ones with free symbols—are concretized to Python ``int`` /
-    ``float`` so the generated code never depends on sympy names (``Mul``,
-    ``Float``, ``Pow``, etc.) being in scope.
+    Produces valid Python source text that can appear in the generated kernel
+    wrapper code.  All sympy expressions—including symbolic ones with free
+    symbols—are concretized to Python ``int`` / ``float`` so the generated
+    code never depends on sympy names (``Mul``, ``Float``, ``Pow``, etc.)
+    being in scope.
 
-    SDSC generation at this point requires concrete values.  Keeping them
-    symbolic here would only be needed once SDSC generation itself supports symbolic
-    expressions.
+    This is needed because ``op_info`` dicts may contain symbolic scalars
+    (e.g. ``1.0 / s97``) that came from Inductor's symbolic analysis.
+
+    TODO(issue#220): once SDSC generation produces symbolic JSON
+    (``symbolDefinitions_``), this function should emit symbolic references
+    rather than concretizing.
     """
     if isinstance(v, sympy.Integer):
         return repr(int(v))

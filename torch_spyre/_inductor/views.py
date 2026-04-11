@@ -22,12 +22,19 @@ from typing import Optional, Sequence, Dict, Tuple
 from torch._inductor.virtualized import V
 
 
-def _concretize_for_cmp(expr: sympy.Expr) -> int:
+# NOTE: this is intentionally a local copy of pass_utils.concretize_expr.
+# views.py cannot import from pass_utils because pass_utils imports
+# compute_coordinates from views (circular dependency).  The duplication
+# is acceptable because both are thin wrappers around V.graph.sizevars.size_hint.
+def _concretize_for_cmp(expr) -> int:
     """Return a concrete int for use in comparison operators only.
 
-    It is only used for the branching decisions inside
-    ``compute_coordinates`` (e.g. choosing which dimension a loop variable
-    maps to).
+    Used for branching decisions inside ``compute_coordinates`` and
+    ``align_tensors`` (e.g. choosing which dimension a loop variable maps to).
+    The coordinate *output* expressions stay symbolic.
+
+    TODO(issue#1373): once these algorithms use sympy predicates or
+    SizeVarAllocator guards, this function can be removed.
     """
     if isinstance(expr, (int, float)):
         return int(expr)
@@ -68,7 +75,9 @@ def compute_coordinates(
     coordinates = [sympy.S.Zero] * n
     vars = index.free_symbols
     for var in vars:
-        # Skip symbols that are not loop variables (e.g. size symbols like
+        # Skip symbols that are not loop variables (e.g. size symbols
+        # injected by dynamic shapes that appear in the index expression
+        # but are not iteration variables).
         if var not in var_ranges:
             continue
 
@@ -88,9 +97,10 @@ def compute_coordinates(
         step = term.subs(var, 1)
         limit = term.subs(var, range_val)
 
-        # Concretize step and limit for comparison logic only.
-        # step is typically concrete (single-variable substitution with 1),
-        # but limit can be symbolic when range_val is symbolic.
+        # Concretize step and limit for comparison logic only.  The symbolic
+        # ``step`` and ``limit`` are still used in the coordinate *output*
+        # expressions (``var * step // st``), preserving symbolic output.
+        # TODO(issue#1373): replace with sympy predicates to avoid concretization.
         concrete_step = _concretize_for_cmp(step)
         concrete_limit = _concretize_for_cmp(limit)
 
@@ -305,6 +315,8 @@ def align_tensors(
     # sorting, math.gcd, and integer division that require concrete ints.
     # Coordinate *expressions* remain symbolic (they reference loop variable
     # Symbols, not range values).
+    # TODO(issue#1373): make align_tensors symbolic-aware so concretization can
+    #              be removed.
 
     var_ranges = {
         var: _concretize_for_cmp(val[0]) for var, val in iteration_space.items()

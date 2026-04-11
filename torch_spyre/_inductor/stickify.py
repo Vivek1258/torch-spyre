@@ -52,6 +52,10 @@ from .pass_utils import (
     device_coordinates,
 )
 from .views import matching_dim
+# ---------------------------------------------------------------------------
+# TODO(issue#1371): once SpyreTensorLayout is migrated to c10::SymInt, all
+# concretize_expr calls in this file can be removed.
+# ---------------------------------------------------------------------------
 
 logger = get_inductor_logger("stickify")
 
