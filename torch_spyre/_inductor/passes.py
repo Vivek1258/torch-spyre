@@ -24,6 +24,7 @@ from torch._inductor.custom_graph_pass import (
 )
 from torch._inductor.scheduler import BaseSchedulerNode
 
+from .padding import insert_padding
 from .temp_passes import (
     bmm_unflatten_pass,
     mm_to_bmm_pass,
@@ -48,6 +49,19 @@ def _maybe_run_graph_pass(pass_fn, graph: torch.fx.graph.Graph) -> None:
 
     if has_spyre_device:
         return pass_fn(graph)
+
+
+class CustomPreGradPasses:
+    """
+    This inductor extension point enables Spyre-specific passes to run on the
+    pre-grad FX graph.
+    """
+
+    passes: List[Callable[[torch.fx.graph.Graph], None]] = [insert_padding]
+
+    def __call__(self, graph: torch.fx.graph.Graph) -> None:
+        for p in self.passes:
+            p(graph)
 
 
 class CustomPrePasses(CustomGraphPass):
@@ -138,10 +152,7 @@ class CustomPreFusionPasses(CustomNodePassBase):
     """
 
     def get_passes(self):
-        passes = [propagate_spyre_tensor_layouts, core_division_planning]
-        if config.lx_planning:
-            passes.append(scratchpad_planning)
-        return passes
+        return [propagate_spyre_tensor_layouts]
 
 
 class CustomPostFusionPasses(CustomNodePassBase):
@@ -149,9 +160,22 @@ class CustomPostFusionPasses(CustomNodePassBase):
     This inductor extension point enables Spyre-specific passes to run over
     the graph of LoopLevelIR nodes immediately after Inductor's fusion pass runs.
 
+    core_division_planning must run here (not pre-fusion) because inductor's
+    fusion pass renames the iteration-space symbols in MemoryDep.ranges between
+    the two phases.  Storing op_it_space_splits before that rename causes a
+    symbol mismatch at codegen time, silently dropping all work-division splits.
+
     The list of nodes is guarenteed by the caller to be in topological order.
     The returned list of nodes must also be in topological order.
     """
 
     def get_passes(self):
-        return [spyre_fuse_nodes]
+        # core_division_planning and scratchpad_planning must precede
+        # spyre_fuse_nodes because the latter wraps SchedulerNodes into
+        # FusedSchedulerNodes, making them invisible to those passes'
+        # isinstance(n, SchedulerNode) checks.
+        passes = [core_division_planning]
+        if config.lx_planning:
+            passes.append(scratchpad_planning)
+        passes.append(spyre_fuse_nodes)
+        return passes
