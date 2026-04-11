@@ -47,11 +47,15 @@ def get_mem_deps(n: SchedulerNode) -> list[SchedNodeArg]:
 def concretize_expr(expr: Union[Expr, int]) -> int:
     """Concretize a sympy expression to a Python int.
 
-    Used at boundaries where concrete values are required (C++ constructors,
-    comparison operators inside algorithms).  Symbolic loop variables in
-    coordinate *output* expressions are never affected—only the structural
-    parameters (sizes, strides) are concretized so that the algorithm can
-    make branching decisions.
+    Used at boundaries where concrete values are required (e.g. C++
+    constructors that only accept ``int``, comparison operators inside
+    algorithms such as core-division and coordinate computation).
+
+    Key invariant: only structural parameters (sizes, strides, split
+    counts) are concretized.  Symbolic loop variables inside coordinate
+    output expressions are never touched, so the generated coordinate
+    expressions remain symbolic and will carry through to the SDSC when
+    symbolic SDSC generation is implemented.
     """
     if isinstance(expr, int):
         return expr
@@ -63,9 +67,11 @@ def concretize_expr(expr: Union[Expr, int]) -> int:
 
 
 def host_coordinates(layout: FixedLayout, dep: MemoryDep) -> list[sympy.Expr]:
-    # Concretize size/stride for the compute_coordinates algorithm (needs
-    # concrete values for comparison operators).  The var_ranges and index
-    # stay symbolic so that coordinate *output* expressions remain symbolic.
+    # Concretize size/stride so compute_coordinates can use plain ``<``/``>``
+    # comparisons.  var_ranges and index stay symbolic so the *output*
+    # coordinate expressions remain symbolic.
+    # TODO(issue#1373): remove concretization once compute_coordinates handles
+    #              symbolic comparisons natively.
     concrete_size = [concretize_expr(s) for s in layout.size]
     concrete_stride = [concretize_expr(s) for s in layout.stride]
     return compute_coordinates(concrete_size, concrete_stride, dep.ranges, dep.index)

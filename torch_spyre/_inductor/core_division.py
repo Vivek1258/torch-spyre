@@ -132,7 +132,8 @@ def multi_dim_iteration_space_split(
     for v in priorities:
         if n_cores_remaining <= 1:
             break
-
+        # TODO(issue#1372): with bucketed core division, keep iteration_space[v]
+        #              symbolic and compute splits per bucket.
         best_split = core_split(concretize_expr(iteration_space[v]), n_cores_remaining)
         if best_split > 1:
             splits[v] = best_split
@@ -460,6 +461,7 @@ def plan_splits(
 
     it_space = iteration_space(n)
     # Core division needs concrete sizes for modular arithmetic.
+    # TODO(issue#1372): replace with bucketed split strategy for symbolic shapes.
     it_space = {k: concretize_expr(v) for k, v in it_space.items()}
     input_tds = [TensorDep(a.dep, a.layout) for a in args]
     rw = op.get_read_writes()
@@ -528,8 +530,12 @@ def divide_reduction_op(op: ComputedBuffer, args: list[SchedNodeArg], max_cores)
     red: Reduction = op.data
     is_matmul = red.reduction_type in (MATMUL_REDUCTION_OP, BATCH_MATMUL_OP)
 
-    it_space = iteration_space_from_op(op)
-    input_tds, output_td = collect_tensor_deps(op, args)
+    it_space = iteration_space(n)
+    # Core division needs concrete sizes for modular arithmetic.
+    # TODO(issue#1372): replace with bucketed split strategy for symbolic shapes.
+    it_space = {k: concretize_expr(v) for k, v in it_space.items()}
+    input_tds = [TensorDep(a.dep, a.layout) for a in args]
+    output_td = TensorDep(next(iter(n.read_writes.writes)), n.node.get_layout())
 
     # FIXME: For non-matmul reduction, excluding reduction dimensions from work
     #        division candidates temporarily till known backend issue is fixed
