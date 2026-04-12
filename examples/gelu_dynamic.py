@@ -24,8 +24,10 @@ import torch.nn.functional as F
 DEVICE = torch.device("spyre")
 torch.manual_seed(0xAFFE)
 
+
 def gelu_fn(a):
     return F.gelu(a)
+
 
 # Compile with dynamic=True
 compiled_fn = torch.compile(gelu_fn, dynamic=True)

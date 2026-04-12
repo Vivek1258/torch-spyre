@@ -23,10 +23,12 @@ import torch
 DEVICE = torch.device("spyre")
 torch.manual_seed(0xAFFE)
 
+
 def softmax_fn(a):
     return torch.softmax(a, dim=0)
 
-# Compile with dynamic=True 
+
+# Compile with dynamic=True
 compiled_sm = torch.compile(softmax_fn, dynamic=True)
 
 x = torch.rand(512, 1024, dtype=torch.float16)

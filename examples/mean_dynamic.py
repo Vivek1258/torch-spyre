@@ -9,8 +9,10 @@ import torch
 DEVICE = torch.device("spyre")
 torch.manual_seed(0xAFFE)
 
+
 def mean_fn(a):
     return torch.mean(a, dim=0)
+
 
 # Compile with dynamic=True
 compiled_fn = torch.compile(mean_fn, dynamic=True)

@@ -9,10 +9,12 @@ import torch
 DEVICE = torch.device("spyre")
 torch.manual_seed(0xAFFE)
 
+
 def mul_fn(a, b):
     return torch.mul(a, b)
 
-# Compile with dynamic=True 
+
+# Compile with dynamic=True
 compiled_fn = torch.compile(mul_fn, dynamic=True)
 
 x = torch.rand(128, 64, dtype=torch.float16)
