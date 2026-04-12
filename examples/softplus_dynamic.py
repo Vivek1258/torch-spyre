@@ -24,10 +24,12 @@ import torch.nn.functional as F
 DEVICE = torch.device("spyre")
 torch.manual_seed(0xAFFE)
 
+
 def softplus_fn(a, b, c):
     return F.softplus(a, b, c)
 
-# Compile with dynamic=True 
+
+# Compile with dynamic=True
 compiled_sp = torch.compile(softplus_fn, dynamic=True)
 
 x = torch.rand(512, 1024, dtype=torch.float16)
