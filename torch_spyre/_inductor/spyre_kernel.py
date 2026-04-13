@@ -363,11 +363,18 @@ class SpyreKernel(Kernel[CSEVariable]):
     def create_tensor_arg(
         self, is_input: bool, name: str, tensor: TensorAccess
     ) -> TensorArg:
+        it_space = iteration_space(self.current_node)
+        # With dynamic=True the host index may contain symbolic strides
+        # (e.g. x0*s1+x1).  Concretize size symbols so normalize_coordinates
+        # can correctly isolate each loop variable's contribution.
+        from .pass_utils import _concretize_index
+
+        index = _concretize_index(tensor.index, set(it_space.keys()))
         device_coords = compute_coordinates(
             tensor.layout.device_layout.device_size,
             tensor.layout.device_layout.stride_map,
-            iteration_space(self.current_node),
-            tensor.index,
+            it_space,
+            index,
         )
         tensor_arg = TensorArg(
             is_input,

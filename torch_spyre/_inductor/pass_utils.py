@@ -66,6 +66,24 @@ def concretize_expr(expr: Union[Expr, int]) -> int:
     return int(expr)
 
 
+def _concretize_index(index: sympy.Expr, loop_vars: set) -> sympy.Expr:
+    """Replace non-loop symbolic variables in an index expression with concrete values.
+
+    With ``dynamic=True``, the host index may contain symbolic strides. When
+    ``normalize_coordinates`` isolates each loop variable's contribution
+    by substituting 0 for all other free symbols, the size symbol ``s1``
+    is also zeroed.  This function replaces size symbols with their concrete
+    hints so that coordinate expressions are structurally identical to static-shape
+    compilation while loop variable symbols are preserved.
+    """
+    size_syms = index.free_symbols - loop_vars
+    if not size_syms:
+        return index
+    subs = {s: V.graph.sizevars.size_hint(s) for s in size_syms}
+    result = index.subs(subs)
+    return result
+
+
 def host_coordinates(layout: FixedLayout, dep: MemoryDep) -> list[sympy.Expr]:
     # Concretize size/stride so compute_coordinates can use plain ``<``/``>``
     # comparisons.  var_ranges and index stay symbolic so the *output*
@@ -74,17 +92,19 @@ def host_coordinates(layout: FixedLayout, dep: MemoryDep) -> list[sympy.Expr]:
     #              symbolic comparisons natively.
     concrete_size = [concretize_expr(s) for s in layout.size]
     concrete_stride = [concretize_expr(s) for s in layout.stride]
-    return compute_coordinates(concrete_size, concrete_stride, dep.ranges, dep.index)
+    index = _concretize_index(dep.index, set(dep.ranges.keys()))
+    return compute_coordinates(concrete_size, concrete_stride, dep.ranges, index)
 
 
 def device_coordinates(layout: FixedTiledLayout, dep: MemoryDep) -> list[sympy.Expr]:
     # device_size and stride_map come from the C++ SpyreTensorLayout and are
     # already concrete, so no concretization is needed here.
+    index = _concretize_index(dep.index, set(dep.ranges.keys()))
     return compute_coordinates(
         layout.device_layout.device_size,
         layout.device_layout.stride_map,
         dep.ranges,
-        dep.index,
+        index,
     )
 
 
