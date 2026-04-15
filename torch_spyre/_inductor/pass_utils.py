@@ -83,6 +83,7 @@ def concretize_index(index: sympy.Expr, loop_vars: set) -> sympy.Expr:
     result = index.subs(subs)
     return result
 
+
 def get_mem_deps_from_rw(read_writes: ReadWrites) -> list[SchedNodeArg]:
     res: list[SchedNodeArg] = []
     for arg in read_writes.reads:
