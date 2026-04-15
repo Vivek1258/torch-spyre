@@ -39,7 +39,7 @@ from .constants import (
 )
 from .errors import Unsupported
 from .ir import FixedTiledLayout
-from .pass_utils import concretize_expr, iteration_space
+from .pass_utils import concretize_expr, iteration_space, concretize_index
 from .views import compute_coordinates, align_tensors
 from .logging_utils import get_inductor_logger
 from .op_spec import OpSpec, TensorArg
@@ -367,9 +367,8 @@ class SpyreKernel(Kernel[CSEVariable]):
         # With dynamic=True the host index may contain symbolic strides
         # (e.g. x0*s1+x1).  Concretize size symbols so normalize_coordinates
         # can correctly isolate each loop variable's contribution.
-        from .pass_utils import _concretize_index
 
-        index = _concretize_index(tensor.index, set(it_space.keys()))
+        index = concretize_index(tensor.index, set(it_space.keys()))
         device_coords = compute_coordinates(
             tensor.layout.device_layout.device_size,
             tensor.layout.device_layout.stride_map,

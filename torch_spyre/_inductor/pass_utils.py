@@ -66,7 +66,7 @@ def concretize_expr(expr: Union[Expr, int]) -> int:
     return int(expr)
 
 
-def _concretize_index(index: sympy.Expr, loop_vars: set) -> sympy.Expr:
+def concretize_index(index: sympy.Expr, loop_vars: set) -> sympy.Expr:
     """Replace non-loop symbolic variables in an index expression with concrete values.
 
     With ``dynamic=True``, the host index may contain symbolic strides. When
@@ -92,14 +92,14 @@ def host_coordinates(layout: FixedLayout, dep: MemoryDep) -> list[sympy.Expr]:
     #              symbolic comparisons natively.
     concrete_size = [concretize_expr(s) for s in layout.size]
     concrete_stride = [concretize_expr(s) for s in layout.stride]
-    index = _concretize_index(dep.index, set(dep.ranges.keys()))
+    index = concretize_index(dep.index, set(dep.ranges.keys()))
     return compute_coordinates(concrete_size, concrete_stride, dep.ranges, index)
 
 
 def device_coordinates(layout: FixedTiledLayout, dep: MemoryDep) -> list[sympy.Expr]:
     # device_size and stride_map come from the C++ SpyreTensorLayout and are
     # already concrete, so no concretization is needed here.
-    index = _concretize_index(dep.index, set(dep.ranges.keys()))
+    index = concretize_index(dep.index, set(dep.ranges.keys()))
     return compute_coordinates(
         layout.device_layout.device_size,
         layout.device_layout.stride_map,
