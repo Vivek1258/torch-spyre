@@ -39,7 +39,12 @@ from .constants import (
 )
 from .errors import Unsupported
 from .ir import FixedTiledLayout
-from .pass_utils import concretize_expr, iteration_space, concretize_index
+from .pass_utils import (
+    concretize_expr,
+    iteration_space,
+    concretize_index,
+    map_ir_splits_to_scheduler,
+)
 from .views import compute_coordinates, align_tensors
 from .logging_utils import get_inductor_logger
 from .op_spec import OpSpec, TensorArg

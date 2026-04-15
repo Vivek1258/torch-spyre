@@ -84,6 +84,18 @@ def concretize_index(index: sympy.Expr, loop_vars: set) -> sympy.Expr:
     return result
 
 
+def get_mem_deps_from_rw(read_writes: ReadWrites) -> list[SchedNodeArg]:
+    res: list[SchedNodeArg] = []
+    for arg in read_writes.reads:
+        if isinstance(arg, MemoryDep):
+            buf = V.graph.get_buffer(arg.name)
+            layout = buf.get_layout()
+            if not isinstance(layout, FixedTiledLayout):
+                raise RuntimeError(f"{buf} does not have FixedTiledLayout")
+            res.append(SchedNodeArg(arg, layout))
+    return res
+
+
 def host_coordinates(layout: FixedLayout, dep: MemoryDep) -> list[sympy.Expr]:
     # Concretize size/stride so compute_coordinates can use plain ``<``/``>``
     # comparisons.  var_ranges and index stay symbolic so the *output*
