@@ -57,12 +57,18 @@ def compute_coordinates(
     Stride and index must be relative to the same storage (both host or device).
     Stride values<=0 are ignored.
 
-    ``size`` and ``stride`` should be concrete (int) when possible—callers
-    such as ``host_coordinates`` concretize them before calling.  ``var_ranges``
+    ``size`` and ``stride`` must be concrete (int) values—callers such as
+    ``host_coordinates`` concretize them before calling.  ``var_ranges``
     may contain symbolic expressions (e.g. a dynamic batch dimension); the
     algorithm concretizes range values only for comparison logic, while the
     output coordinate expressions remain symbolic.
     """
+    assert all(isinstance(s, (int, sympy.Integer)) for s in stride), (
+        f"compute_coordinates requires concrete strides, got {stride}"
+    )
+    assert all(isinstance(s, (int, sympy.Integer)) for s in size), (
+        f"compute_coordinates requires concrete sizes, got {size}"
+    )
     # find stride immediately strictly larger that dim stride
     n = len(size)
     next_stride = [sympy.oo] * n
