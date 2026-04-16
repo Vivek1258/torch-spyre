@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import NamedTuple, Union
+from typing import Callable, NamedTuple, TypeVar, Union
 
 
 import sympy
