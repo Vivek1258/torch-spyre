@@ -19,6 +19,7 @@ import torch
 from utils_inductor import (
     ParameterizedTestMeta,
     cached_randn,
+    cached_xavier,
     make_param_dict,
     unique_randn_along_dim,
 )
@@ -196,6 +197,27 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                     ((2, 3, 99, 65), (2, 3, 65, 55)),
                 ]
             ),
+        },
+        ("test_large_matmul", "test_mm_relaxed"): {
+            "ops_dict": {"matmul": torch.matmul},
+            "param_sets": {
+                "2d_M2048_K2048_N65536": (
+                    cached_randn((2048, 2048)),
+                    cached_xavier((2048, 65536)),
+                ),
+                "3d_M3_K11_N2880": (
+                    cached_randn((3, 11, 2880)),
+                    cached_xavier((3, 2880, 2880)),
+                ),
+                "3d2d_M3_K11_N2880": (
+                    cached_randn((3, 11, 2880)),
+                    cached_xavier((2880, 2880)),
+                ),
+                "4d_B2_H2_M2048_K2048_N65536": (
+                    cached_randn((2, 2, 2048, 2048)),
+                    cached_xavier((2, 2, 2048, 65536)),
+                ),
+            },
         },
         ("test_sdsc_padding_sum_keepdim1", "test_reduce_keepdim1_cpu"): {
             "ops_dict": {"sum": torch.sum},
@@ -1196,7 +1218,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
         ): {
             "ops_dict": {
                 # exp(unsqueeze(x)) triggers internal compile in eager mode that
-                # fails with "Host dimension not found in dim_map" errors
+                # fails with host dimension lookup errors
                 "combined": lambda dim, x: torch.exp(torch.unsqueeze(x, dim)),
             },
             "param_sets": {
@@ -1598,6 +1620,33 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 # ),
             }
         },
+        ("test_split", "test_split_cpu"): {
+            "ops_dict": {
+                "split3": lambda dim, index, x: (
+                    torch.split(x, x.size()[dim] // 3, dim=dim)[index].clone(),
+                ),
+            },
+            "param_sets": {
+                "1d0s0": (0, 0, cached_randn((384,), dtype=torch.float16)),
+                "1d0s1": (0, 1, cached_randn((384,), dtype=torch.float16)),
+                "1d0s2": (0, 2, cached_randn((384,), dtype=torch.float16)),
+                "2d0s0": (0, 0, cached_randn((9, 384), dtype=torch.float16)),
+                "2d0s1": (0, 1, cached_randn((9, 384), dtype=torch.float16)),
+                "2d0s2": (0, 2, cached_randn((9, 384), dtype=torch.float16)),
+                "2d1s0": (1, 0, cached_randn((9, 384), dtype=torch.float16)),
+                "2d1s1": (1, 1, cached_randn((9, 384), dtype=torch.float16)),
+                "2d1s2": (1, 2, cached_randn((9, 384), dtype=torch.float16)),
+                "3d0s0": (0, 0, cached_randn((9, 15, 384), dtype=torch.float16)),
+                "3d0s1": (0, 1, cached_randn((9, 15, 384), dtype=torch.float16)),
+                "3d0s2": (0, 2, cached_randn((9, 15, 384), dtype=torch.float16)),
+                "3d1s0": (1, 0, cached_randn((9, 15, 384), dtype=torch.float16)),
+                "3d1s1": (1, 1, cached_randn((9, 15, 384), dtype=torch.float16)),
+                "3d1s2": (1, 2, cached_randn((9, 15, 384), dtype=torch.float16)),
+                "3d2s0": (2, 0, cached_randn((9, 15, 384), dtype=torch.float16)),
+                "3d2s1": (2, 1, cached_randn((9, 15, 384), dtype=torch.float16)),
+                "3d2s2": (2, 2, cached_randn((9, 15, 384), dtype=torch.float16)),
+            },
+        },
     }
 
     def __init__(self, *args, **kwargs):
@@ -1667,7 +1716,7 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
     # Increased mm test tolerance for splitk
     def test_mm_relaxed(self, op, a, b):
         K = b.shape[-2]
-        if K >= (128 // b.element_size()):  # multiple sticks
+        if K > (128 // b.element_size()):  # multiple sticks
             compare(op, a, b, atol=0.1, rtol=0.1)
         else:  # single stick, no need to relax
             compare(op, a, b)
@@ -2167,6 +2216,12 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
                 return result.item()
 
             compare_with_cpu(fn, x, y, cpu_compile=False)
+
+    def test_split_cpu(self, op, dim, index, x):
+        def fn(x):
+            return op(dim, index, x)
+
+        compare_with_cpu(fn, x, run_eager=False, cpu_compile=False)
 
 
 if __name__ == "__main__":
