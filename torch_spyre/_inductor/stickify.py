@@ -513,7 +513,8 @@ def reduction_layout(
         # Concretize for C++ SpyreTensorLayout constructor.
         c_size = [concretize_expr(s) for s in output.size]
         c_stride = [concretize_expr(s) for s in output.stride]
-        stl = SpyreTensorLayout(c_size, c_stride, output.dtype, dim_map)
+        stl = SpyreTensorLayout(c_size, c_stride, output.dtype, dim_order)
+
         return FixedTiledLayout(
             output.device, output.dtype, output.size, output.stride, stl
         )
