@@ -133,8 +133,8 @@ def multi_dim_iteration_space_split(
     for v in priorities:
         if n_cores_remaining <= 1:
             break
-        # TODO(issue#1372): with symbolic core division, concretize_expr 
-        #                   for core_split will not be needed. 
+        # TODO(issue#1372): with symbolic core division, concretize_expr
+        #                   for core_split will not be needed.
         best_split = core_split(concretize_expr(iteration_space[v]), n_cores_remaining)
         if best_split > 1:
             splits[v] = best_split
