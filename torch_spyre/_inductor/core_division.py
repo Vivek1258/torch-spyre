@@ -133,8 +133,8 @@ def multi_dim_iteration_space_split(
     for v in priorities:
         if n_cores_remaining <= 1:
             break
-        # TODO(issue#1372): with bucketed core division, keep iteration_space[v]
-        #              symbolic and compute splits per bucket.
+        # TODO(issue#1372): with symbolic core division, concretize_expr 
+        #                   for core_split will not be needed. 
         best_split = core_split(concretize_expr(iteration_space[v]), n_cores_remaining)
         if best_split > 1:
             splits[v] = best_split
@@ -218,7 +218,7 @@ def get_per_core_span(
             # ``int(term.subs(...))`` cast below) is a Python int.  Per-core
             # span is a hardware-bound quantity that must be compared against
             # MAX_SPAN_BYTES, so concretization here is the right boundary.
-            # TODO(issue#1372): bucketed core division will keep this symbolic.
+            # TODO(issue#1372): Symbolic core division will keep this symbolic.
             R = concretize_expr(it_space_orig[v]) // splits.get(v, 1)
             per_core_max += int(term.subs(v, R - 1))
         per_core_size = per_core_max + 1
@@ -287,7 +287,7 @@ def must_split_vars(
             # ``s0 > 1`` returns a sympy Relational whose truth value is
             # undefined.  Span filtering here is a structural decision that
             # needs a concrete answer.
-            # TODO(issue#1372): bucketed core division will keep this symbolic.
+            # TODO(issue#1372): Symbolic core division will keep this symbolic.
             vars = [
                 v
                 for v in coord.free_symbols
@@ -367,7 +367,7 @@ def must_split_vars(
             # the committed splits, inner dimensions cannot reduce the span further.
             # Concretize it_space_orig[v] so the ``int(coord.subs(...))`` cast
             # below succeeds with symbolic ranges.
-            # TODO(issue#1372): bucketed core division will keep this symbolic.
+            # TODO(issue#1372): Symbolic core division will keep this symbolic.
             per_core_coord_size = (
                 max(
                     int(
@@ -424,7 +424,7 @@ def prioritize_dimensions(
     # whose truth value is undefined and would raise inside Python's sort.
     # The priority order is a structural decision (largest dim first) that
     # needs a concrete numeric ordering.
-    # TODO(issue#1372): bucketed core division will keep this symbolic.
+    # TODO(issue#1372): Symbolic core division will keep this symbolic.
     remaining_output.sort(key=lambda t: concretize_expr(t[1]), reverse=True)
     reduction_dims.sort(key=lambda t: concretize_expr(t[1]), reverse=True)
 
