@@ -26,20 +26,33 @@ from torch._inductor.virtualized import V
 # views.py cannot import from pass_utils because pass_utils imports
 # compute_coordinates from views (circular dependency).  The duplication
 # is acceptable because both are thin wrappers around V.graph.sizevars.size_hint.
-def _concretize_for_cmp(expr) -> int:
-    """Return a concrete int for use in comparison operators only.
+def _concretize_for_cmp(expr):
+    """Return a concrete numeric value for use in comparison operators only.
 
     Used for branching decisions inside ``compute_coordinates`` and
     ``align_tensors`` (e.g. choosing which dimension a loop variable maps to).
     The coordinate *output* expressions stay symbolic.
 
+    Returns a Python ``int`` for ordinary values, and ``math.inf`` /
+    ``-math.inf`` for sympy infinities (used as ``limit=sympy.oo`` sentinels
+    in ``add_term`` when the index has a non-zero storage offset, e.g. for
+    slice / split ops).  ``int(sympy.oo)`` would raise; ``math.inf`` works
+    correctly in ``<`` / ``>`` comparisons against ints and sympy values.
+
     TODO(issue#1373): once these algorithms use sympy predicates or
     SizeVarAllocator guards, this function can be removed.
     """
-    if isinstance(expr, (int, float)):
-        return int(expr)
+    if isinstance(expr, int):
+        return expr
     if isinstance(expr, sympy.Integer):
         return int(expr)
+    # sympy.oo / -sympy.oo cannot be cast to int; preserve as Python infinity.
+    if expr == sympy.oo:
+        return math.inf
+    if expr == -sympy.oo:
+        return -math.inf
+    if isinstance(expr, float):
+        return expr  # passthrough (incl. math.inf); avoids int(math.inf) error
     if hasattr(expr, "free_symbols") and expr.free_symbols:
         return V.graph.sizevars.size_hint(expr)
     return int(expr)
