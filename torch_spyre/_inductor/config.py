@@ -29,6 +29,21 @@ dxp_lx_frac_avail: float = float(os.environ.get("DXP_LX_FRAC_AVAIL", "0.2"))
 
 sencores: int = int(os.getenv("SENCORES", "32"))
 
+# Dynamic-shape / symbolic-dim knobs --------------------------------------
+# Upper bound on the number of admissible runtime buckets for a symbolic
+# dimension (= max_size / granularity). Keeps the bucket structure bounded
+# so downstream validation / padding tables stay small.
+max_buckets: int = int(os.getenv("MAX_BUCKETS", "32"))
+
+# Soft floor on the auto-derived granularity when mark_dynamic(min=...) is
+# not supplied. Acts as a parallelism floor: the symbolic dim can be split
+# at most min(largest_divisor_of_G <= SENCORES, G) ways during work
+# division, so a too-small default G caps symbolic-dim parallelism even
+# when other dims have nowhere to absorb the extra cores.
+# Only consulted in the auto-derive branch; a user-supplied min is honoured
+# verbatim (subject to divisibility and bucket-cap checks).
+min_default_granularity: int = int(os.getenv("MIN_DEFAULT_GRANULARITY", "4"))
+
 # k_fast: a two-layer optimisation for K-split matmul work-divisions.
 #   Layer 1 (planner, core_division.py): picks (1, n, k>1) over pure-M
 #     for narrow-N small-M matmul shapes that would otherwise leave the
