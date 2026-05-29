@@ -220,5 +220,124 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             assert result == index, f"Expected {index}, got {result}"
 
 
+class TestPassUtils(unittest.TestCase):
+    """Unit tests for helpers in ``torch_spyre._inductor.pass_utils``.
+
+    These cover the pure-Python utilities (no live Inductor compile context
+    required); the ShapeEnv interactions are stubbed via ``unittest.mock``.
+    """
+
+    @staticmethod
+    def _mock_v_with_bounds(lower, upper):
+        """Build a mock ``V`` whose ShapeEnv reports the given bounds.
+
+        Only the ``.lower`` and ``.upper`` fields of the ValueRanges-shaped
+        return value are read by the helpers under test, so a
+        ``SimpleNamespace`` is sufficient.
+        """
+        from types import SimpleNamespace
+
+        def bound_sympy(_expr):
+            return SimpleNamespace(lower=lower, upper=upper)
+
+        return SimpleNamespace(
+            graph=SimpleNamespace(
+                sizevars=SimpleNamespace(
+                    shape_env=SimpleNamespace(bound_sympy=bound_sympy)
+                )
+            )
+        )
+
+    # ----- compute_granularity --------------------------------------------
+
+    def test_compute_granularity_user_min_happy_path(self):
+        """User-supplied min is honoured when it divides max and the
+        resulting bucket count fits under max_buckets."""
+        from unittest.mock import patch
+        import sympy
+        from torch_spyre._inductor.pass_utils import compute_granularity
+
+        expr = sympy.Symbol("s0", integer=True, positive=True)
+        # max=512, min=16 -> 32 buckets, fits under default cap of 32.
+        mock_v = self._mock_v_with_bounds(sympy.Integer(16), sympy.Integer(512))
+        with patch("torch_spyre._inductor.pass_utils.V", mock_v):
+            granularity = compute_granularity(expr, max_size=512)
+            assert granularity == 16, f"expected 16, got {granularity}"
+
+    def test_compute_granularity_user_min_not_a_divisor_raises(self):
+        """User-supplied min that does not divide max -> Unsupported."""
+        from unittest.mock import patch
+        import sympy
+        from torch_spyre._inductor.errors import Unsupported
+        from torch_spyre._inductor.pass_utils import compute_granularity
+
+        expr = sympy.Symbol("s0", integer=True, positive=True)
+        mock_v = self._mock_v_with_bounds(sympy.Integer(7), sympy.Integer(512))
+        with patch("torch_spyre._inductor.pass_utils.V", mock_v):
+            with self.assertRaises(Unsupported) as cm:
+                compute_granularity(expr, max_size=512)
+        assert "must divide max" in str(cm.exception), str(cm.exception)
+
+    def test_compute_granularity_user_min_exceeds_bucket_cap_raises(self):
+        """User min that produces too many buckets -> Unsupported."""
+        from unittest.mock import patch
+        import sympy
+        from torch_spyre._inductor.errors import Unsupported
+        from torch_spyre._inductor.pass_utils import compute_granularity
+
+        expr = sympy.Symbol("s0", integer=True, positive=True)
+        # max=512, min=4 -> 128 buckets, exceeds default cap of 32.
+        mock_v = self._mock_v_with_bounds(sympy.Integer(4), sympy.Integer(512))
+        with patch("torch_spyre._inductor.pass_utils.V", mock_v):
+            with self.assertRaises(Unsupported) as cm:
+                compute_granularity(expr, max_size=512)
+        msg = str(cm.exception)
+        assert "buckets" in msg and "max_buckets" in msg, msg
+
+    def test_compute_granularity_default_with_warning(self):
+        """When the user did not supply min (lower == ShapeEnv default), the
+        smallest divisor of max satisfying the floor and bucket cap is
+        chosen, and a warning is emitted."""
+        import warnings
+        from unittest.mock import patch
+        import sympy
+        from torch_spyre._inductor.pass_utils import compute_granularity
+
+        expr = sympy.Symbol("s0", integer=True, positive=True)
+        # lower=2 is PyTorch's default -> treated as "no min provided".
+        # max=1024 with default max_buckets=32 and floor=4:
+        #   smallest divisor of 1024 >= 4 with 1024/d <= 32 is 32.
+        mock_v = self._mock_v_with_bounds(sympy.Integer(2), sympy.Integer(1024))
+        with patch("torch_spyre._inductor.pass_utils.V", mock_v):
+            with warnings.catch_warnings(record=True) as w:
+                warnings.simplefilter("always")
+                granularity = compute_granularity(expr, max_size=1024)
+        assert granularity == 32, f"expected 32, got {granularity}"
+        messages = [str(x.message) for x in w]
+        assert any("defaulting granularity" in m for m in messages), messages
+
+    def test_compute_granularity_size_hint_fallback_emits_warning(self):
+        """When the symbol has no finite upper bound (compute_max_size fell
+        back to size_hint), a warning is emitted before granularity is
+        derived."""
+        import warnings
+        from unittest.mock import patch
+        import sympy
+        from torch_spyre._inductor.pass_utils import compute_granularity
+
+        expr = sympy.Symbol("s0", integer=True, positive=True)
+        # No finite upper bound (sympy.oo) -> compute_max_size would have
+        # fallen back to size_hint; granularity helper warns about this.
+        mock_v = self._mock_v_with_bounds(sympy.Integer(2), sympy.oo)
+        with patch("torch_spyre._inductor.pass_utils.V", mock_v):
+            with warnings.catch_warnings(record=True) as w:
+                warnings.simplefilter("always")
+                granularity = compute_granularity(expr, max_size=1024)
+        messages = [str(x.message) for x in w]
+        assert any("came from size_hint" in m for m in messages), messages
+        # The function should still return a usable granularity.
+        assert granularity == 32, f"expected 32, got {granularity}"
+
+
 if __name__ == "__main__":
     unittest.main()
