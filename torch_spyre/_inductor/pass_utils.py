@@ -102,8 +102,10 @@ def concretize_expr(expr: Union[Expr, int]) -> int:
 def _user_min_or_none(expr: Expr) -> Optional[int]:
     """Return the user-supplied ``mark_dynamic(min=...)``, or ``None``.
 
-    Lower bounds equal to ``_SHAPE_ENV_DEFAULT_LOWER`` are treated as
-    "no min provided". See #2284 for the trade-off (min=2 case).
+    PyTorch initialises the lower bound for size symbols to 2 (sizes 0
+    and 1 are specialised), so a lower bound of 2 is indistinguishable
+    from "user did not pass min". We treat lower == 2 as "no min
+    provided". See #2284 for the discussion of the min=2 edge case.
     """
     vr = V.graph.sizevars.shape_env.bound_sympy(expr)
     if not isinstance(vr.lower, sympy.Integer):
@@ -123,20 +125,24 @@ def _has_finite_upper_bound(expr: Expr) -> bool:
 def compute_granularity(expr: Expr, max_size: int) -> int:
     """Return the granularity for a symbolic dimension.
 
-    Admissible runtime values are ``{G, 2G, ..., max_size}``. If the user
-    set ``mark_dynamic(min=...)`` it is honoured after validation; otherwise
-    the smallest divisor of ``max_size`` satisfying ``config.max_buckets``
-    and ``config.min_default_granularity`` is picked.
+    Admissible runtime values are ``{G, 2G, ..., max_size}``. If the
+    user passed ``mark_dynamic(min=...)`` we honour it after validation;
+    otherwise we pick the smallest divisor of ``max_size`` that
+    satisfies ``config.max_buckets`` and ``config.min_default_granularity``.
 
-    Callers must only invoke this for symbolic ``expr``. See #2284, #2287,
-    #2288, #2289 for the full design.
+    Callers must only invoke this for symbolic ``expr``. See #2284,
+    #2287, #2288, #2289 for the full design.
 
-    # TODO(phase-2.A): stick-dim symbolic case. When the symbolic dim is the
-    #   stick dim of its tensor, granularity must additionally be a multiple
-    #   of ``elems_per_stick(dtype)``. Out of scope for Phase 1.
-    # TODO: to be used in size_hint call-sites in work_division.py and
-    #   codegen/superdsc.py for SDSC fields and work-division planning
-    #   (parallels the TODO on ``compute_max_size``).
+    Wiring: this helper has no call sites yet. The pointwise
+    work-division PR (#2499) will plug it into the size_hint call sites
+    in ``work_division.py`` and ``codegen/superdsc.py``, alongside
+    ``compute_max_size`` from #2003. We are landing the utilities
+    separately so each PR stays small and reviewable on its own; #2499
+    is the PR that actually exercises both.
+
+    Deferred: when the symbolic dim is the stick dim of its tensor the
+    granularity also needs to be a multiple of ``elems_per_stick(dtype)``.
+    Handled in a follow-up once the stick-dim symbolic path is enabled.
     """
     assert hasattr(expr, "free_symbols") and expr.free_symbols, (
         f"compute_granularity called on non-symbolic expr={expr!r}"
@@ -145,8 +151,10 @@ def compute_granularity(expr: Expr, max_size: int) -> int:
     max_buckets = config.max_buckets
     min_default_g = config.min_default_granularity
 
-    # If compute_max_size fell back to size_hint, the granularity we pick
-    # here is only as trustworthy as that hint. Surface that.
+    # When ShapeEnv has no finite upper bound, max_size came from
+    # size_hint (via compute_max_size in #2003), not from
+    # mark_dynamic(max=...). The granularity is then only as trustworthy
+    # as that hint -- warn the user so they can pin it explicitly.
     if not _has_finite_upper_bound(expr):
         warnings.warn(
             f"max for symbolic dim {expr} came from size_hint, not from "
@@ -171,8 +179,8 @@ def compute_granularity(expr: Expr, max_size: int) -> int:
             )
         return user_min
 
-    # No user min: smallest divisor of max_size >= min_default_g with
-    # max_size / d <= max_buckets.
+    # No user min: pick the smallest divisor d of max_size where
+    # d >= min_default_g and max_size / d <= max_buckets.
     for divisor in sorted(sympy.divisors(max_size)):
         if divisor < min_default_g:
             continue
@@ -186,8 +194,9 @@ def compute_granularity(expr: Expr, max_size: int) -> int:
             )
             return divisor
 
-    # Unreachable for sane inputs (max_size is always a self-divisor with
-    # 1 bucket). Defensive raise.
+    # Unreachable for sane inputs: max_size is always a divisor of
+    # itself and gives 1 bucket, so the loop above always finds a hit.
+    # Kept as a defensive raise.
     raise Unsupported(
         f"No valid granularity for max={max_size} under "
         f"max_buckets={max_buckets}, min_default_granularity={min_default_g}"

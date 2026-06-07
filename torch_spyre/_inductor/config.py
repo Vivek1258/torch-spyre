@@ -32,21 +32,20 @@ dxp_lx_frac_avail: float = float(os.environ.get("DXP_LX_FRAC_AVAIL", "0.2"))
 
 sencores: int = int(os.getenv("SENCORES", "32"))
 
-# Symbolic-dim knobs: see #2284, #2287.
+# Symbolic-dim knobs consumed by compute_granularity in pass_utils.py.
+# The pointwise work-division PR (#2499) wires that helper into the
+# compilation pipeline; until then these knobs are read only by the
+# helper and its unit tests. See #2284, #2287 for the design.
+
 # Cap on bucket count (= max_size / granularity).
-# TODO: get confirmation from Deeptools for default MAX_BUCKETS value.
+# TODO: confirm the default with the Deeptools team.
 max_buckets: int = int(os.getenv("MAX_BUCKETS", "32"))
-# Soft floor on auto-derived granularity when mark_dynamic(min=...) is absent.
+
+# Soft floor on the auto-derived granularity when mark_dynamic(min=...)
+# is not provided. Keeps the picked granularity from collapsing to a
+# very small divisor when max_size has many of them.
 min_default_granularity: int = int(os.getenv("MIN_DEFAULT_GRANULARITY", "4"))
 
-# k_fast: a two-layer optimisation for K-split matmul work-divisions.
-#   Layer 1 (planner, core_division.py): picks (1, n, k>1) over pure-M
-#     for narrow-N small-M matmul shapes that would otherwise leave the
-#     PT array under-utilised.
-#   Layer 2 (SDSC emitter, codegen/compute_ops.py): permutes physical
-#     core IDs so K-collaborators land on adjacent ring positions,
-#     reducing PSUM chain hops from m*n to 1.
-# Set SPYRE_CORE_ID_K_FAST_EMISSION=0 to disable both layers.
 # For K-split matmuls, permute physical core IDs so the cores collaborating on a
 # K reduction land on adjacent ring positions, cutting PSUM chain hops from m*n
 # to 1. The split itself is chosen by the cost-model planner; this only reorders
