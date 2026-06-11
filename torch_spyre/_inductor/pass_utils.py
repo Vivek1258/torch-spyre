@@ -104,23 +104,39 @@ def _user_min_or_none(expr: Expr) -> Optional[int]:
     """Return the user-supplied ``mark_dynamic(min=...)``, or ``None``.
 
     PyTorch initialises the lower bound for size symbols to 2 (sizes 0
-    and 1 are specialised), so a lower bound of 2 is indistinguishable
-    from "user did not pass min". We treat lower == 2 as "no min
-    provided". See #2284 for the discussion of the min=2 edge case.
+    and 1 are specialised), so a recorded lower bound of 2 is
+    indistinguishable from "user did not pass min". We treat
+    ``lower == 2`` as "no min provided".
+
+    Known limitation: a user who legitimately passes
+    ``mark_dynamic(min=2, max=...)`` will be silently treated as if
+    they had not passed min at all. The call site in
+    ``compute_granularity`` will then take the default-divisor branch
+    (and emit the "defaulting granularity to ..." warning) instead of
+    honouring the user value. There is no way to disambiguate the two
+    cases from the ShapeEnv alone -- resolving this needs PyTorch to
+    expose the user-provided min separately from the bound. See #2284
+    for the design discussion.
     """
     vr = V.graph.sizevars.shape_env.bound_sympy(expr)
     if not isinstance(vr.lower, sympy.Integer):
         return None
     lower = int(vr.lower)
+    # min=2 collides with PyTorch's default lower bound and is treated
+    # as "unset" here
     return None if lower == _SHAPE_ENV_DEFAULT_LOWER else lower
 
 
-def _has_finite_upper_bound(expr: Expr) -> bool:
-    """Whether ShapeEnv has a finite recorded upper bound for ``expr``."""
+def _finite_upper_or_none(expr: Expr) -> Optional[int]:
+    """Return the ShapeEnv finite upper bound for ``expr``, or ``None``.
+    A bound is usable iff it is a positive concrete
+    ``sympy.Integer``; ``sympy.oo``, non-integers, and non-positive
+    values all return ``None``.
+    """
     vr = V.graph.sizevars.shape_env.bound_sympy(expr)
-    return (
-        isinstance(vr.upper, sympy.Integer) and vr.upper.is_finite and int(vr.upper) > 0
-    )
+    if isinstance(vr.upper, sympy.Integer) and vr.upper.is_finite and int(vr.upper) > 0:
+        return int(vr.upper)
+    return None
 
 
 def compute_granularity(expr: Expr, max_size: int) -> int:
@@ -135,11 +151,9 @@ def compute_granularity(expr: Expr, max_size: int) -> int:
     #2287, #2288, #2289 for the full design.
 
     Wiring: this helper has no call sites yet. The pointwise
-    work-division PR (#2499) will plug it into the size_hint call sites
-    in ``work_division.py`` and ``codegen/superdsc.py``, alongside
-    ``compute_max_size`` from #2003. We are landing the utilities
-    separately so each PR stays small and reviewable on its own; #2499
-    is the PR that actually exercises both.
+    work-division PR (#2499) will plug it into the ``size_hint`` call
+    sites in ``work_division.py`` and ``codegen/superdsc.py``,
+    alongside ``compute_max_size``.
 
     Deferred: when the symbolic dim is the stick dim of its tensor the
     granularity also needs to be a multiple of ``elems_per_stick(dtype)``.
@@ -153,10 +167,11 @@ def compute_granularity(expr: Expr, max_size: int) -> int:
     min_default_g = config.min_default_granularity
 
     # When ShapeEnv has no finite upper bound, max_size came from
-    # size_hint (via compute_max_size in #2003), not from
+    # size_hint (via compute_max_size below, merged in #2003), not from
     # mark_dynamic(max=...). The granularity is then only as trustworthy
-    # as that hint -- warn the user so they can pin it explicitly.
-    if not _has_finite_upper_bound(expr):
+    # as that hint -- warn the user so they can pin it explicitly with
+    # mark_dynamic(max=...).
+    if _finite_upper_or_none(expr) is None:
         warnings.warn(
             f"max for symbolic dim {expr} came from size_hint, not from "
             f"mark_dynamic(max=...). Proceeding with max={max_size} as a "
@@ -251,10 +266,9 @@ def compute_max_size(expr: Union[Expr, int]) -> int:
         return int(expr)
     if not (hasattr(expr, "free_symbols") and expr.free_symbols):
         return int(expr)
-    shape_env = V.graph.sizevars.shape_env
-    vr = shape_env.bound_sympy(expr)
-    if isinstance(vr.upper, sympy.Integer) and vr.upper.is_finite and int(vr.upper) > 0:
-        return int(vr.upper)
+    bound = _finite_upper_or_none(expr)
+    if bound is not None:
+        return bound
     return V.graph.sizevars.size_hint(expr)
 
 

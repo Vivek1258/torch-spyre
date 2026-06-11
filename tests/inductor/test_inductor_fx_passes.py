@@ -22,7 +22,7 @@ import sympy
 import torch
 
 from torch_spyre._inductor.errors import Unsupported
-from torch_spyre._inductor.pass_utils import compute_granularity
+from torch_spyre._inductor.pass_utils import compute_granularity, compute_max_size
 from utils_inductor import (
     ParameterizedTestMeta,
     cached_randn,
@@ -224,63 +224,52 @@ class TestOps(unittest.TestCase, metaclass=ParameterizedTestMeta):
             result = concretize_index(index, loop_vars)
             assert result == index, f"Expected {index}, got {result}"
 
-    def test_compute_max_size(self):
-        from types import SimpleNamespace
-        from unittest.mock import patch
-        import sympy
-        from torch_spyre._inductor.pass_utils import compute_max_size
 
-        # branches that need no V.graph
+class TestPassUtils(unittest.TestCase):
+    """Unit tests for helpers in ``torch_spyre._inductor.pass_utils``."""
+
+    @staticmethod
+    def _mock_v(lower=None, upper=None, size_hint=None):
+        """Build a mock ``V`` whose ShapeEnv reports the given bounds.
+
+        ``size_hint`` is wired only when provided; tests that should
+        never reach the size_hint fallback can omit it (any accidental
+        call would raise ``AttributeError`` and fail the test loudly).
+        """
+        shape_env = SimpleNamespace(
+            bound_sympy=lambda _e: SimpleNamespace(lower=lower, upper=upper)
+        )
+        sizevars = SimpleNamespace(shape_env=shape_env)
+        if size_hint is not None:
+            sizevars.size_hint = lambda _e: size_hint
+        return SimpleNamespace(graph=SimpleNamespace(sizevars=sizevars))
+
+    def test_compute_max_size(self):
+        # Branches that never touch V.graph
         assert compute_max_size(42) == 42
         assert compute_max_size(sympy.Integer(7)) == 7
         assert compute_max_size(sympy.Integer(3) + sympy.Integer(4)) == 7
 
         s = sympy.Symbol("s0", integer=True, positive=True)
 
-        # finite upper bound: return it
-        mock_v = SimpleNamespace(
-            graph=SimpleNamespace(
-                sizevars=SimpleNamespace(
-                    shape_env=SimpleNamespace(
-                        bound_sympy=lambda _e: SimpleNamespace(upper=sympy.Integer(576))
-                    ),
-                    size_hint=lambda _e: 128,
-                )
-            )
-        )
+        # Finite ShapeEnv upper bound is recorded, return it.
+        # ``size_hint`` is wired to a deliberately wrong value so a
+        # regression that falls through to size_hint would fail loudly.
+        mock_v = self._mock_v(upper=sympy.Integer(576), size_hint=9999)
         with patch("torch_spyre._inductor.pass_utils.V", mock_v):
             assert compute_max_size(s) == 576
 
-        # infinite upper: fall back to size_hint
-        mock_v2 = SimpleNamespace(
-            graph=SimpleNamespace(
-                sizevars=SimpleNamespace(
-                    shape_env=SimpleNamespace(
-                        bound_sympy=lambda _e: SimpleNamespace(upper=sympy.oo)
-                    ),
-                    size_hint=lambda _e: 64,
-                )
-            )
-        )
-        with patch("torch_spyre._inductor.pass_utils.V", mock_v2):
+        # No usable upper bound (sympy.oo) -- fall back to size_hint.
+        mock_v = self._mock_v(upper=sympy.oo, size_hint=64)
+        with patch("torch_spyre._inductor.pass_utils.V", mock_v):
             assert compute_max_size(s) == 64
 
-
-class TestPassUtils(unittest.TestCase):
-    """Unit tests for helpers in ``torch_spyre._inductor.pass_utils``."""
-
-    @staticmethod
-    def _mock_v(lower, upper):
-        """Build a mock ``V`` whose ShapeEnv reports the given bounds."""
-        return SimpleNamespace(
-            graph=SimpleNamespace(
-                sizevars=SimpleNamespace(
-                    shape_env=SimpleNamespace(
-                        bound_sympy=lambda _e: SimpleNamespace(lower=lower, upper=upper)
-                    )
-                )
-            )
-        )
+        # Edge case: the ``_finite_upper_or_none`` predicate filters
+        # non-positive bounds (``int(vr.upper) > 0``). Zero upper must
+        # fall through to size_hint just like sympy.oo does.
+        mock_v = self._mock_v(upper=sympy.Integer(0), size_hint=42)
+        with patch("torch_spyre._inductor.pass_utils.V", mock_v):
+            assert compute_max_size(s) == 42
 
     def test_compute_granularity_user_min_happy_path(self):
         expr = sympy.Symbol("s0", integer=True, positive=True)
