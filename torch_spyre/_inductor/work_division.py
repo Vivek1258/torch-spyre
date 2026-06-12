@@ -19,7 +19,6 @@ import itertools
 from sympy import Expr, Integer, Symbol, divisors
 from .ir import SpyreConstantFallback, SpyreEmptyFallback
 
-import torch
 from torch._inductor.ir import (
     ComputedBuffer,
     ExternKernel,
@@ -61,9 +60,6 @@ logger = get_inductor_logger("work_division")
 
 # Maximum memory access span per core: 256MB hardware limit
 MAX_SPAN_BYTES = 256 * 1024 * 1024
-
-aten = torch.ops.aten
-spyreop = torch.ops.spyre
 
 
 @dataclasses.dataclass
@@ -202,7 +198,7 @@ def multi_dim_iteration_space_split(
         # Sanity check: making sure that reduction_dims list is cleared up if
         #               any reduction dim is already selected during span reduction
         assert (
-            not is_reduction_included  # not empty
+            not is_reduction_included  # empty
             or not any(v in min_splits for v in reduction_dims)  # no overlap
         )
 
@@ -417,6 +413,8 @@ def must_split_vars(
 
     Returns a dict mapping Symbol -> number of slices.
     """
+    # TODO: use compute_max_size(...) / compute_granularity(...) from pass_utils.py
+    # for symbolic path. Refer to #2287 for details.
     accumulated_splits: dict[Symbol, int] = {}
 
     for td in tensor_deps:
@@ -427,15 +425,17 @@ def must_split_vars(
             continue
 
         for coord in td.device_coords[:-1]:
-            # Filter out variables whose effective range is <= 1 (cannot contribute
-            # to a span violation). For symbolic dims, max_size > 1 by construction,
-            # so they are always considered.
-            vars = [
+            # Concretize for the ``> 1`` comparison: with symbolic ranges,
+            # ``s0 > 1`` returns a sympy Relational whose truth value is
+            # undefined.  Span filtering here is a structural decision that
+            # needs a concrete answer.
+            # TODO(issue#1372): Symbolic work division will keep this symbolic.
+            split_vars = [
                 v
                 for v in coord.free_symbols
                 if _effective_size(v, it_space_orig, symbol_meta) > 1
             ]
-            if not vars:
+            if not split_vars:
                 continue
 
             def valid_splits(v: Symbol) -> list[int]:
@@ -455,9 +455,9 @@ def must_split_vars(
                     if s >= current_min
                 ]
 
-            var_divisors = [valid_splits(v) for v in vars]
+            var_divisors = [valid_splits(v) for v in split_vars]
 
-            for v, candidates in zip(vars, var_divisors):
+            for v, candidates in zip(split_vars, var_divisors):
                 if not candidates:
                     raise Unsupported(
                         f"No valid split for variable {v} "
@@ -478,7 +478,7 @@ def must_split_vars(
 
             for combo in itertools.product(*var_divisors):
                 trial = dict(accumulated_splits)
-                for v, s in zip(vars, combo):
+                for v, s in zip(split_vars, combo):
                     trial[v] = s
 
                 if math.prod(trial.values()) > max_cores:
@@ -505,7 +505,7 @@ def must_split_vars(
                 break
 
             best_span, best_combo = best
-            for v, s in zip(vars, best_combo):
+            for v, s in zip(split_vars, best_combo):
                 accumulated_splits[v] = s
 
             if best_span <= MAX_SPAN_BYTES:
@@ -634,7 +634,7 @@ def _work_div_hint_by_name(op: ComputedBuffer) -> dict[str, int]:
 
 
 def _has_work_div_hint(op: ComputedBuffer) -> bool:
-    return bool(_work_div_hint_by_name(op))
+    return any(hint_dict.get("work_div") for hint_dict in get_op_hints(op).values())
 
 
 def _resolve_work_div_hint(
@@ -1215,6 +1215,9 @@ def _cost_model_divide_op(op: ComputedBuffer, max_cores: int) -> bool:
         return False
     if op.data.reduction_type != BATCH_MATMUL_OP:
         return False
+    if not config.ignore_work_division_hints and _has_work_div_hint(op):
+        # User hints take ownership of the split decision; do not override them.
+        return False
 
     rw = op.get_read_writes()
     args = get_mem_deps_from_rw(rw)
@@ -1240,12 +1243,6 @@ def _cost_model_divide_op(op: ComputedBuffer, max_cores: int) -> bool:
 
 
     it_space_adjusted, stick_vars = adjust_it_space_for_sticks(it_space, all_tds)
-    if (
-        not config.ignore_work_division_hints
-        and _resolve_work_div_hint(op, it_space_adjusted) is not None
-    ):
-        # User hints take ownership of the split decision; do not override them.
-        return False
 
 
     # op.op_it_space_splits holds span_reduction's commits here: span_reduction
