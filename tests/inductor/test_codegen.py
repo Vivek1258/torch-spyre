@@ -89,7 +89,7 @@ class TestSpyreConfig(InductorTestCase):
         y = torch.randn_like(x)
         torch._dynamo.mark_dynamic(x, 0, min=64, max=1024)
         torch._dynamo.mark_dynamic(y, 0, min=64, max=1024)
-        comp_fn = torch.compile(fn)
+        comp_fn = torch.compile(fn, dynamic=True)
         _, source_codes = run_and_get_code(comp_fn, x.to("spyre"), y.to("spyre"))
         # Iteration space embeds (size_expr, split). The symbolic batch dim's
         # split must equal SENCORES=32; the static stick dim's split must be 1.
@@ -110,7 +110,7 @@ class TestSpyreConfig(InductorTestCase):
         y = torch.randn_like(x)
         torch._dynamo.mark_dynamic(x, 0, min=4, max=64)
         torch._dynamo.mark_dynamic(y, 0, min=4, max=64)
-        comp_fn = torch.compile(fn)
+        comp_fn = torch.compile(fn, dynamic=True)
         _, source_codes = run_and_get_code(comp_fn, x.to("spyre"), y.to("spyre"))
         # Symbolic batch dim split = 4 (largest divisor of granularity=4 ≤ 32);
         # static stick dim split = 8 (largest divisor of 16 sticks ≤ 8).
