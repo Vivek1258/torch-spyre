@@ -38,8 +38,7 @@ from .constants import BATCH_MATMUL_OP, TOPK_OPS
 from .ir import FixedTiledLayout
 from .pass_utils import (
     SchedNodeArg,
-    # These utility functions will be available
-    # once PR#2003 and PR#2379 land in main branch.
+    _finite_upper_or_none,
     compute_granularity,
     compute_max_size,
     concretize_expr,
@@ -81,20 +80,31 @@ SymbolMeta = dict[Symbol, tuple[int, int]]
 
 
 def _collect_symbol_metadata(it_space: dict[Symbol, Expr]) -> SymbolMeta:
-    """Build a ``{symbol: (max_size, granularity)}`` map for symbolic iteration vars.
+    """Build ``{symbol: (max_size, granularity)}`` for opted-in symbolic dims.
 
-    For each iteration variable whose range expression carries free symbols
-    (i.e. is symbolic under ``mark_dynamic`` / ``dynamic=True``), query the
-    bucket metadata from #2284's ``compute_max_size`` / ``compute_granularity``
-    helpers. Concrete dims (no free symbols) are omitted so call sites can
-    cheaply detect them with ``v in meta``.
+    An iteration var is "opted in" iff the user passed
+    ``mark_dynamic(max=...)`` -- that's exactly when ShapeEnv records a
+    finite upper bound. Auto-dynamic symbols (Dynamo promoting an int on
+    retrace when a Python loop varies it) have no finite max, so we skip
+    them here and let them fall through to the existing
+    ``concretize_expr`` + ``size_hint`` path.
+
+    Concrete dims (no free symbols) are also omitted, so callers can use
+    ``v in meta`` to detect both cases.
     """
     meta: SymbolMeta = {}
     for sym, expr in it_space.items():
-        if hasattr(expr, "free_symbols") and expr.free_symbols:
-            max_size = compute_max_size(expr)
-            granularity = compute_granularity(expr, max_size)
-            meta[sym] = (max_size, granularity)
+        if not (hasattr(expr, "free_symbols") and expr.free_symbols):
+            continue
+        if _finite_upper_or_none(expr) is None:
+            logger.debug(
+                f"[work_division/symbolic] skipping auto-dynamic symbol "
+                f"{sym}; use mark_dynamic(max=...) to enable symbolic planning"
+            )
+            continue
+        max_size = compute_max_size(expr)
+        granularity = compute_granularity(expr, max_size)
+        meta[sym] = (max_size, granularity)
     if meta:
         logger.info(
             "[work_division/symbolic] collected symbol_meta: "
@@ -891,7 +901,9 @@ def work_distribution_pass(
                     f"min_splits={committed_splits}, user_splits={user_splits}, "
                     f"op_it_space_splits={op_splits}"
                 )
-            warn_if_per_core_overflow(all_tds, it_space, user_splits, op.get_name())
+            warn_if_per_core_overflow(
+                all_tds, it_space, user_splits, op.get_name(), symbol_meta
+            )
             return
 
     splits, output_dims, reduction_dims = _default_split(
@@ -1241,9 +1253,7 @@ def _cost_model_divide_op(op: ComputedBuffer, max_cores: int) -> bool:
             f"ops only."
         )
 
-
     it_space_adjusted, stick_vars = adjust_it_space_for_sticks(it_space, all_tds)
-
 
     # op.op_it_space_splits holds span_reduction's commits here: span_reduction
     # runs before this pass, and work_distribution — which would overwrite it —
