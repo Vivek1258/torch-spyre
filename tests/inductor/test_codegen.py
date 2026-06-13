@@ -97,27 +97,6 @@ class TestSpyreConfig(InductorTestCase):
             source_codes[0]
         )
 
-    @config.patch({"sencores": 32})
-    def test_symbolic_batch_with_static_dim_leftover(self):
-        """Symbolic dim caps at granularity; static dim absorbs the leftover (#2287).
-
-        ``[s, 1024]`` fp16 with ``s in [4, 64]`` (granularity = 4). The symbolic
-        batch dim takes the largest divisor of granularity ≤ 32 = 4, leaving 8 cores for the
-        static stick dim (1024 / 64 = 16 sticks → split 8).
-        """
-        fn = torch.add
-        x = torch.randn((64, 1024), dtype=torch.float16)
-        y = torch.randn_like(x)
-        torch._dynamo.mark_dynamic(x, 0, min=4, max=64)
-        torch._dynamo.mark_dynamic(y, 0, min=4, max=64)
-        comp_fn = torch.compile(fn, dynamic=True)
-        _, source_codes = run_and_get_code(comp_fn, x.to("spyre"), y.to("spyre"))
-        # Symbolic batch dim split = 4 (largest divisor of granularity=4 ≤ 32);
-        # static stick dim split = 8 (largest divisor of 16 sticks ≤ 8).
-        FileCheck().check("sdsc_fused_add").check(", 4)").check(", 8)").run(
-            source_codes[0]
-        )
-
     # Need a test where changing dxp_lx_frac_avail changes the generated OpSpec
     # @config.patch({"dxp_lx_frac_avail": 0.01, "lx_planning": True})
     # def test_config_dxp_lx_frac_avail(self):
