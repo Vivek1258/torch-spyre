@@ -1,21 +1,7 @@
-# Torch-Spyre Dynamic Shapes Support — Design Document
-
-**Status**: Living document — Phase 1.A landed, Phase 1.B / 2 / 3 planned.
-**Last updated**: 2026-06-23
-**Owners**: Vivek Mankar (work-division, addresses), Nethra Khandige (SDSC metadata).
-**Audience**: torch-spyre + DeepTools engineering; readable by directors via the executive summary.
-
+# Torch-Spyre Dynamic Shapes Support 
 ---
 
-## Executive Summary
-
-Dynamic shapes lets a model be **compiled once and dispatched with varying input shapes** (batch sizes, sequence lengths) instead of recompiling per shape. For torch-spyre, this is the prerequisite for production-grade LLM serving via vLLM, FSM/Granite, and Triton Inference Server — all of which present variable batch/sequence sizes per request.
-
-We implement a **bounded bucketing model**: the user declares a dimension's `(min, max)` via `torch._dynamo.mark_dynamic(tensor, dim, min=..., max=...)`. The compiler treats `min` as the *granularity* and `max` as the upper bound; admissible runtime values are `{granularity, 2·granularity, ..., max}`. This bounded model is the same approach taken by XLA/TPU and Cerebras; SambaNova goes fully symbolic, Graphcore (and today's Spyre baseline) recompiles per shape.
-
-**Where we are**: Phase 1.A — symbolic batch dimension for pointwise ops — is **landed end-to-end** through the torch-spyre frontend (PRs #2003, #2379, #2499, #2673). Per-core symbolic start addresses (issue #2289) are in flight on the `symbolic_sdsc` branch. The DeepTools backend contract for symbolic SDSC consumption is ratified ([interface-specs/0248-SdscBundleSpec/SuperDSC-Bundle.md](../interface-specs/0248-SdscBundleSpec/SuperDSC-Bundle.md)) and consumer-side work is in progress.
-
-**What's next**: Phase 1.B (symbolic batchmatmul), Phase 2 (symbolic stick dimension), Phase 3 (symbolic reductions + LX scratchpad + recompile policy). Cross-cutting unblockers: dim symbols as MLIR SSA values, runtime HBM/stride alignment (issue #2434), bundle.mlir `input_arg` declarations for symbolic dims (issue #2500).
+This page describes how the Torch-Spyre front-end compiler enables dynamic shape support in the AI model compilation pipeline. 
 
 ---
 
@@ -28,11 +14,11 @@ We implement a **bounded bucketing model**: the user declares a dimension's `(mi
 ```python
 x = torch.randn((1024, 128), dtype=torch.float16)
 torch._dynamo.mark_dynamic(x, dim=0, min=64, max=1024)
-compiled = torch.compile(model, dynamic=False)
-out = compiled(x.to("spyre"))   # runtime size can be 64, 128, 256, ..., 1024
+compiled = torch.compile(model)
+out = compiled(x.to("spyre"))   # the runtime size can be 64, 128, 256, ..., 1024
 ```
 
-PyTorch's Dynamo registers a sympy symbol (e.g. `s0`) with `ShapeEnv` bounds `lower=64, upper=1024`. The compiled artifact accepts any shape in that range — **no recompilation**.
+PyTorch's Dynamo registers a sympy symbol (e.g. `s0`) with `ShapeEnv` bounds `lower=64, upper=1024`. The compiled artifact accepts any shape in that range that is a multiple of `min`. — **no recompilation**.
 
 ### The bounded bucketing model
 
@@ -46,47 +32,39 @@ where `granularity = min` (the value passed via `mark_dynamic(min=...)`) and `ma
 
 This is enforced by the **correctness invariant** `n | granularity`: the compile-time work-division split count `n` for a symbolic dimension must divide its granularity. Since every admissible runtime value `R = granularity · k` for some integer `k`, the per-core chunk `R / n` is guaranteed integer-valued **for every `k`** iff `n` divides `granularity`. This means a single compiled plan is valid for the entire declared range — no runtime fallback, no rebalancing.
 
-The model is **bounded** (not fully symbolic) because:
-- HBM allocation needs a worst-case footprint — sized at `max`.
-- Work-division must pick a split that is valid for all runtime values — driven by `granularity`.
-- Compile cache size is `O(distinct (min, max) ranges declared)`, not `O(shapes seen)`.
-
-**Source**: [Symbolic_Shapes_Epic_Updates](Symbolic_Shapes_Epic_Updates%20%5BAutosaved%5D%20%281%29.md) lines 84-145; issue [#2287](https://github.com/torch-spyre/torch-spyre/issues/2287) worked examples; issue [#2284](https://github.com/torch-spyre/torch-spyre/issues/2284).
+The model is **bounded**  because HBM allocation needs a worst-case footprint — sized at `max` and work-division must pick a split that is valid for all runtime values — driven by `granularity`. 
 
 ---
 
-## 2. Why Dynamic Shapes in torch-spyre — and Why It's Hard
+## 2. Dynamic Shapes challenges
 
-### Why we need it
+### Why it is needed
+
+Real-world inference workloads frequently operate on variable-length inputs. Without dynamic shape compilation support, inference servers must either pad inputs to a fixed shape or generate specialized kernels through runtime recompilation.
+
+Excessive padding wastes compute and memory bandwidth by performing work on artificial tokens or elements, while runtime recompilation introduces compilation overhead directly into the critical inference path. Together, these limitations reduce hardware efficiency, increase tail latency, and hinder the ability of the serving system to scale efficiently under diverse production workloads.
 
 | Today (static-only) | With dynamic shapes |
 |---|---|
 | One SDSC per shape; cache grows unbounded with serving traffic. | One SDSC per `(min, max)` range; cache is `O(buckets)`. |
-| HBM allocated to compile-time shape; rejects larger shapes at runtime. | HBM allocated at `max`; accepts every shape in range. |
-| Per-shape recompile latency on every new batch size. | Compile-once, dispatch-many. |
-| vLLM and FSM workloads cannot be served — they present variable batch/sequence per request. | Production LLM serving via vLLM + FSM unblocked. |
+| Per-shape recompile latency on every new input size. | Compile-once, dispatch-many. |
 
-Issue [#2284](https://github.com/torch-spyre/torch-spyre/issues/2284): *"Bounded ranges are essential because HBM allocation depends on maxSize, work-division algorithms require granularity to pick split counts, and SDSC metadata is computed as (maxSize/n, granularity/n) per core."*
 
-### Why it's challenging
+### Five structural challenges:
 
-Five structural challenges:
+1. **Symbol propagation through torch-spyre's pipeline (compile-time).** PyTorch Inductor natively encodes iteration spaces as sympy expressions, but the same symbols must flow through torch-spyre's own passes — views.align_tensors, work_division, spyre_kernel.create_op_spec, and the codegen stride helpers — and ultimately surface in the SDSC JSON.
 
-1. **Symbol propagation through Inductor IR**. PyTorch's lowering passes routinely concretise expressions to integers for sorting and divisibility math. Without a guard, the symbolic dimension is lost before reaching torch-spyre's codegen. We use `finite_upper_or_none(expr)` ([pass_utils.py:131](../Nethra_PR_Review/torch-spyre/torch_spyre/_inductor/pass_utils.py#L131)) as a uniform predicate to decide whether to keep a symbol alive or concretise to a hint.
+2. **Correctness invariant `n | granularity` (compile-time, work-division)**. Work-division must pick split counts from `divisors(granularity)`, not `divisors(maxSize)`. A naive port of the static planner picks splits from `divisors(maxSize)` and silently produces non-divisible chunks at runtime.
 
-2. **Correctness invariant `n | granularity`**. Work-division must pick split counts from `divisors(granularity)`, not `divisors(maxSize)`. A naive port of the static planner picks splits from `divisors(maxSize)` and silently produces non-divisible chunks at runtime.
+3. **Per-core start addresses depend on runtime size (compile-time emit, runtime resolution).** For a symbolic dim split across `n > 1` cores, core `c`'s start address is `base + c · (S/n) · inner_stride` where S is the runtime value. Baking c · (max/n) · inner_stride at compile time causes silent miscompute on every core after core 0 for any runtime value < max — each core reads from the wrong region of its max-sized HBM buffer. This needs symbolic address handling with Dimension symbol IDs and address symbol IDs handling in the same bundle. 
 
-3. **Per-core start addresses depend on runtime size**. For a symbolic dim split across `n > 1` cores, core `c`'s start address is `base + c · (S/n) · inner_stride`, where `S` is the **runtime** value. Compile-time baking of `c · (max/n) · inner_stride` causes silent miscompute for any runtime value `< max` (every core after core 0 reads from the wrong region). This is the entire motivation for issue [#2289](https://github.com/torch-spyre/torch-spyre/issues/2289).
+4. **Stick-padded memory layouts (compile-time)**. Spyre's 128-byte aligned stick layout adds padding padded = ((size + epp − 1) // epp) · epp. For symbolic size, this arithmetic must be sympy-safe — the static int(...) casts in stride helpers like `_tiled_byte_stride` fault on symbolic inputs.
 
-4. **Stick-padded memory layouts**. Spyre's 128-byte aligned stick layout adds padding: `padded = ((size + epp − 1) // epp) · epp`. For symbolic `size`, this arithmetic must be sympy-safe (the static `int(...)` casts in stride helpers fault on symbolic inputs).
+5. **256 MB HBM-span constraint (compile-time check)**. The SDSC spec mandates "The span of addresses accessed from DDR for any given tensor must not exceed 256MB". The span check must use the worst-case footprint (max), not the warmup value — otherwise a runtime shape near max exceeds the limit silently once the binary ships.
 
-5. **256 MB HBM-span constraint**. Spec line 355: *"The span of addresses accessed from DDR for any given tensor must not exceed 256MB."* The span check must use the worst-case footprint (`max`), not the warmup value — otherwise a runtime shape near `max` can exceed the limit silently.
+6. **Runtime HBM allocation and stride derivation at max (runtime — issue #2434)**. DeepTools' contract for a symbolic-dim tensor [d0=64, d1=symbolic, d2=8] with d1.max=1024, d1.granularity=16: at any runtime d1 (e.g. 32), the tensor lives in memory as if d1 = max — stride(d0)=1, stride(d1)=64, stride(d2)=64·1024=65536. Strides are constant; HBM is sized at max; only the actual d1=32 elements are written/read. The runtime today sizes HBM and emits strides from the runtime input shape. The hard part: dynamic compilation runs after .to("spyre"), so neither side knows max at HBM-allocation time. Resolution requires either propagating max from the user annotation through to the runtime allocator (statically), or deferring allocation until the first compiled dispatch sees max.
 
-**Source**: epic doc lines 38, 84-145; spec lines 174-186, 352-358; issue [#2434](https://github.com/torch-spyre/torch-spyre/issues/2434).
-
----
-
-## 3. Prior Arts — How Other Data-Flow Accelerators Handle Dynamic Shapes
+## 3. Prior Arts 
 
 | Accelerator | Approach | Trade-offs |
 |---|---|---|
@@ -96,8 +74,6 @@ Five structural challenges:
 | **Graphcore IPU** | **Fully Static + Recompile**. No symbolic support — recompile per shape. | Simplest backend; unworkable for variable-input serving workloads. |
 | **Spyre (today)** | Fully static (Graphcore-style baseline). | Same trade-offs as Graphcore. |
 | **Spyre (target — this doc)** | **Bounded Dynamic + Bucketing** — closest to XLA/Cerebras. | Avoids the full-symbolic complexity of SambaNova while unblocking vLLM/FSM. |
-
-**Source**: epic doc lines 13-18 (table reproduced from prior-arts research).
 
 ---
 
@@ -109,15 +85,13 @@ GPU dynamic shapes (the upstream PyTorch / CUDA path) handle most of these impli
 
 2. **Per-core start addresses cannot be baked**. Spec line 184-186: *"start addresses per core will need to be symbolic; in AllocateNode fill `FoldManager<int64_t> startAddressCoreCorelet_` with VariableSymbol entries; set `bool isStartAddrSymbolic_`."*
 
-3. **Stick-padded memory layouts** turn linear math into floor-division. Symbolic `((s + epp − 1) // epp) · epp` requires sympy expressions throughout, not Python `int`. The current stick adjustment (`adjust_it_space_for_sticks` in [work_division.py:260](../Nethra_PR_Review/torch-spyre/torch_spyre/_inductor/work_division.py#L260)) raises `Unsupported` for symbolic stick dims today.
+3. **Stick-padded memory layouts** turn linear math into floor-division. Symbolic `((s + epp − 1) // epp) · epp` requires sympy expressions throughout, not Python `int`. The current stick adjustment raises `Unsupported` for symbolic stick dims today.
 
-4. **HBM allocation must size to `max`**, not warmup shape (issue [#2434](https://github.com/torch-spyre/torch-spyre/issues/2434)): *"HBM must be sized at max along symbolic dim; device strides must derive from max (not per-call runtime value) to remain constant."*
+4. **HBM allocation must size to `max`**, not warmup shape: *"HBM must be sized at max along symbolic dim; device strides must derive from max (not per-call runtime value) to remain constant."*
 
 5. **256 MB DDR-span constraint** (spec line 355) interacts with max-sized buffers — the planner must reject splits where the worst-case per-core span exceeds the limit, even if the warmup shape would fit.
 
 6. **Bundle-scope symbol ID uniqueness**. Spec line 68: *"symbols_ids must be unique in the bundle i.e., symbols ids cannot be recycled across sdscs that are part of the same bundle (unless they take the same value)."* Both dimension symbols and address symbols are allocated from the same negative-ID space within a bundle.
-
-**Source**: spec lines 57-68, 124-128, 174-186, 352-358; issue [#2434](https://github.com/torch-spyre/torch-spyre/issues/2434).
 
 ---
 
@@ -175,9 +149,9 @@ flowchart TB
 ### Contract boundaries
 
 1. **PyTorch ↔ torch-spyre**: the FX graph + ShapeEnv bounds. Standard PyTorch interface.
-2. **torch-spyre ↔ DeepTools**: SDSC JSON fields (`dimToSymbolMapping_`, `symbolicDimInfo_`, `inputSymbolsAndTags_`, `isStartAddrSymbolic_`, `startAddressCoreCorelet_.data_`) + bundle.mlir (`sdsc_execute` operands, `symbol_ids`). Codified in [interface-specs/0248-SdscBundleSpec/SuperDSC-Bundle.md](../interface-specs/0248-SdscBundleSpec/SuperDSC-Bundle.md).
+2. **torch-spyre ↔ DeepTools**: SDSC JSON fields (`dimToSymbolMapping_`, `symbolicDimInfo_`, `inputSymbolsAndTags_`, `isStartAddrSymbolic_`, `startAddressCoreCorelet_.data_`) + bundle.mlir (`sdsc_execute` operands, `symbol_ids`).
 3. **DeepTools ↔ Spyre runtime**: opaque to torch-spyre. DeepTools owns this.
-4. **torch-spyre ↔ Spyre runtime (host side)**: HBM allocation, dim symbol value plumbing at dispatch (issue [#2434](https://github.com/torch-spyre/torch-spyre/issues/2434) — open).
+4. **torch-spyre ↔ Spyre runtime (host side)**: HBM allocation, dim symbol value plumbing at dispatch 
 
 ---
 
@@ -211,7 +185,7 @@ gantt
     Recompile / out-of-range policy      :p33, after p32, 21d
 ```
 
-### Phase 1.A — Symbolic batch dim for pointwise ops ✅ **LANDED**
+### Phase 1.A — Symbolic batch dim for pointwise ops 
 
 Covers `mark_dynamic` propagation, granularity-based work division, SDSC JSON emission of dim metadata, and per-core symbolic addresses (#2289 in flight).
 
@@ -222,7 +196,7 @@ PRs:
 - **#2673** — symbolic SDSC JSON emission (`dimToSymbolMapping_`, `symbolicDimInfo_`, `inputSymbolsAndTags_`).
 - **#2289** — per-core symbolic start addresses (in flight on `symbolic_sdsc` branch).
 
-### Phase 1.B — Symbolic batch dim for matmul 🟡 **NEXT**
+### Phase 1.B — Symbolic batch dim for matmul
 
 Today work_division raises `Unsupported` for symbolic-dim batchmatmul ([work_division.py:1249-1255](../Nethra_PR_Review/torch-spyre/torch_spyre/_inductor/work_division.py#L1249-L1255)). Lift the guard. The downstream SDSC + per-core address logic is op-type-agnostic and fires automatically.
 
@@ -273,22 +247,21 @@ flowchart LR
 
 ### 8.1 Symbolic Core Division
 
-Owned by [work_division.py](../Nethra_PR_Review/torch-spyre/torch_spyre/_inductor/work_division.py) and its helpers in [pass_utils.py](../Nethra_PR_Review/torch-spyre/torch_spyre/_inductor/pass_utils.py).
 
-**The opt-in gate** — `finite_upper_or_none(expr)` ([pass_utils.py:131](../Nethra_PR_Review/torch-spyre/torch_spyre/_inductor/pass_utils.py#L131)). Returns the ShapeEnv upper bound for `expr` if it's a finite `sympy.Integer`, else `None`. This is the **single most important architectural invariant** of the design — every layer that consumes a symbolic iteration var must skip when this returns `None`. Mirroring it uniformly across `views.py`, `work_division.py`, and `spyre_kernel.py` is load-bearing: it prevents auto-dynamic symbols (Dynamo-promoted shapes the user *didn't* mark) from leaking into the symbolic path.
+**The opt-in gate** — `finite_upper_or_none(expr)` ([pass_utils.py:131]). Returns the ShapeEnv upper bound for `expr` if it's a finite `sympy.Integer`, else `None`. This is the **single most important architectural invariant** of the design — every layer that consumes a symbolic iteration var must skip when this returns `None`. Mirroring it uniformly across `views.py`, `work_division.py`, and `spyre_kernel.py` is load-bearing: it prevents auto-dynamic symbols (Dynamo-promoted shapes the user *didn't* mark) from leaking into the symbolic path.
 
 **Bound computation**:
-- `compute_max_size(expr)` ([pass_utils.py:252](../Nethra_PR_Review/torch-spyre/torch_spyre/_inductor/pass_utils.py#L252)) — returns the finite upper bound or falls back to `size_hint` for unbounded.
-- `compute_granularity(expr, max_size)` ([pass_utils.py:143](../Nethra_PR_Review/torch-spyre/torch_spyre/_inductor/pass_utils.py#L143)) — returns the user-supplied `min` if it divides `max`, else picks the smallest divisor of `max` ≥ `min_default_granularity` such that `max / d ≤ max_buckets`.
-- `compute_symbolic_bounds(expr)` ([pass_utils.py:273](../Nethra_PR_Review/torch-spyre/torch_spyre/_inductor/pass_utils.py#L273)) — composes the above into `(max, granularity)`.
+- `compute_max_size(expr)` ([pass_utils.py:252] — returns the finite upper bound or falls back to `size_hint` for unbounded.
+- `compute_granularity(expr, max_size)` ([pass_utils.py:143]) — returns the user-supplied `min` if it divides `max`, else picks the smallest divisor of `max` ≥ `min_default_granularity` such that `max / d ≤ max_buckets`.
+- `compute_symbolic_bounds(expr)` ([pass_utils.py:273]) — composes the above into `(max, granularity)`.
 
 **The planner**:
-- `_collect_symbol_metadata(it_space)` ([work_division.py:82](../Nethra_PR_Review/torch-spyre/torch_spyre/_inductor/work_division.py#L82)) walks the iteration space, applies the opt-in gate, returns `SymbolMeta: dict[Symbol, tuple[max, granularity]]` ([work_division.py:79](../Nethra_PR_Review/torch-spyre/torch_spyre/_inductor/work_division.py#L79)).
-- `_valid_divisor_basis(v, it_space, meta)` ([work_division.py:128](../Nethra_PR_Review/torch-spyre/torch_spyre/_inductor/work_division.py#L128)) returns *granularity* for symbolic dims (so the chosen split divides every admissible runtime size) and the concretised size for concrete dims.
+- `_collect_symbol_metadata(it_space)` ([work_division.py:82] walks the iteration space, applies the opt-in gate, returns `SymbolMeta: dict[Symbol, tuple[max, granularity]]` ([work_division.py:79]).
+- `_valid_divisor_basis(v, it_space, meta)` ([work_division.py:128]) returns *granularity* for symbolic dims (so the chosen split divides every admissible runtime size) and the concretised size for concrete dims.
 
 **Active `Unsupported` guards in core division**:
-- Symbolic stick dim: [work_division.py:304-308](../Nethra_PR_Review/torch-spyre/torch_spyre/_inductor/work_division.py#L304-L308) — *"symbolic stick dim {stick_var} is not supported yet"*.
-- Symbolic batchmatmul: [work_division.py:1249-1255](../Nethra_PR_Review/torch-spyre/torch_spyre/_inductor/work_division.py#L1249-L1255) — *"symbolic dim(s) on batchmatmul ... are not supported yet"*.
+- Symbolic stick dim: [work_division.py:304-308] *"symbolic stick dim {stick_var} is not supported yet"*.
+- Symbolic batchmatmul: [work_division.py:1249-1255] — *"symbolic dim(s) on batchmatmul ... are not supported yet"*.
 
 ### 8.2 Symbolic SDSC Generation
 
