@@ -66,14 +66,23 @@ Excessive padding wastes compute and memory bandwidth by performing work on arti
 
 ## 3. Prior Arts 
 
-| Accelerator | Approach | Trade-offs |
-|---|---|---|
-| **Google XLA/TPU** | **Bounded Dynamic + Bucketing**. User specifies max shape; runtime pads to max or nearest bucket. | Simple compile-time model; padding overhead for inputs much smaller than max. |
-| **SambaNova RDU** | **Runtime Reconfiguration**. Fully symbolic SDSC + DCI; backend resolves shapes at dispatch. | Maximum flexibility; very heavy compiler complexity; full symbolic semantics. |
-| **Cerebras WSE** | **Bounded Dynamic, Compiler-Optimised**. Compiler knows max shape; processes only valid data at runtime. | Like XLA but with smarter masking instead of padding. |
-| **Graphcore IPU** | **Fully Static + Recompile**. No symbolic support — recompile per shape. | Simplest backend; unworkable for variable-input serving workloads. |
-| **Spyre (today)** | Fully static (Graphcore-style baseline). | Same trade-offs as Graphcore. |
-| **Spyre (target — this doc)** | **Bounded Dynamic + Bucketing** — closest to XLA/Cerebras. | Avoids the full-symbolic complexity of SambaNova while unblocking vLLM/FSM. |
+The table below summarises how other accelerator software stacks handle variable input shapes, based on each project's public documentation. The intent is to compare mechanisms, not capability or performance.
+
+| Stack | Approach for dynamic shapes |
+|---|---|
+| **NVIDIA GPU (PyTorch Inductor + Triton)** | Native symbolic-shape support throughout the compilation pipeline. Kernels are parameterised on sympy expressions; no bucketing needed at the compiler layer. This is the reference behaviour that `torch.compile(dynamic=True)` targets upstream. |
+| **Google XLA / TPU** | Shape polymorphism via JAX (`jax.export` with `polymorphic_shapes`) and TensorFlow SavedModel signatures. The user declares shape constraints; the compiler can either emit a single executable that spans the range or specialise per bucket, depending on configuration. |
+| **SambaNova RDU (SambaFlow)** | Dataflow-graph compilation with runtime support for varying input dimensions. |
+| **Cerebras WSE (Cerebras Software Platform)** | Wafer-scale dataflow with primarily static-graph compilation; dynamic-shape support for inference is an evolving area. |
+| **Graphcore IPU (Poplar SDK)** | Graph compilation per input geometry; recent Poplar releases have added incremental dynamic-shape capabilities. |
+| **Torch-Spyre (this document)** | Bounded bucketing. The user declares `(min, max)` via `torch._dynamo.mark_dynamic`; the compiler picks a per-core work distribution that is valid for the entire `{granularity, 2·granularity, …, max}` range, and emits SDSC metadata so the backend can resolve per-core addresses and dim sizes at dispatch. |
+
+### Where torch-spyre fits
+
+Torch-Spyre commits to a per-core static work distribution at compile time — this is a property of the Spyre dataflow architecture, not a software choice. Combined with the goal of unblocking variable-input serving workloads such as vLLM and FSM, this motivates the bounded bucketing approach: a single compiled binary covers an entire declared range, and the planner can still reason about splits and HBM spans using compile-time constants (`max` and `granularity`).
+
+A fully symbolic GPU-style approach would require lifting the static work-distribution constraint, which is out of scope for the current Spyre hardware generation. A fully static recompile-per-shape approach would not meet the latency requirements of online serving. Bounded bucketing is the trade-off that fits both the hardware and the target workloads.
+
 
 ---
 
