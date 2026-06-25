@@ -20,9 +20,9 @@ This page describes how the Torch-Spyre front-end compiler enables dynamic shape
 
 ## 1. What is Dynamic Shapes Support
 
-**Static shapes (today's baseline).** Torch-spyre's compiler bakes every tensor shape into the SDSC at compile time. When the user calls the compiled function with a different shape, the entire compilation pipeline reruns. The compile cache grows as `O(distinct shapes seen)`.
+**Static shapes:** Torch-spyre's compiler bakes every tensor shape into the SDSC at compile time. When the user calls the compiled function with a different shape, the entire compilation pipeline reruns. The compile cache grows as `O(distinct shapes seen)`.
 
-**Dynamic shapes.** The user marks specific dimensions as variable, declaring their bounds:
+**Dynamic shapes:** The user marks specific dimensions as variable, declaring their bounds:
 
 ```python
 x = torch.randn((1024, 128), dtype=torch.float16)
@@ -101,8 +101,8 @@ Torch-Spyre commits to a per-core static work distribution at compile time. This
 
 Dynamic shape support is driven by inference serving workloads where batch sizes and sequence lengths vary across requests.
 
-- **vLLM on Spyre (`spyre-inference` plugin).** vLLM serves LLMs with continuous batching and a PagedAttention KV cache. Each scheduling iteration processes a mix of prefill and decode tokens, so both batch and sequence dimensions vary per step.
-- **Foundation Model Stack (FMS).** FMS is a collection of PyTorch-native components for development, inference, training, and tuning of foundation models. It provides reimplementations of model families (LLaMA, GPT-BigCode, RoBERTa, and others via `fms-extras`) that are designed to compile cleanly with `torch.compile` and to integrate with downstream serving stacks such as TGIS. Dynamic shapes lets FMS-based inference paths compile once per `(min, max)` range instead of once per shape.
+- **vLLM on Spyre (`spyre-inference` plugin).** vLLM serves LLMs with continuous batching and a PagedAttention KV cache. Each scheduling iteration processes a mix of prefill and decode tokens, so both batch and sequence dimensions vary per step. Find more details [here](https://github.com/torch-spyre/spyre-inference)
+- **Foundation Model Stack (FMS).** FMS is a collection of PyTorch-native components for development, inference, training, and tuning of foundation models. It provides reimplementations of model families (LLaMA, GPT-BigCode, RoBERTa, and others via `fms-extras`) that are designed to compile cleanly with `torch.compile` and to integrate with downstream serving stacks such as TGIS. Dynamic shapes lets FMS-based inference paths compile once per `(min, max)` range instead of once per shape. Find more details [here](https://github.com/foundation-model-stack/foundation-model-stack)
 
 Other inference servers implementing Dynamic batching ( such as Triton Inference Server ) aggregate concurrent client requests into variable batch sizes per dispatch. Dynamic shapes lets the same compiled binary serve every aggregated batch size within the declared bucket.
 
@@ -196,19 +196,21 @@ Coarse tiling and scratchpad planning are unchanged. They see per-core sizes com
 
 ## 7. Phase Plan
 
-The feature is delivered in four phases. Each phase widens the set of operators and dimensions that accept a user-declared `mark_dynamic` annotation.
+The feature is delivered in three phases. Each phase widens the set of operators and dimensions that accept a user-declared `mark_dynamic` annotation.
 
-### Phase 1.A. Symbolic batch dim for pointwise ops
+### Phase 1
+
+#### A. Symbolic batch dim for pointwise ops
 
 Covers `mark_dynamic` propagation through Dynamo and the torch-spyre passes, granularity-based work division, SDSC JSON emission of dim metadata, and per-core symbolic addresses.
 
 **Use cases enabled.** Pointwise ops in serving paths run without per-shape recompilation. The compiled artifact accepts any admissible runtime value of the batch dimension. This is the path most LLM-serving prologue and epilogue ops take (activations, normalisation steps, biases).
 
-### Phase 1.B. Symbolic batch dim for matmul
+#### B. Symbolic batch dim for matmul
 
 Today the work_division planner raises `Unsupported` for symbolic-dim batchmatmul. Lifting this guard is the main change; the downstream SDSC and per-core address logic is op-type-agnostic and fires automatically.
 
-**Use cases enabled.** Matmul-heavy LLM serving (attention projections, MLP linears) runs with a single compiled binary across variable batch sizes. This is what unblocks vLLM continuous batching and FSM Granite serving end-to-end, because the matmul cost dominates the inference step.
+**Use cases enabled.** Matmul-heavy LLM serving (attention projections, MLP linears) runs with a single compiled binary across variable batch sizes. 
 
 ### Phase 2. Symbolic stick dim
 
@@ -403,62 +405,69 @@ classDiagram
 
 ## 9. End-to-End Worked Example
 
-This section traces a single symbolic-batch `add` through the entire pipeline, from user code to the emitted SDSC JSON and bundle.mlir. The example uses an output of shape `[s0, 128]` fp16 with `s0 ∈ [64, 1024]` and `granularity = 64`, on a card with `SENCORES = 32`.
+This section traces a single symbolic-batch GELU (a one-input pointwise op) through the entire pipeline, from user code to the emitted SDSC JSON and bundle.mlir. The example uses the input shape `[s97, 1024]` fp16 with `s97 ∈ [56, 616]` and `granularity = 56`, on a card with `SENCORES = 32`. The numbers shown match a real compile run.
 
 ### Step 0. User code
 
 ```python
 import torch
+import torch._dynamo as dynamo
+import torch.nn.functional as F
 
-x = torch.randn((1024, 128), dtype=torch.float16)
-y = torch.randn_like(x)
+def gelu_fn(a):
+    return F.gelu(a)
 
-torch._dynamo.mark_dynamic(x, dim=0, min=64, max=1024)
-torch._dynamo.mark_dynamic(y, dim=0, min=64, max=1024)
+x = torch.rand(560, 1024, dtype=torch.float16)
+x_device = x.to("spyre")
 
-compiled = torch.compile(torch.add)
-out = compiled(x.to("spyre"), y.to("spyre"))
+# Mark dim 0 dynamic with explicit bounds.
+dynamo.mark_dynamic(x_device, 0, min=56, max=616)
+
+compiled_fn = torch.compile(gelu_fn)
+out = compiled_fn(x_device).cpu()
 ```
+
+The warmup tensor's batch dim is `560`. The compiled artifact accepts any admissible runtime value `s97 ∈ {56, 112, 168, …, 616}` (multiples of `granularity=56`) without recompilation.
 
 ### Step 1. PyTorch Dynamo
 
-Dynamo registers a symbol (call it `s0`) for dim 0 and records `ShapeEnv` bounds `lower=64, upper=1024`. The traced FX graph is:
+Dynamo registers a symbol (call it `s97`) for dim 0 and records `ShapeEnv` bounds `lower=56, upper=616`. The traced FX graph is:
 
 ```
-add(f16[s0, 128], f16[s0, 128]) -> f16[s0, 128]
+gelu(f16[s97, 1024]) -> f16[s97, 1024]
 ```
 
 ### Step 2. Inductor lowering
 
-The graph reaches the Spyre Inductor backend. LoopLevelIR represents the iteration space as `{p0: s0, p1: 128}` with index expression `index0 = 128*p0 + p1` for all three tensors.
+The graph reaches the Spyre Inductor backend. LoopLevelIR represents the iteration space as `{p0: s97, p1: 1024}` with index expression `index0 = 1024*p0 + p1` for both the input and the output tensor.
 
 ### Step 3. `views.align_tensors` (LoopLevelIR pass)
 
-For each iteration variable, `_bounded_or_hint(expr, size_hint)` is called. For `s0`:
+For each iteration variable, `_bounded_or_hint(expr, size_hint)` is called. For `s97`:
 
-- `finite_upper_or_none(s0)` returns `1024` (the user-declared upper bound).
-- The function therefore returns `s0` unchanged (it does not fall back to the size hint).
+- `finite_upper_or_none(s97)` returns `616` (the user-declared upper bound).
+- The function therefore returns `s97` unchanged (it does not fall back to the size hint).
 
-The iteration space stays symbolic: `{p0: s0, p1: 128}`.
+The iteration space stays symbolic: `{p0: s97, p1: 1024}`.
 
 ### Step 4. Work division (Pass 1: span reduction)
 
-`_collect_symbol_metadata` returns `SymbolMeta = {s0: (1024, 64)}`. Pass 1 checks the per-core span using `_effective_size(p0, meta) = 1024`:
+`_collect_symbol_metadata` returns `SymbolMeta = {s97: (616, 56)}`. Pass 1 checks the per-core span using `_effective_size(p0, meta) = 616`:
 
 ```
-worst-case span = 1024 (p0) * 128 (p1) * 2 bytes (fp16) = 256 KB per core (unsplit)
+worst-case span = 616 (p0) * 1024 (p1) * 2 bytes (fp16) ≈ 1.2 MB per core (unsplit)
 ```
 
-256 KB is well under the 256 MB limit, so no minimum split is committed.
+1.2 MB is well under the 256 MB limit, so no minimum split is committed.
 
 ### Step 5. Work division (Pass 3: work distribution)
 
-Pass 3 ranks output dimensions by size: `p0` (size 1024) first, `p1` (size 128) second. For `p0`:
+Pass 3 ranks output dimensions by size: `p1` (size 1024) first, `p0` (size 616 via `_effective_size`) second. The stick dim (`p1`) is the inner dim and is typically split last; the planner therefore distributes cores to `p0` based on the granularity. For `p0`:
 
-- `_valid_divisor_basis(p0, meta)` returns `64` (the granularity, not the max).
-- Divisors of 64 are `{1, 2, 4, 8, 16, 32, 64}`. `core_split(64, 32) = 32` picks the largest divisor `≤ SENCORES`.
+- `_valid_divisor_basis(p0, meta)` returns `56` (the granularity, not the max).
+- Divisors of 56 are `{1, 2, 4, 7, 8, 14, 28, 56}`. `core_split(56, 32) = 28` picks the largest divisor `≤ SENCORES`.
 
-`p0` absorbs all 32 cores. `p1` gets 1. Final split: `{p0: 32, p1: 1}`.
+`p0` absorbs 28 cores. `p1` gets 1. Final split: `{p0: 28, p1: 1}`. (Four cores are idle: 32 − 28. This is the cost of staying divisibility-correct across the entire admissible range.)
 
 ### Step 6. `create_op_spec` snapshot
 
@@ -466,12 +475,12 @@ Before the `ShapeEnv` goes out of scope, `create_op_spec` snapshots the bounds i
 
 ```python
 OpSpec(
-    op="add",
+    op="gelu",
     is_reduction=False,
-    iteration_space={p0: (s0, 32), p1: (Integer(128), 1)},
-    args=[TensorArg(arg_index=0, ...), TensorArg(arg_index=1, ...), TensorArg(arg_index=2, ...)],
+    iteration_space={p0: (s97, 28), p1: (Integer(1024), 1)},
+    args=[TensorArg(arg_index=0, ...), TensorArg(arg_index=1, ...)],  # input, output
     op_info={},
-    symbolic_dim_bounds={"s0": (1024, 64)},
+    symbolic_dim_bounds={"s97": (616, 56)},
 )
 ```
 
@@ -479,39 +488,39 @@ OpSpec(
 
 `parse_op_spec` relabels iteration vars to SDSC dim names (`p0` -> `mb`, `p1` -> `out`) and resolves sizes:
 
-- `_resolve_sdsc_size(s0, {"s0": (1024, 64)})` returns `1024`.
-- `SDSCSpec.iteration_space = {Symbol("mb"): 1024, Symbol("out"): 128}`.
-- `SDSCSpec.work_slices = {Symbol("mb"): 32, Symbol("out"): 1}`.
-- `SDSCSpec.symbolic_dims = {"mb": ("s0", 64, 1024)}`.
+- `_resolve_sdsc_size(s97, {"s97": (616, 56)})` returns `616`.
+- `SDSCSpec.iteration_space = {Symbol("mb"): 616, Symbol("out"): 1024}`.
+- `SDSCSpec.work_slices = {Symbol("mb"): 28, Symbol("out"): 1}`.
+- `SDSCSpec.symbolic_dims = {"mb": ("s97", 56, 616)}`.
 
 ### Step 8. `generate_sdsc` emits JSON
 
-The emitted `sdsc_0.json` carries the following symbolic-shape fields (other fields shown elided for brevity):
+The emitted `sdsc_0.json` carries the following symbolic-shape fields (other fields elided for brevity). The values below match the JSON captured from the real run:
 
 ```json
 {
-  "0_add": {
-    "numCoresUsed_": 32,
-    "numWkSlicesPerDim_": { "mb": 32, "out": 1 },
+  "0_gelufwd": {
+    "numCoresUsed_": 28,
+    "numWkSlicesPerDim_": { "mb": 28, "out": 1 },
     "dscs_": [
       {
-        "add": {
-          "N_": { "mb_": 1024, "out_": 128 },
+        "gelufwd": {
+          "N_": { "mb_": 616, "out_": 1024 },
           "dimToSymbolMapping_": { "mb": [-1] },
           "dataStageParam_": {
             "0": {
               "ss_": {
-                "mb_": 32,
-                "out_": 128,
+                "mb_": 22,
+                "out_": 1024,
                 "symbolicDimInfo_": {
-                  "mb": { "maxSize_": 32, "granularity_": 2 }
+                  "mb": { "maxSize_": 22, "granularity_": 2 }
                 }
               },
               "el_": {
-                "mb_": 32,
-                "out_": 128,
+                "mb_": 22,
+                "out_": 1024,
                 "symbolicDimInfo_": {
-                  "mb": { "maxSize_": 32, "granularity_": 2 }
+                  "mb": { "maxSize_": 22, "granularity_": 2 }
                 }
               }
             }
@@ -526,7 +535,7 @@ The emitted `sdsc_0.json` carries the following symbolic-shape fields (other fie
                   "[0, 0, 0]": "-2",
                   "[1, 0, 0]": "-3",
                   "...":       "...",
-                  "[31, 0, 0]": "-33"
+                  "[27, 0, 0]": "-29"
                 }
               }
             }
@@ -534,17 +543,19 @@ The emitted `sdsc_0.json` carries the following symbolic-shape fields (other fie
         }
       }
     ],
-    "inputSymbolsAndTags_": { "-1": "s0" }
+    "inputSymbolsAndTags_": { "-1": "s97" }
   }
 }
 ```
 
 Key points:
 
-- Dim symbol `s0` gets the first negative ID (`-1`), recorded in `dimToSymbolMapping_` for dim `mb` and in `inputSymbolsAndTags_` for runtime resolution.
-- Per-core `symbolicDimInfo_` carries `maxSize_ = 1024 / 32 = 32` and `granularity_ = max(1, 64 / 32) = 2`, so the backend knows each core handles at most 32 elements along `mb`, in steps of 2.
-- For each tensor, 32 per-core entries in `startAddressCoreCorelet_.data_` hold distinct negative symbol IDs (`-2..-33` for tensor 0, then continuing for tensors 1 and 2). Each ID resolves at runtime to `base + c · (s0_runtime / 32) · 128 · 2` bytes.
-- `isStartAddrSymbolic_: 1` on every HBM allocate node tells DeepTools to use the symbolic-resolution path.
+- Dim symbol `s97` gets the first negative ID (`-1`), recorded in `dimToSymbolMapping_` for dim `mb` and in `inputSymbolsAndTags_` for runtime resolution.
+- Per-core `symbolicDimInfo_` carries `maxSize_ = 616 / 28 = 22` and `granularity_ = max(1, 56 / 28) = 2`, so the backend knows each core handles at most 22 elements along `mb`, in steps of 2.
+- For each tensor, 28 per-core entries in `startAddressCoreCorelet_.data_` hold distinct negative symbol IDs (`-2..-29` for the input tensor, then `-30..-57` for the output tensor). Each ID resolves at runtime to `base + c · (s97_runtime / 28) · 1024 · 2` bytes.
+- `isStartAddrSymbolic_: 1` on every HBM allocate node tells the runtime to invoke JIT Program Correction for the per-core address path.
+
+> **Note on current vs. post-#2289 output.** The symbolic per-core address IDs (`-2..-29`, `-30..-57`) and the `isStartAddrSymbolic_: 1` flag are added by PR #2289 (in flight). A real compile against today's frontend (with the Phase 1.A SDSC PR but without #2289) instead bakes compile-time-concretised addresses into `data_` (for example `"[0, 0, 0]": "0"`, `"[1, 0, 0]": "2560"`, …, computed from `max=616 / split=28`). Those baked offsets are wrong for any runtime value smaller than `max`. This is precisely the silent-miscompute hazard that motivates #2289 (see Section 8.3).
 
 ### Step 9. `bundle.mlir`
 
@@ -553,20 +564,18 @@ Key points:
 ```mlir
 module {
   func.func @sdsc_bundle(%arg_0_base_addr: !sdscbundle.input_arg<index>,
-                         %arg_1_base_addr: !sdscbundle.input_arg<index>,
-                         %arg_2_base_addr: !sdscbundle.input_arg<index>) {
+                         %arg_1_base_addr: !sdscbundle.input_arg<index>) {
     %arg_0 = sdscbundle.input_arg_extract value from %arg_0_base_addr : !sdscbundle.input_arg<index> -> index
     %arg_1 = sdscbundle.input_arg_extract value from %arg_1_base_addr : !sdscbundle.input_arg<index> -> index
-    %arg_2 = sdscbundle.input_arg_extract value from %arg_2_base_addr : !sdscbundle.input_arg<index> -> index
 
-    // Dim symbol s0 placeholder. Patched by JIT Program Correction at dispatch via inputSymbolsAndTags_.
+    // Dim symbol s97 placeholder. Patched by JIT Program Correction at dispatch via inputSymbolsAndTags_.
     %sym_1 = arith.constant 0 : index
 
     // kernel_derived_symbolic placeholders, one per (tensor, core c >= 1).
     %sym_3 = arith.constant 0 : index
-    // ... per-core placeholders for tensor 0 (cores 1..31), tensor 1, tensor 2 ...
+    // ... per-core placeholders for the input tensor (cores 1..31) and the output tensor ...
 
-    sdscbundle.sdsc_execute (%sym_1, %arg_0, %sym_3, /* ... */, %arg_1, /* ... */, %arg_2, /* ... */)
+    sdscbundle.sdsc_execute (%sym_1, %arg_0, %sym_3, /* ... */, %arg_1, /* ... */)
         {sdsc_filename="sdsc_0.json", symbol_ids=[-1, -2, -3, /* ... */]}
     return
   }
@@ -577,14 +586,14 @@ The operand value for `kernel_derived_symbolic` and `dimension` symbols is `arit
 
 ### Step 10. Runtime dispatch (illustrative)
 
-When the compiled function is later invoked with a different shape, for example `x_runtime.shape[0] = 256`:
+When the compiled function is later invoked with a different shape, for example `x_runtime.shape[0] = 168` (an admissible value: `168 = 56 · 3`):
 
 1. PyTorch dispatches the kernel through the standard host wrapper.
 2. The Spyre runtime reads the actual tensor shape and invokes JIT Program Correction.
-3. JIT Program Correction reads `s0 = 256` from the runtime shape and patches the per-core addresses in the Spyre Code using the SDSC metadata. The per-core slice along the batch dim is `256 / 32 = 8` elements, so the per-core start address for tensor 0 core `c` is `base + c · 8 · 128 · 2 bytes = base + c · 2048`.
-4. Each Spyre core executes on its correct 8-batch slice.
+3. JIT Program Correction reads `s97 = 168` from the runtime shape and patches the per-core addresses in the Spyre Code using the SDSC metadata. The per-core slice along the batch dim is `168 / 28 = 6` elements, so the per-core start address for the input tensor core `c` is `base + c · 6 · 1024 · 2 bytes = base + c · 12288` (the output tensor follows the same formula with its own base).
+4. Each Spyre core executes on its correct 6-batch slice (28 active cores, 4 idle).
 
-No backend recompilation is needed for any admissible runtime value in `{64, 128, 192, ..., 1024}`; only the JIT Program Correction step runs per dispatch.
+No backend recompilation is needed for any admissible runtime value in `{56, 112, 168, …, 616}`; only the JIT Program Correction step runs per dispatch.
 
 ---
 
