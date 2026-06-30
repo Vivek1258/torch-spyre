@@ -25,7 +25,7 @@ This page describes how the Torch-Spyre front-end compiler enables dynamic shape
 **Dynamic shapes:** The user marks specific dimensions as variable, declaring their bounds:
 
 ```python
-x = torch.randn((1024, 128), dtype=torch.float16)
+x = torch.randn((512, 128), dtype=torch.float16)
 torch._dynamo.mark_dynamic(x, dim=0, min=64, max=1024)
 compiled = torch.compile(model)
 out = compiled(x.to("spyre"))   # the runtime size can be 64, 128, 256, ..., 1024
