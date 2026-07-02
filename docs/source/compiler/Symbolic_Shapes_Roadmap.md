@@ -1,138 +1,154 @@
 # Symbolic Shapes Roadmap
 
-A single-glance view of where the work is, what is in flight, and what
-is queued. Status colours: green = landed, yellow = in flight,
-blue = next to open, grey = future.
+**Last updated:** 2026-07-02
+**Target:** August deadline. Two-week sprints. Development and testing
+run in parallel; every dev PR gets a test-plan slice in the same
+sprint, with a feedback arrow when bugs surface.
+
+## Quick navigation
+
+- [Already landed](#already-landed)
+- [Sprint roadmap](#sprint-roadmap)
+- [Risk assessment for the August deadline](#risk-assessment-for-the-august-deadline)
+- [Cross-team dependencies with sprint targets](#cross-team-dependencies-with-sprint-targets)
+- [Beyond August](#beyond-august)
+- [Legend and cross-references](#legend-and-cross-references)
+
+## Already landed
+
+Foundation is closed. Eight issues merged via PRs #2003, #2379, #2499,
+#2673: `mark_dynamic` extraction, symbolic OpSpec, bucketing
+invariant, work division, SDSC JSON emission with dim-symbol metadata.
+See the [GitHub Issues Compendium](Symbolic_Shapes_GitHub_Issues.md)
+for the verbatim record.
+
+## Sprint roadmap
+
+Left to right is time. Vertical rows inside each sprint are the four
+parallel tracks. Dotted arrows carry the test-fix loop back into dev.
 
 ```mermaid
-flowchart TB
-    %% ============ FOUNDATION (LANDED) ============
-    subgraph FOUNDATION ["Foundation (landed)"]
+flowchart LR
+    %% =============== SPRINT 1 ===============
+    subgraph SPR1 ["Sprint 1: Jul 2 - Jul 16"]
         direction TB
-        F218[#218<br/>OpSpec carries sympy]
-        F219[#219<br/>Constraints from ShapeEnv]
-        F1371[#1371<br/>Compile symbolic /<br/>runtime concrete]
-        F1372[#1372<br/>Bounded bucketing<br/>n divides granularity]
-        F1373[#1373<br/>views.py opt-in]
-        F2284[#2284<br/>mark_dynamic extraction]
-        F2287[#2287<br/>Work division]
-        F2288[#2288<br/>SDSC JSON emission]
+        S1_DEV["<b>Dev</b><br/>#2289 lands<br/>#2500 in review<br/>#221 late-bind explor."]:::inflight
+        S1_CT["<b>Cross-team</b><br/>0.2 DeepTools interface kickoff<br/>0.3 HBM API decision<br/>#2408 DT-side sync"]:::inflight
+        S1_VLLM["<b>vLLM + Granite</b><br/>0.1 Granite readiness memo<br/>Plugin blocker triage"]:::inflight
+        S1_TEST["<b>Testing</b><br/>#2279 pointwise coverage<br/>#2289 pod tests<br/>#3005 constraint bug"]:::inflight
     end
 
-    %% ============ END-TO-END UNBLOCK (IN FLIGHT) ============
-    subgraph INFLIGHT ["End-to-end unblock (in flight)"]
+    %% =============== SPRINT 2 ===============
+    subgraph SPR2 ["Sprint 2: Jul 16 - Jul 30"]
         direction TB
-        I2289[#2289<br/>Per-core symbolic<br/>start addresses]
-        I2500[#2500<br/>bundle.mlir input_args<br/>plus auto-enable]
-        I2434[#2434<br/>Runtime HBM at max<br/>plus stride derivation]
+        S2_DEV["<b>Dev</b><br/>#2500 lands<br/>Ticket 1 Multi-SDSC IDs<br/>Ticket 2 Reductions core div<br/>Ticket 4 BMM core div"]:::next
+        S2_CT["<b>Cross-team</b><br/>#2434 runtime work<br/>#2408 consumer sync<br/>0.3 API decision closed"]:::atrisk
+        S2_VLLM["<b>vLLM + Granite</b><br/>Plugin coord: three blockers<br/>Granite demo scope"]:::next
+        S2_TEST["<b>Testing</b><br/>#2500 pod tests<br/>Multi-SDSC unit tests<br/>#220 SDSC path tests"]:::next
     end
 
-    %% ============ ARCHITECTURAL FOUNDATION (NEXT) ============
-    subgraph ARCH ["Architectural foundation (open next)"]
+    %% =============== SPRINT 3 ===============
+    subgraph SPR3 ["Sprint 3 buffer: Jul 30 - August"]
         direction TB
-        A5[Multi-SDSC symbol<br/>ID uniqueness]
+        S3_DEV["<b>Dev</b><br/>Ticket 3 Reductions SDSC<br/>Ticket 5 BMM SDSC<br/>Bug-fix window"]:::next
+        S3_CT["<b>Cross-team</b><br/>#2434 lands<br/>DT consumer end-to-end"]:::atrisk
+        S3_VLLM["<b>vLLM + Granite</b><br/>Granite demo prep<br/>Plugin PRs open"]:::next
+        S3_TEST["<b>Testing</b><br/>End-to-end smoke<br/>Regression sweep<br/>Granite validation"]:::next
     end
 
-    %% ============ PHASE 1.B (NEXT) ============
-    subgraph P1B ["Phase 1.B (open after Phase 0 lands)"]
-        direction TB
-        P1B1[Reductions<br/>Core Division]
-        P1B2[Reductions<br/>SDSC and bundle.mlir]
-        P1B3[Matmul / BMM<br/>Core Division]
-        P1B4[Matmul / BMM<br/>SDSC and bundle.mlir]
-    end
+    %% =============== SPRINT FLOW ===============
+    SPR1 --> SPR2 --> SPR3
 
-    %% ============ PHASE 2 (FUTURE) ============
-    subgraph P2 ["Phase 2 (future)"]
-        direction TB
-        P2A[Phase 2.A<br/>Symbolic stick dim]
-        P2B[Phase 2.B<br/>Middle and multi-dim<br/>symbolic]
-    end
+    %% =============== TEST-FIX LOOP ===============
+    S1_TEST -.->|test bugs| S1_DEV
+    S2_TEST -.->|test bugs| S2_DEV
+    S3_TEST -.->|test bugs| S3_DEV
+    S1_TEST -.->|carried bugs| S2_DEV
+    S2_TEST -.->|carried bugs| S3_DEV
 
-    %% ============ PHASE 3 (FUTURE) ============
-    subgraph P3 ["Phase 3 (future)"]
-        direction TB
-        P3R[Reduction along<br/>symbolic axis]
-        P3L[Symbolic LX<br/>scratchpad]
-        P3P[Recompile policy<br/>plus perf tuning]
-    end
-
-    %% ============ WORKLOAD MILESTONES ============
-    V1[vLLM packed-token<br/>non-attention path<br/>single binary]:::value
-    V2[FMS batched serving<br/>single binary<br/>requires FMS-side mark_dynamic]:::value
-    V3[FMS seq-axis activates<br/>vision / speech encoders<br/>single binary]:::value
-    V4[FMS decode attention<br/>against non-paged cache]:::value
-
-    %% ============ DEPENDENCIES ============
-    FOUNDATION --> INFLIGHT
-    INFLIGHT --> ARCH
-    ARCH --> P1B
-    P1B --> P1B1
-    P1B --> P1B3
-    P1B1 --> P1B2
-    P1B3 --> P1B4
-
-    P1B2 --> V1
-    P1B4 --> V1
-    P1B2 --> V2
-    P1B4 --> V2
-
-    P1B --> P2A
-    P2A --> P2B
-    P2B --> V3
-
-    P2B --> P3
-    P3 --> P3R
-    P3 --> P3L
-    P3 --> P3P
-    P3R --> V4
-
-    %% ============ STYLING ============
-    classDef done fill:#c8e6c9,stroke:#2e7d32,color:#1b5e20
+    %% =============== STYLING ===============
     classDef inflight fill:#fff9c4,stroke:#f57f17,color:#e65100
     classDef next fill:#bbdefb,stroke:#1565c0,color:#0d47a1
-    classDef future fill:#eeeeee,stroke:#616161,color:#212121
-    classDef value fill:#f8bbd0,stroke:#ad1457,color:#880e4f,stroke-width:2px
-
-    class F218,F219,F1371,F1372,F1373,F2284,F2287,F2288 done
-    class I2289,I2500,I2434 inflight
-    class A5,P1B1,P1B2,P1B3,P1B4 next
-    class P2A,P2B,P3R,P3L,P3P future
+    classDef atrisk fill:#ffcdd2,stroke:#c62828,color:#b71c1c,stroke-width:2px
+    classDef done fill:#c8e6c9,stroke:#2e7d32,color:#1b5e20
 ```
 
-## Legend
+**Reading the diagram**
 
-- **Green (Foundation)**: landed via PRs #2003, #2379, #2499, #2673. Closed issues.
-- **Yellow (In flight)**: open issues on the critical path for end-to-end dispatch.
-- **Blue (Next)**: queued to open immediately after the in-flight three land.
-- **Grey (Future)**: scoped for later phases; no concrete issue yet.
-- **Pink (Workload milestones)**: where real users see value.
+- **Yellow** cells are in flight this sprint.
+- **Blue** cells are queued for this sprint or the next.
+- **Red-bordered** cells are at risk of slipping the deadline (see the
+  risk table below).
+- **Dotted arrows** carry the test-fix feedback loop. A bug found in
+  Sprint 1 testing either flows back into Sprint 1 dev (fixed same
+  sprint) or is carried into Sprint 2 dev (fixed next sprint). Bugs
+  found in Sprint 3 consume the bug-fix window; anything past the
+  cut-off becomes a follow-up PR, not a milestone blocker.
+- Solid `-->` arrows show sprint order; individual node dependencies
+  within a sprint are implicit in the row grouping.
 
-## Reading the diagram
+## Risk assessment for the August deadline
 
-The vertical layering shows the dependency order: foundation enables the
-in-flight unblock, which enables Phase 1.B, which delivers the first
-workload milestones. Phases 2 and 3 follow.
+| Risk | Impact | Likelihood | Mitigation |
+|---|---|---|---|
+| DeepTools symbolic SDSC consumer (#2408) late | HIGH | MEDIUM | Kick off in Sprint 1 via JIRA 0.2. Get commitment on landing dates from DeepTools by end of Sprint 1. If consumer slips past Sprint 2, defer Granite demo to a follow-up milestone and ship the torch-spyre side as a documented handoff. |
+| HBM allocation API decision (JIRA 0.3) late | HIGH | LOW | Force a decision meeting in Sprint 1 week 1. The three options are on the table. Recommend the max-at-`.to("spyre")` API to the runtime team early so #2434 can start. |
+| Matmul cost model harder than scoped (ticket 4) | HIGH | MEDIUM | Do the design spike in Sprint 1 alongside #2289 review. If the spike shows more than one sprint of work, split ticket 4 into a refactor-then-symbolic pair and defer the second half to a follow-up. |
+| Test bugs surfaced late in Sprint 3 | HIGH | MEDIUM | Reserve the last 3-4 days of Sprint 3 as an explicit bug-fix window with no new feature work. Set a cut-off after which new bugs get deferred to a follow-up PR rather than blocking the milestone. Testing team publishes daily bug summary in Sprint 3 so triage stays visible. |
+| spyre-inference plugin blockers not resolved | MEDIUM | MEDIUM | JIRA 0.1 produces a go/no-go memo in Sprint 1 with the three specific blockers (`dynamic=False`, `mark_dynamic` call, attention closure constants). If plugin team cannot commit by end of Sprint 2, the Granite demo becomes a "torch-spyre + DeepTools ready, plugin follow-up" narrative. |
+| Concurrent refactor collision (PR #2914) | MEDIUM | MEDIUM | Coordinate landing order with dgrove-oss in Sprint 1. Recommendation: land #2289 first and rebase #2914 on top. See the workitems doc callout. |
+| vLLM upstream shape-contract shift | LOW | LOW | Monitor via JIRA 0.1. No mitigation beyond visibility; contract drift there is out of our control. |
 
-The architectural foundation (Multi-SDSC ID uniqueness) lands between
-the in-flight three and Phase 1.B because Phase 1.B's SDSC work assumes
-bundle-global symbol IDs from day one. Landing it after Phase 1.B would
-require ID rework inside #2/#4 above.
+## Cross-team dependencies with sprint targets
 
-Phase 2.A is sequenced before Phase 2.B because it isolates stick-dim
-mechanics from the broader middle-dim work; it does not unlock a
-workload on its own.
+- **DeepTools**: symbolic SDSC consumer per #2408 owned by @lupalby.
+  Sprint 1: contract ratification via JIRA 0.2. Sprint 2: consumer
+  code in review. Sprint 3: end-to-end smoke on Pod.
+- **Runtime team**: HBM sized at max plus stride derivation per #2434.
+  Sprint 1: HBM API decision via JIRA 0.3. Sprint 2: implementation
+  in progress. Sprint 3: lands.
+- **spyre-inference plugin team**: three plugin-side blockers listed
+  in JIRA 0.1 (`dynamic=False` hard-coded, no `mark_dynamic` call,
+  attention closure constants). Sprint 1: commit dates. Sprint 2:
+  PR opened. Sprint 3: merges alongside end-to-end demo.
+- **FMS team**: `mark_dynamic` on `input_ids` and KV-cache. Not
+  needed to hit the August torch-spyre deliverable, but flagged
+  for follow-up so FMS-batched serving unlocks after August.
 
-Phase 3 is the only path to FMS-style decode attention against a
-non-paged variable-length cache, because that workload reduces along
-a symbolic axis.
+## Beyond August
 
-## Cross-team dependencies (not shown on the dependency graph)
+Out of scope for the August deadline, captured so nothing is lost:
 
-- **DeepTools**: symbolic SDSC consumer, JIT Program Correction at
-  dispatch.
-- **Runtime team**: #2434 implementation.
-- **FMS team**: `mark_dynamic` calls on `input_ids` and KV-cache batch
-  dim once Phase 1.B lands.
-- **vLLM (spyre-inference)**: padding to `granularity` multiples at
-  runtime; no code change for Phase 1.A.
+- **Symbolic stick dim** (torch-spyre-side): scaffolds middle-dim
+  work; low direct value alone.
+- **Middle and multi-dim symbolic** (torch-spyre-side): unlocks the
+  FMS seq-dim marking already present in FMS code today.
+- **Reduction along a symbolic axis** (torch-spyre-side): required
+  for FMS-style decode attention against a non-paged variable-length
+  cache.
+- **Performance tuning and recompile policy** (torch-spyre-side):
+  formalise the out-of-range behaviour and perf targets vs the
+  concrete-shape baseline.
+
+## Legend and cross-references
+
+Colour coding:
+
+- **Yellow**: in flight this sprint.
+- **Blue**: queued this sprint or next.
+- **Red border**: at risk of slipping the deadline.
+- **Green**: already landed (see the "Already landed" section).
+
+Related docs:
+
+- [Symbolic_Shapes_Design_Document.md](Symbolic_Shapes_Design_Document.md)
+  for the engineering HLD.
+- [Symbolic_Shapes_Next_Workitems.md](Symbolic_Shapes_Next_Workitems.md)
+  for per-ticket scope of the 8 workitems referenced above.
+- [Symbolic_Shapes_GitHub_Issues.md](Symbolic_Shapes_GitHub_Issues.md)
+  for the verbatim issue compendium including #220, #221, #2279,
+  #3005, and #2408.
+- [Symbolic_Shapes_Readout_Script.md](Symbolic_Shapes_Readout_Script.md)
+  for the team-facing communication artefact.
+- [Symbolic_Shapes_Phasewise_Usecases.md](Symbolic_Shapes_Phasewise_Usecases.md)
+  for the workload-to-scope mapping.
