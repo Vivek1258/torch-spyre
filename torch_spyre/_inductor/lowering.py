@@ -699,6 +699,22 @@ def lower_gelu(x, approximate="none"):
     return pw
 
 
+@register_spyre_lowering(torch.ops.spyre.silu)
+def lower_silu(x):
+    pw = Pointwise.create(
+        device=x.get_device(),
+        dtype=x.get_dtype(),
+        inner_fn=lambda index: lowering.ops_wrapper(torch.ops.spyre.silu.__name__)(
+            x.make_loader()(index)
+        ),
+        ranges=x.get_size(),
+        origin_node=x.get_origin_node(),
+        traceback=x.get_traceback(),
+    )
+    pw.realize()
+    return pw
+
+
 @register_spyre_lowering(torch.ops.spyre.softplus)
 def lower_softplus(x, beta=1.0, threshold=20.0):
     fn = lowering.ops_wrapper(torch.ops.spyre.softplus.__name__)
@@ -1164,3 +1180,45 @@ def lower_minimum(x, y):
 )
 def lower_maximum(x, y):
     return with_int64_fallback(lowering.maximum, x, y)
+
+
+@register_spyre_lowering(torch.ops.spyre.qfp8ch)
+def lower_qfp8ch(x):
+    """
+    Lower qfp8ch operation - channel-wise FP8 format conversion.
+
+    Pointwise format conversion only (no scaling).
+    """
+
+    fn = lowering.ops_wrapper(torch.ops.spyre.qfp8ch.__name__)
+    x_loader = x.make_loader()
+
+    def inner_fn(index):
+        return fn(x_loader(index))
+
+    pw = Pointwise.create(
+        device=x.get_device(),
+        dtype=torch.float8_e4m3fn,
+        inner_fn=inner_fn,
+        ranges=x.get_size(),
+        origin_node=x.get_origin_node(),
+        traceback=x.get_traceback(),
+    )
+    pw.realize()
+    return pw
+
+
+@register_spyre_lowering(
+    torch.ops.spyre.prod_dim_int,
+    type_promotion_kind=None,
+)
+def lower_prod_dim(x, dim, keepdim=False):
+    def _prod_dim_impl(x):
+        kwargs = lowering._make_reduction_inner(
+            x, axis=[dim], keepdims=keepdim, dtype=x.dtype, override_return_dtype=None
+        )
+        result = Reduction.create(reduction_type="prod", input_node=x, **kwargs)
+        result.realize()
+        return result
+
+    return with_int64_fallback(_prod_dim_impl, x)

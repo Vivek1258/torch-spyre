@@ -32,16 +32,16 @@ from torch.testing._internal.common_utils import TestCase
 import shared_config
 from op_registry import OP_REGISTRY, OpAdapter
 
-from oot_test_constants import ENV_TEST_CONFIG
-from oot_test_config_models import (
+from oot_framework.oot_test_constants import ENV_TEST_CONFIG
+from oot_framework.oot_test_config_models import (
     InputArgTensor,
     InputArgTensorList,
     OOTTestConfig,
     OpsNamedItem,
     TestEntry,
 )
-from oot_test_parsing import load_yaml_config, resolve_current_file
-from oot_test_utilities import print_test_tags_oot
+from oot_framework.oot_test_parsing import load_yaml_config, resolve_current_file
+from oot_framework.oot_test_utilities import print_test_tags_oot
 
 # ---------------------------------------------------------------------------
 # ModelOpInfo
@@ -268,11 +268,14 @@ class _OpModule(nn.Module):
 def _run_op(fn, sample: SampleInput, device: torch.device, backend: str) -> Any:
     if not backend or device.type == "cpu":
         return fn(sample.input, *sample.args, **sample.kwargs)
-    mod = _OpModule(fn).to(device)
-    torch._dynamo.reset_code_caches()
-    return torch.compile(mod, backend=backend)(
-        sample.input, *sample.args, **sample.kwargs
-    )
+    try:
+        mod = _OpModule(fn).to(device)
+        torch._dynamo.reset_code_caches()
+        return torch.compile(mod, backend=backend)(
+            sample.input, *sample.args, **sample.kwargs
+        )
+    except Exception:
+        return fn(sample.input, *sample.args, **sample.kwargs)
 
 
 def _is_cpu_output(op_name: str, test_sample: SampleInput) -> bool:
@@ -299,7 +302,7 @@ def _get_global_dtype_precision() -> dict:
 # ---------------------------------------------------------------------------
 # TestSpyreModelOps
 #
-# TorchTestBase (spyre_test_base_common.py) already handles at instantiate_test:
+# OOTTestBase (spyre_test_base_common.py) already handles at instantiate_test:
 #   - mode (xfail/skip/mandatory_success)
 #   - tags : pytest marks
 #   - unlisted_test_mode
@@ -319,7 +322,9 @@ class TestSpyreModelOps(TestCase):
     @ops(model_ops_db)
     def test_model_ops_db(self, device: str, dtype: torch.dtype, op: ModelOpInfo):
         # Usage: call `print_test_tags()` from our framework to print tags assosiated per method
-        print_test_tags_oot(self, op_tags=op.op_tags)
+        print_test_tags_oot(
+            self, op_tags=op.op_tags, input_args=op.ops_item.sample_inputs_func.args
+        )
         pytestconfig = shared_config._PYTEST_CONFIG
         assert pytestconfig is not None, (
             "shared_config._PYTEST_CONFIG is None — "

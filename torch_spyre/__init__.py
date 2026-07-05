@@ -19,9 +19,9 @@ import importlib
 import torch
 
 from .constants import DEVICE_NAME, DISTRIBUTED_BACKEND_NAME
-
 from . import memory
 from . import profiler
+
 
 _runtime_init_lock = threading.Lock()
 
@@ -345,6 +345,9 @@ def _autoload():
     os.environ.setdefault("TORCH_SENDNN_LOG", "CRITICAL")
     os.environ.setdefault("DT_DEEPRT_VERBOSE", "-1")
     os.environ.setdefault("DTLOG_LEVEL", "error")
+
+    # Enable spyre code with symbolic args by default
+    os.environ.setdefault("BUNDLE_SYMBOLIC_ARGS", "1")
 
 
 if not profiler.is_available():

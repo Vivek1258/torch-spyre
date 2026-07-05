@@ -41,6 +41,22 @@ on:
         required: false
         type: boolean
         default: true
+      runner_label:
+        description: |
+          Per-PR ephemeral runner-set IMAGE label to select
+          (image_spyre_backend_pr_<component>_<sha12>, e.g. image_spyre_backend_pr_flex_8ddcf3e155e9).
+          Empty = use the standing image_spyre_backend set (the RPM is then installed at
+          runtime via rpm_names; the ephemeral flow leaves this set and rpm_names empty).
+        required: false
+        type: string
+        default: ''
+      test_type:
+        description: >-
+          Suite subset to run: smoke | core | full | suite_<group> | <label>.
+          Default: full (every config).
+        required: false
+        type: string
+        default: full
 
 concurrency:
   group: ${{ github.workflow }}-${{ (github.event_name == 'pull_request' && github.event.pull_request.html_url) || (github.event_name == 'workflow_dispatch'
@@ -112,14 +128,17 @@ jobs:
     uses: ./.github/workflows/_test_matrix.yaml
     with:
       runner_label: linux
-      extra_test_flags: -v
+      # Per-PR ephemeral image label when provided, else the standing set.
+      image_label: ${{ inputs.runner_label || 'image_spyre_backend' }}
+      extra_test_flags: -v -m "not xfail"
+      extra_test_flags_multi_spyre: -v
       checkout_pytorch: false
-      torch_root: ''
       ref: ${{ inputs.ref || '' }}
       repository: ${{ inputs.repository || '' }}
       rpm_location: ${{ inputs.rpm_location || '' }}
       rpm_names: ${{ inputs.rpm_names || '' }}
       build_torch_spyre: ${{ inputs.build_torch_spyre == true }}
+      test_type: ${{ inputs.test_type || 'full' }}
 
   # ---------------------------------------------------------------------------
   # Job 3: run-spyre-unit-tests (required check gate)
