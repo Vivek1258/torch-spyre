@@ -31,6 +31,8 @@ from torch_spyre._inductor.errors import Unsupported
 from torch_spyre._inductor.codegen.compute_ops import (
     SymbolKind,
     _per_core_symbolic_dim_info,
+    _symbolic_split_info,
+    _tensor_has_symbolic_split,
 )
 from torch_spyre._inductor.codegen.superdsc import _resolve_sdsc_size, compile_op_spec
 from torch_spyre._inductor.op_spec import OpSpec, TensorArg
@@ -370,3 +372,277 @@ class TestSdscJsonSymbolicDimSmoke(InductorTestCase):
         for stage in ("ss_", "el_"):
             sym_info = dsc["dataStageParam_"]["0"][stage]["symbolicDimInfo_"]
             self.assertEqual(sym_info, {"mb": {"maxSize_": 512, "granularity_": 64}})
+
+
+class TestSymbolKindKernelDerivedSymbolic(InductorTestCase):
+    """Unit tests for the kernel_derived_symbolic variant added to
+    compute_ops.SymbolKind for per-core symbolic start addresses (#2289).
+    """
+
+    def test_factory_sets_all_fields(self):
+        sk = SymbolKind.kernel_derived_symbolic(
+            arg_index=2,
+            core_idx=5,
+            split_count=8,
+            base_sym_idx=3,
+            pytorch_sym="s0",
+        )
+        self.assertEqual(sk.kind, "kernel_derived_symbolic")
+        self.assertEqual(sk.arg_index, 2)
+        self.assertEqual(sk.core_idx, 5)
+        self.assertEqual(sk.split_count, 8)
+        self.assertEqual(sk.base_sym_idx, 3)
+        self.assertEqual(sk.pytorch_sym, "s0")
+
+    def test_is_derived_symbolic_true(self):
+        sk = SymbolKind.kernel_derived_symbolic(
+            arg_index=0, core_idx=1, split_count=4, base_sym_idx=0, pytorch_sym="s0"
+        )
+        self.assertTrue(sk.is_derived_symbolic)
+
+    def test_kernel_derived_is_not_symbolic(self):
+        # kernel_derived and kernel_derived_symbolic share base_sym_idx semantics
+        # but must be distinguishable so the bundle.mlir emitter picks the
+        # correct lowering path.
+        self.assertFalse(
+            SymbolKind.kernel_derived(
+                base_sym_idx=0, offset=128, arg_index=0
+            ).is_derived_symbolic
+        )
+
+    def test_is_derived_strict_check(self):
+        # is_derived must be False for kernel_derived_symbolic so the existing
+        # bundle.py arith.addi branch does not match.
+        sk = SymbolKind.kernel_derived_symbolic(
+            arg_index=0, core_idx=1, split_count=4, base_sym_idx=0, pytorch_sym="s0"
+        )
+        self.assertFalse(sk.is_derived)
+        self.assertFalse(sk.is_pool)
+        self.assertFalse(sk.is_dimension)
+
+    def test_offset_field_is_unused_sentinel(self):
+        # Symbolic per-core addresses do not carry a concrete offset; the
+        # offset field must stay at its default sentinel.
+        sk = SymbolKind.kernel_derived_symbolic(
+            arg_index=0, core_idx=1, split_count=4, base_sym_idx=0, pytorch_sym="s0"
+        )
+        self.assertEqual(sk.offset, 0)
+
+
+class TestSymbolicSplitPredicates(InductorTestCase):
+    """Unit tests for compute_ops._symbolic_split_info and
+    _tensor_has_symbolic_split (#2289).
+
+    The predicates classify whether a tensor's split is on a symbolic dim,
+    which gates per-core symbolic address emission in generate_sdsc.
+    Stub-based fixtures avoid dependence on the full TensorArg / SDSCSpec
+    construction path.
+    """
+
+    _SYMBOLIC_DIMS_MB = {"mb": ("s0", 64, 1024)}
+    _MB_SYM = sympy.Symbol("mb")
+    _OUT_SYM = sympy.Symbol("out")
+
+    @staticmethod
+    def _stub_tensor(arg_index, scales, strides):
+        return SimpleNamespace(
+            arg_index=arg_index,
+            scales=scales,
+            strides=strides,
+        )
+
+    def test_symbolic_split_returns_info(self):
+        # mb is symbolic and split across 8 cores; the tensor uses it.
+        tensor = self._stub_tensor(
+            arg_index=0,
+            scales={self._MB_SYM: 1, self._OUT_SYM: 1},
+            strides={self._MB_SYM: 256, self._OUT_SYM: 1},
+        )
+        work_slices = {self._MB_SYM: 8, self._OUT_SYM: 1}
+        info = _symbolic_split_info(tensor, work_slices, self._SYMBOLIC_DIMS_MB)
+        self.assertEqual(info, ("mb", 8, "s0"))
+        self.assertTrue(
+            _tensor_has_symbolic_split(tensor, work_slices, self._SYMBOLIC_DIMS_MB)
+        )
+
+    def test_symbolic_dim_not_split_returns_none(self):
+        # mb is symbolic but work_slices=1 so it is not actually split.
+        tensor = self._stub_tensor(
+            arg_index=0,
+            scales={self._MB_SYM: 1, self._OUT_SYM: 1},
+            strides={self._MB_SYM: 256, self._OUT_SYM: 1},
+        )
+        work_slices = {self._MB_SYM: 1, self._OUT_SYM: 8}
+        self.assertIsNone(
+            _symbolic_split_info(tensor, work_slices, self._SYMBOLIC_DIMS_MB)
+        )
+
+    def test_no_symbolic_dims_returns_none(self):
+        tensor = self._stub_tensor(
+            arg_index=0,
+            scales={self._MB_SYM: 1, self._OUT_SYM: 1},
+            strides={self._MB_SYM: 256, self._OUT_SYM: 1},
+        )
+        work_slices = {self._MB_SYM: 8, self._OUT_SYM: 1}
+        self.assertIsNone(_symbolic_split_info(tensor, work_slices, {}))
+
+    def test_pool_tensor_defensively_skipped(self):
+        # Pool tensors have arg_index < 0; they have no kernel base to
+        # reference, so the predicate skips them even when a symbolic dim
+        # is split.
+        tensor = self._stub_tensor(
+            arg_index=-1,
+            scales={self._MB_SYM: 1, self._OUT_SYM: 1},
+            strides={self._MB_SYM: 256, self._OUT_SYM: 1},
+        )
+        work_slices = {self._MB_SYM: 8, self._OUT_SYM: 1}
+        self.assertIsNone(
+            _symbolic_split_info(tensor, work_slices, self._SYMBOLIC_DIMS_MB)
+        )
+
+    def test_reduced_or_broadcast_dim_skipped(self):
+        # scales <= 0 means the tensor either reduces along or broadcasts
+        # against this dim; the per-core address does not depend on the
+        # symbolic value in that case.
+        tensor = self._stub_tensor(
+            arg_index=0,
+            scales={self._MB_SYM: -1, self._OUT_SYM: 1},
+            strides={self._MB_SYM: 0, self._OUT_SYM: 1},
+        )
+        work_slices = {self._MB_SYM: 8, self._OUT_SYM: 1}
+        self.assertIsNone(
+            _symbolic_split_info(tensor, work_slices, self._SYMBOLIC_DIMS_MB)
+        )
+
+
+class TestGenerateSdscSymbolicPerCoreAddresses(InductorTestCase):
+    """Smoke test: a symbolic-batch op with a per-core split emits the
+    expected per-core symbolic address fields in SDSC (#2289).
+
+    Fixture mirrors TestSdscJsonSymbolicDimSmoke but with work_slices that
+    actually split the symbolic dim across cores.  The split count is the
+    full bucketing-model split (s0 max=512, granularity=64, splits across
+    8 cores), which is the case JIT Program Correction is designed for.
+    """
+
+    _DEVICE_SIZE = [4, 512, 64]
+    _HBM_BASE = 0x400000000
+    _NUM_CORES = 8
+
+    def _make_symbolic_op_spec(self) -> OpSpec:
+        c_row, c_col = sympy.Symbol("c_row"), sympy.Symbol("c_col")
+        s0 = sympy.Symbol("s0", integer=True, positive=True)
+        coords = [c_col // 64, c_row, sympy.Mod(c_col, 64)]
+
+        def _tensor_arg(is_input, arg_index, hbm_base):
+            return TensorArg(
+                is_input=is_input,
+                arg_index=arg_index,
+                device_dtype=DataFormats.SEN169_FP16,
+                device_size=list(self._DEVICE_SIZE),
+                device_coordinates=coords,
+                allocation={"hbm": hbm_base},
+            )
+
+        return OpSpec(
+            op="add",
+            is_reduction=False,
+            iteration_space={
+                c_row: (s0, self._NUM_CORES),
+                c_col: (sympy.Integer(256), 1),
+            },
+            args=[
+                _tensor_arg(True, 0, self._HBM_BASE),
+                _tensor_arg(True, 1, self._HBM_BASE + 0x1000),
+                _tensor_arg(False, 2, self._HBM_BASE + 0x100000000),
+            ],
+            op_info={},
+            symbolic_dim_bounds={"s0": (512, 64)},
+        )
+
+    def test_per_core_symbolic_addresses_emitted(self):
+        op_spec = self._make_symbolic_op_spec()
+        sdsc_json, base_symbol_values, _, symbol_kinds = compile_op_spec(
+            idx=0, op_spec=op_spec, symbols=[], use_symbols=True
+        )
+
+        top = next(iter(sdsc_json.values()))
+        dsc = next(iter(top["dscs_"][0].values()))
+
+        # Dim symbol s0 -> mb is still bound the same way as the Phase 1.A
+        # smoke test; this PR layers per-core symbols on top.
+        self.assertEqual(dsc["dimToSymbolMapping_"], {"mb": [-1]})
+
+        # Every HBM tensor's allocate node carries the symbolic-address flag
+        # and a per-core data_ map whose values are symbol id strings.
+        hbm_allocate_nodes = [
+            node
+            for node in dsc["scheduleTree_"]
+            if node.get("nodeType_") == "allocate"
+            and node.get("component_") == "hbm"
+        ]
+        self.assertEqual(len(hbm_allocate_nodes), 3)
+
+        per_core_symbol_ids: list[int] = []
+        for node in hbm_allocate_nodes:
+            self.assertEqual(node["isStartAddrSymbolic_"], 1)
+            data = node["startAddressCoreCorelet_"]["data_"]
+            self.assertEqual(len(data), self._NUM_CORES)
+            for c in range(self._NUM_CORES):
+                key = f"[{c}, 0, 0]"
+                self.assertIn(key, data)
+                value = int(data[key])
+                # Symbol ids are negative; concrete addresses would be
+                # positive in the warmup case, so a positive value here
+                # would signal that the per-core symbolic path did not
+                # fire for cores 1..n-1.
+                if c > 0:
+                    self.assertLess(value, 0)
+                per_core_symbol_ids.append(value)
+
+        # The dim-symbol id (-1) must not collide with any per-core address id.
+        self.assertNotIn(-1, per_core_symbol_ids)
+
+        # inputSymbolsAndTags_ lists every symbol id used in this SDSC.
+        tags = top["inputSymbolsAndTags_"]
+        self.assertEqual(tags["-1"], "s0")
+        for sym_id in per_core_symbol_ids:
+            if sym_id < -1:
+                self.assertIn(str(sym_id), tags)
+                self.assertTrue(tags[str(sym_id)].endswith("_addr"))
+
+        # The kernel_derived_symbolic kind appears in symbol_kinds for every
+        # core after core 0 of every HBM tensor.
+        symbolic_kinds = [sk for sk in symbol_kinds if sk.is_derived_symbolic]
+        # 3 HBM tensors * (NUM_CORES - 1) symbolic per-core addresses each.
+        self.assertEqual(len(symbolic_kinds), 3 * (self._NUM_CORES - 1))
+        for sk in symbolic_kinds:
+            self.assertEqual(sk.split_count, self._NUM_CORES)
+            self.assertEqual(sk.pytorch_sym, "s0")
+            self.assertGreaterEqual(sk.core_idx, 1)
+
+        # base_symbol_values: dim-symbol slot is 0; address symbols follow.
+        # The symbolic per-core slots must also be 0 placeholders so the
+        # runtime patches them at dispatch.
+        self.assertEqual(base_symbol_values[0], 0)
+        for sk, val in zip(symbol_kinds, base_symbol_values):
+            if sk.is_derived_symbolic:
+                self.assertEqual(val, 0)
+
+    def test_dim_symbol_ids_strictly_less_than_address_ids(self):
+        # Guard against silent reordering: dim symbols must occupy the
+        # smallest (most negative) ids in the SDSC's local range.  If a
+        # future change inverts this, bundle.mlir operand positions shift
+        # silently.
+        op_spec = self._make_symbolic_op_spec()
+        _, _, _, symbol_kinds = compile_op_spec(
+            idx=0, op_spec=op_spec, symbols=[], use_symbols=True
+        )
+        first_address = next(
+            i for i, sk in enumerate(symbol_kinds) if not sk.is_dimension
+        )
+        # All dimension kinds appear before any address kind.
+        for sk in symbol_kinds[:first_address]:
+            self.assertTrue(sk.is_dimension)
+        for sk in symbol_kinds[first_address:]:
+            self.assertFalse(sk.is_dimension)

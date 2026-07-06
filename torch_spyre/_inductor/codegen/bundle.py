@@ -281,12 +281,29 @@ def generate_bundle(
                 f.write(f"\t\t%loop_bound_{lb_idx} = {_mlir_count_value(lb)}\n")
 
         # Emit one declaration per symbol (symbolic_args path):
-        #   - "kernel"          → skipped; already a function param + extract op above
-        #   - "kernel_derived"  → arith.addi %arg_{arg_index}, <per_core_offset>
-        #                         deduped by (arg_index, offset) pair
-        #   - "pool"            → arith.addi %pool, <pool_offset>
-        #                         deduped by pool offset value
-        #   - anything else     → arith.constant (non-symbolic path)
+        #   - "kernel"                   → skipped; already a function param +
+        #                                  extract op above
+        #   - "kernel_derived"           → arith.addi %arg_{arg_index},
+        #                                  <per_core_offset>; deduped by
+        #                                  (arg_index, offset) pair
+        #   - "kernel_derived_symbolic"  → falls through to the `else` branch;
+        #                                  emits `arith.constant 0 : index` as
+        #                                  a placeholder.  The runtime patches
+        #                                  the real per-core address at
+        #                                  dispatch via JIT Program Correction,
+        #                                  using the SDSC's
+        #                                  startAddressCoreCorelet_ +
+        #                                  dimToSymbolMapping_ + the runtime
+        #                                  dim value.  Replaced by an
+        #                                  arith.divsi / muli / addi chain
+        #                                  once dim symbols become MLIR SSA
+        #                                  values via #2500.  See #2289.
+        #   - "pool"                     → arith.addi %pool, <pool_offset>;
+        #                                  deduped by pool offset value
+        #   - "dimension"                → skipped; already a function param +
+        #                                  extract op above (resolved via
+        #                                  sym_canonical)
+        #   - anything else              → arith.constant (non-symbolic path)
         # All kernel sym indices to skip during emission (canonical + duplicates).
         kernel_arg_sym_set = set(kernel_arg_sym_indices) | set(kernel_dup_canonical)
         # Map kernel sym_idx → arg_index for SSA name generation.

@@ -16,6 +16,7 @@
 import dataclasses
 
 from torch_spyre._C import encode_constant, DataFormats
+from torch_spyre._inductor.errors import Unsupported
 from sympy import Symbol
 
 
@@ -23,7 +24,7 @@ from sympy import Symbol
 class SymbolKind:
     """Classifies a symbol registered in the bundle symbol table.
 
-    Three variants (constructed via class methods):
+    Variants (constructed via class methods):
       - ``kernel(arg_index)``:               base HBM address of a kernel tensor arg;
                                              emitted as a ``!sdscbundle.input_arg`` param
                                              named ``%arg_{arg_index}``.
@@ -31,6 +32,18 @@ class SymbolKind:
                                              emitted as ``arith.addi %arg_{arg_i}, off``.
                                              ``base_sym_idx`` is the 0-based index into the
                                              global ``symbols`` list of the kernel base symbol.
+      - ``kernel_derived_symbolic(...)``:    per-core derived address when the tensor's
+                                             split is on a symbolic dim. The actual byte
+                                             offset is ``core_idx * (S / split_count) *
+                                             inner_stride`` where ``S`` is the runtime size
+                                             of the symbolic dim. Emitted in SDSC with the
+                                             ``isStartAddrSymbolic_`` flag set; bundle.mlir
+                                             today emits a placeholder ``arith.constant 0
+                                             : index`` operand. The Spyre runtime patches
+                                             the real address at dispatch via JIT Program
+                                             Correction, using ``startAddressCoreCorelet_``
+                                             and ``dimToSymbolMapping_`` plus the runtime
+                                             dim value.
       - ``pool()``:                          pool-allocated tensor address;
                                              emitted as ``arith.addi %pool, value``.
       - ``dimension(gran, max, sym)``:       dynamic iteration-space dim size from
@@ -47,6 +60,8 @@ class SymbolKind:
     granularity: int = 0
     max_value: int = 0
     pytorch_sym: str = ""
+    core_idx: int = -1
+    split_count: int = 0
 
     @classmethod
     def kernel(cls, arg_index: int) -> "SymbolKind":
@@ -61,6 +76,24 @@ class SymbolKind:
             base_sym_idx=base_sym_idx,
             offset=offset,
             arg_index=arg_index,
+        )
+
+    @classmethod
+    def kernel_derived_symbolic(
+        cls,
+        arg_index: int,
+        core_idx: int,
+        split_count: int,
+        base_sym_idx: int,
+        pytorch_sym: str,
+    ) -> "SymbolKind":
+        return cls(
+            kind="kernel_derived_symbolic",
+            arg_index=arg_index,
+            core_idx=core_idx,
+            split_count=split_count,
+            base_sym_idx=base_sym_idx,
+            pytorch_sym=pytorch_sym,
         )
 
     @classmethod
@@ -81,6 +114,10 @@ class SymbolKind:
     @property
     def is_derived(self) -> bool:
         return self.kind == "kernel_derived"
+
+    @property
+    def is_derived_symbolic(self) -> bool:
+        return self.kind == "kernel_derived_symbolic"
 
     @property
     def is_pool(self) -> bool:
@@ -296,6 +333,49 @@ def _per_core_symbolic_dim_info(symbolic_dims: dict, work_slices: dict) -> dict:
     return info
 
 
+def _symbolic_split_info(
+    tensor,
+    work_slices: dict,
+    symbolic_dims: dict,
+) -> tuple[str, int, str] | None:
+    """Return ``(sdsc_dim_name, split_count, pytorch_sym)`` if ``tensor`` is
+    split across more than one core along a symbolic dim, else ``None``.
+
+    A tensor is considered to have a symbolic split iff all of the following:
+      - it is a kernel tensor arg (``arg_index >= 0``); pool tensors are
+        defensively skipped because they have no kernel base to reference.
+      - one of the dims in ``symbolic_dims`` has ``work_slices > 1``.
+      - the tensor actually uses that dim (``tensor.scales[dim] > 0`` so the
+        dim is neither reduced nor broadcast away for this tensor).
+
+    Only the first symbolic split dim is reported; the planner already
+    rejects plans with multiple symbolic splits per tensor upstream.
+    """
+    if tensor.arg_index < 0:
+        return None
+    for sdsc_dim, (pytorch_sym, _granularity, _max_val) in symbolic_dims.items():
+        dim_sym = Symbol(sdsc_dim)
+        split = work_slices.get(dim_sym)
+        if split is None or split <= 1:
+            continue
+        if dim_sym not in tensor.scales or tensor.scales[dim_sym] <= 0:
+            continue
+        return sdsc_dim, int(split), pytorch_sym
+    return None
+
+
+def _tensor_has_symbolic_split(
+    tensor,
+    work_slices: dict,
+    symbolic_dims: dict,
+) -> bool:
+    """True iff ``tensor`` has at least one symbolic dim that is split
+    across more than one core. Thin wrapper over ``_symbolic_split_info``
+    for sites that only need the boolean.
+    """
+    return _symbolic_split_info(tensor, work_slices, symbolic_dims) is not None
+
+
 def _tiled_byte_stride(tensor, tiled_sym, iteration_space) -> int:
     """Byte stride per loop iteration for a single tiled dimension.
 
@@ -396,13 +476,10 @@ def generate_sdsc(
     - ``sdsc_json``: the JSON dict to write to ``sdsc_N.json``
     - ``base_symbol_values``: list of HBM byte offsets registered in ``symbols``;
       empty when ``use_symbols=False``
-    - ``affine_strides``: list (parallel to ``sdsc_spec.args``) of per-level
-      stride lists.  Each element is a list of dicts, one per loop-nesting level
-      (outermost first), where each dict maps ``tiled_sym -> stride_bytes`` for
-      that level's tiled symbols.  Always ``[[]] * len(sdsc_spec.args)`` when
-      ``use_symbols=False``.  Used by ``bundle.py`` to emit ``affine.apply`` ops
-      inside ``scf.for`` loops, with one stride per level mapped to the correct
-      loop variable.
+    - ``affine_strides``: list (parallel to ``sdsc_spec.args``) of dicts
+      ``{tiled_sym: stride_bytes}`` for tiled HBM tensors; always empty when
+      ``use_symbols=False``.  Used by ``bundle.py`` to emit ``affine.apply``
+      ops inside ``scf.for`` loops.
     - ``symbol_kinds``: list of ``SymbolKind`` parallel to ``base_symbol_values``;
       empty when ``use_symbols=False``.  Classifies each symbol as a kernel base
       address, per-core derived address, or pool-allocated address.
@@ -415,7 +492,6 @@ def generate_sdsc(
     IDs in the JSON and their values appended to ``symbols``, enabling
     ``affine.apply`` address computation in ``bundle.mlir`` for tiled loops.
     """
-    # tiled_symbols is list[list[Symbol]], outermost-first per nesting level.
     if tiled_symbols is None:
         tiled_symbols = []
 
@@ -456,11 +532,24 @@ def generate_sdsc(
     # declarations in bundle.mlir.  This keeps symbol IDs contiguous with the
     # symbols list indices: symbols[abs(id)-1] is always the value for id.
     local_symbols: dict[int, int] = {}
-    # Parallel to local_symbols (insertion order): one SymbolKind per registered symbol.
+    # Parallel to local_symbols + symbolic per-core registrations (insertion order):
+    # one SymbolKind and one int placeholder per registered symbol.  Tracking the
+    # values separately keeps ordering correct across mixed kernel / kernel_derived
+    # / kernel_derived_symbolic registrations.
+    local_symbol_values: list[int] = []
     local_symbol_kind: list[SymbolKind] = []
+    # Per-core symbolic addresses (cores 1..n-1 for tensors whose split is on a
+    # symbolic dim).  Keyed by (tensor_idx, core_idx); values are negative symbol
+    # ids.  Not deduped because each per-core address gets its own symbol.
+    symbolic_per_core_id: dict[tuple[int, int], int] = {}
 
     def _per_core_kind(
-        c: int, arg_index: int, core0_addr: int, addr: int, base_sym_idx: int
+        c: int,
+        arg_index: int,
+        core0_addr: int,
+        addr: int,
+        base_sym_idx: int,
+        symbolic_split: tuple[str, int, str] | None = None,
     ) -> SymbolKind:
         """Return the SymbolKind for a per-core HBM address.
 
@@ -468,11 +557,24 @@ def generate_sdsc(
         cores are derived from it.  ``base_sym_idx`` is the 0-based index into the
         global ``symbols`` list where the core-0 symbol was (or will be) registered.
         Pool tensors (arg_index < 0) always use SymbolKind.pool().
+
+        When ``symbolic_split`` is not None, cores 1..n-1 are
+        ``kernel_derived_symbolic`` (the offset depends on the runtime size of the
+        symbolic dim and is patched at dispatch).
         """
         if arg_index < 0:
             return SymbolKind.pool()
         if c == 0:
             return SymbolKind.kernel(arg_index=arg_index)
+        if symbolic_split is not None:
+            _, split_count, pytorch_sym = symbolic_split
+            return SymbolKind.kernel_derived_symbolic(
+                arg_index=arg_index,
+                core_idx=c,
+                split_count=split_count,
+                base_sym_idx=base_sym_idx,
+                pytorch_sym=pytorch_sym,
+            )
         return SymbolKind.kernel_derived(
             base_sym_idx=base_sym_idx,
             offset=addr - core0_addr,
@@ -481,25 +583,42 @@ def generate_sdsc(
 
     if use_symbols:
 
+        def _next_sym_id() -> int:
+            # Address symbols start after dim symbols in the ID counter.
+            # `local_symbol_values` counts both dedup-by-address and symbolic
+            # per-core registrations in insertion order.
+            return -(symbol_id_offset + n_dim_syms + len(local_symbol_values) + 1)
+
         def offset_as_symbol(s, kind: SymbolKind):
             if s not in local_symbols:
-                # Address symbols start after dim symbols in the ID counter.
-                local_symbols[s] = -(
-                    symbol_id_offset + n_dim_syms + len(local_symbols) + 1
-                )
+                local_symbols[s] = _next_sym_id()
                 symbols.append(s)
+                local_symbol_values.append(s)
                 local_symbol_kind.append(kind)
             return local_symbols[s]
 
-        # Compute per-tensor, per-level affine strides and register base addresses.
-        # affine_strides[i] is a list of dicts, one per loop-nesting level
-        # (outermost first), where each dict maps tiled_sym -> stride_bytes for
-        # the symbols at that level that advance tensor i.  Empty list of dicts
-        # (i.e. [{}] * n_levels or []) for non-tiled / lx tensors.
-        affine_strides: list[list[dict]] = []
-        for tensor in sdsc_spec.args:
+        def register_symbolic_per_core(
+            tensor_idx: int, core_idx: int, kind: SymbolKind
+        ) -> int:
+            """Register a per-core symbolic address.  Not deduped: each
+            (tensor_idx, core_idx) pair gets its own symbol id.  The value
+            appended to ``symbols`` is a 0 placeholder; the runtime patches
+            the real address at dispatch via JIT Program Correction.
+            """
+            sym_id = _next_sym_id()
+            symbolic_per_core_id[(tensor_idx, core_idx)] = sym_id
+            symbols.append(0)
+            local_symbol_values.append(0)
+            local_symbol_kind.append(kind)
+            return sym_id
+
+        # Compute per-tensor affine strides and register base addresses in symbols.
+        # affine_strides[i] is {tiled_sym: stride_bytes} for tensor i (empty if
+        # non-tiled/lx).
+        affine_strides: list[dict] = []
+        for tensor_idx, tensor in enumerate(sdsc_spec.args):
             if "lx" in tensor.allocation:
-                affine_strides.append([{} for _ in tiled_symbols])
+                affine_strides.append({})
                 continue
             core0_addr = tensor.start_address + core_idx_to_slice_offset(
                 tensor, core_id_to_wk_slice["0"], sdsc_spec.work_slices
@@ -507,36 +626,75 @@ def generate_sdsc(
             # 0-based index in global symbols[] where this tensor's core-0 address will
             # be registered. Offset by n_dim_syms because dim symbols occupy the first
             # n_dim_syms slots in this SDSC's range of the shared counter.
-            base_sym_idx = symbol_id_offset + n_dim_syms + len(local_symbols)
-            # Build per-level strides: for each level, collect the symbols at that
-            # level that tile this tensor (i.e. appear in tensor.strides).
-            per_level_strides: list[dict] = []
-            any_tiled = False
-            for level_syms in tiled_symbols:
-                tensor_tiled_at_level = [s for s in level_syms if s in tensor.strides]
-                strides_for_level: dict = {}
-                for s in tensor_tiled_at_level:
-                    strides_for_level[s] = _tiled_byte_stride(
-                        tensor, s, sdsc_spec.iteration_space
+            base_sym_idx = symbol_id_offset + n_dim_syms + len(local_symbol_values)
+            tensor_tiled = [s for s in tiled_symbols if s in tensor.strides]
+            symbolic_split = _symbolic_split_info(
+                tensor, sdsc_spec.work_slices, symbolic_dims
+            )
+            if symbolic_split is not None and tensor_tiled:
+                sym_dim_name = symbolic_split[0]
+                if any(str(s) == sym_dim_name for s in tensor_tiled):
+                    raise Unsupported(
+                        f"Symbolic dim '{sym_dim_name}' is both split across cores"
+                        f" and inside a tiled loop on tensor at arg_index="
+                        f"{tensor.arg_index}; per-core symbolic addresses inside"
+                        " tiled loops are not yet supported."
                     )
-                    any_tiled = True
-                per_level_strides.append(strides_for_level)
-            if not any_tiled:
-                # Non-tiled HBM: register per-core addresses.
-                for c in range(sdsc_spec.num_cores):
-                    addr = tensor.start_address + core_idx_to_slice_offset(
-                        tensor, core_id_to_wk_slice[str(c)], sdsc_spec.work_slices
-                    ) * num_bytes(tensor.data_format)
-                    offset_as_symbol(
-                        addr,
-                        _per_core_kind(
-                            c, tensor.arg_index, core0_addr, addr, base_sym_idx
-                        ),
-                    )
-                affine_strides.append([{} for _ in tiled_symbols])
+            if not tensor_tiled:
+                # Core 0 is always the kernel base (or pool); registered via the
+                # dedup path so a future shared-base SDSC can reuse the id.
+                offset_as_symbol(
+                    core0_addr,
+                    _per_core_kind(
+                        0,
+                        tensor.arg_index,
+                        core0_addr,
+                        core0_addr,
+                        base_sym_idx,
+                        symbolic_split=symbolic_split,
+                    ),
+                )
+                if symbolic_split is not None:
+                    # Cores 1..n-1: per-core symbolic addresses.  Compile-time
+                    # `addr` is computed from the warmup (max) shape for the
+                    # base_sym_idx bookkeeping only; the bundle.mlir operand is
+                    # a placeholder and the SDSC carries the symbol id.
+                    for c in range(1, sdsc_spec.num_cores):
+                        register_symbolic_per_core(
+                            tensor_idx,
+                            c,
+                            _per_core_kind(
+                                c,
+                                tensor.arg_index,
+                                core0_addr,
+                                core0_addr,
+                                base_sym_idx,
+                                symbolic_split=symbolic_split,
+                            ),
+                        )
+                else:
+                    for c in range(1, sdsc_spec.num_cores):
+                        addr = tensor.start_address + core_idx_to_slice_offset(
+                            tensor,
+                            core_id_to_wk_slice[str(c)],
+                            sdsc_spec.work_slices,
+                        ) * num_bytes(tensor.data_format)
+                        offset_as_symbol(
+                            addr,
+                            _per_core_kind(
+                                c, tensor.arg_index, core0_addr, addr, base_sym_idx
+                            ),
+                        )
+                affine_strides.append({})
             else:
                 # Tiled HBM: symbol value = per-core iter-0 base address.
                 # The affine map adds loop_var * tile_stride on top at runtime.
+                # Symbolic-dim splits inside tiled loops are guarded above.
+                strides_for_tensor = {}
+                for s in tensor_tiled:
+                    strides_for_tensor[s] = _tiled_byte_stride(
+                        tensor, s, sdsc_spec.iteration_space
+                    )
                 for c in range(sdsc_spec.num_cores):
                     addr = tensor.start_address + core_idx_to_slice_offset(
                         tensor, core_id_to_wk_slice[str(c)], sdsc_spec.work_slices
@@ -547,9 +705,9 @@ def generate_sdsc(
                             c, tensor.arg_index, core0_addr, addr, base_sym_idx
                         ),
                     )
-                affine_strides.append(per_level_strides)
+                affine_strides.append(strides_for_tensor)
 
-        def _start_addr_data(tensor):
+        def _start_addr_data(tensor, tensor_idx):
             # All per-core addresses were already registered by the per-tensor loop
             # above. Look them up directly rather than re-computing SymbolKind.
             if "lx" in tensor.allocation:
@@ -559,6 +717,11 @@ def generate_sdsc(
                 }
             result = {}
             for c in range(sdsc_spec.num_cores):
+                if (tensor_idx, c) in symbolic_per_core_id:
+                    result[f"[{c}, 0, 0]"] = str(
+                        symbolic_per_core_id[(tensor_idx, c)]
+                    )
+                    continue
                 addr = tensor.start_address + core_idx_to_slice_offset(
                     tensor, core_id_to_wk_slice[str(c)], sdsc_spec.work_slices
                 ) * num_bytes(tensor.data_format)
@@ -568,9 +731,12 @@ def generate_sdsc(
     else:
         # use_symbols=False: bake concrete HBM addresses directly into the JSON.
         # symbols and local_symbols are not modified.
-        affine_strides = [[{} for _ in tiled_symbols] for _ in sdsc_spec.args]
+        affine_strides = [{} for _ in sdsc_spec.args]
 
-        def _start_addr_data(tensor):
+        def _start_addr_data(tensor, tensor_idx):
+            # tensor_idx is unused on this path; accepted so the signature
+            # matches the use_symbols=True closure above.
+            del tensor_idx
             if "lx" in tensor.allocation:
                 return {
                     f"[{c}, 0, 0]": str(tensor.start_address)
@@ -736,7 +902,7 @@ def generate_sdsc(
                                             {"factor_": 1, "label_": "corelet"},
                                             {"factor_": 1, "label_": "time"},
                                         ],
-                                        "data_": _start_addr_data(tensor),
+                                        "data_": _start_addr_data(tensor, i),
                                     },
                                     **(
                                         {
@@ -853,14 +1019,26 @@ def generate_sdsc(
                     }
                 ],
                 # Emit top-level symbolic metadata only when symbolic dims are present.
-                # inputSymbolsAndTags_ maps symbol ID -> pytorch symbol name for the runtime.
+                # inputSymbolsAndTags_ maps symbol ID -> tag for the runtime.  Dim
+                # symbols use the PyTorch sympy name; per-core address symbols use a
+                # descriptive tag identifying the tensor and core they bind.  Both
+                # draw from the same bundle-local negative-ID pool per the SDSC
+                # contract.
                 **(
                     {
                         "datadscs_": [],
                         "dimToSymbolMappingOpcodeCorrection_": {},
                         "inputSymbolsAndTags_": {
-                            str(sym_id): pytorch_sym
-                            for pytorch_sym, sym_id in dim_local_symbols.items()
+                            **{
+                                str(sym_id): pytorch_sym
+                                for pytorch_sym, sym_id in dim_local_symbols.items()
+                            },
+                            **{
+                                str(sym_id): f"Tensor{t_idx}_core{c_idx}_addr"
+                                for (t_idx, c_idx), sym_id in (
+                                    symbolic_per_core_id.items()
+                                )
+                            },
                         },
                         "symbolDefinitions_": {},
                     }
@@ -869,8 +1047,10 @@ def generate_sdsc(
                 ),
             }
         },
-        # Dim symbols occupy the first n_dim_syms slots (value 0); address symbols follow.
-        [0] * n_dim_syms + list(local_symbols.keys()),
+        # Dim symbols occupy the first n_dim_syms slots (value 0); address symbols
+        # follow in registration order (kernel, kernel_derived,
+        # kernel_derived_symbolic, pool), all tracked in local_symbol_values.
+        [0] * n_dim_syms + local_symbol_values,
         affine_strides,
         dim_symbol_kinds + local_symbol_kind,
     )
