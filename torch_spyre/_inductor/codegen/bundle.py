@@ -81,9 +81,20 @@ def generate_bundle(
         unroll_loops = _spyre_config.unroll_loops
     if symbolic_args is None:
         symbolic_args = _spyre_config.bundle_symbolic_args
-    use_symbols = symbolic_args
 
     specs_list: list = unroll_loop_specs(list(specs)) if unroll_loops else list(specs)
+
+    # Auto-enable symbolic_args when any op carries symbolic dim bounds. The
+    # concrete-address path bakes per-core offsets at warmup, so runtime dim
+    # values other than the warmup value land on wrong memory. DeepTools'
+    # symbolic-kernel contract requires per-tensor base-address symbols and
+    # isStartAddrSymbolic_=1; those emerge only on the symbolic_args path.
+    if not symbolic_args and any(
+        getattr(s, "symbolic_dim_bounds", None) for s in specs_list
+    ):
+        symbolic_args = True
+
+    use_symbols = symbolic_args
 
     # -----------------------------------------------------------------------
     # Pass 1: compile all OpSpecs depth-first.

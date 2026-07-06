@@ -482,7 +482,15 @@ def _create_sdsc_tensors(
                     logger,
                 )
             else:
-                max_dim_sizes[dim] = -1
+                # -1 is the DeepTools sentinel for "unbounded / runtime symbolic".
+                # The symbolic dim (mb_sym) is prepended after this loop with -1
+                # at line 499, so every dim reached here is concrete. Emit the
+                # concrete iteration-space size so DeepTools does not treat
+                # static axes as symbolic.
+                try:
+                    max_dim_sizes[dim] = int(iteration_space[dim])
+                except (TypeError, ValueError):
+                    max_dim_sizes[dim] = -1
 
             dim_coord = arg.device_coordinates[-stride_idx - 2]
             if not isinstance(dim_coord, IndirectAccess) and dev_dim_size > it_dim_size:
