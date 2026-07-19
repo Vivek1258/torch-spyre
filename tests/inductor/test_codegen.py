@@ -468,9 +468,7 @@ class TestSymbolKindKernelDerivedSymbolic(InductorTestCase):
     def test_kernel_derived_is_distinguishable(self):
         # kernel_derived and kernel_derived_symbolic share base_sym_idx
         # semantics but must be distinguishable by the codegen.
-        concrete = SymbolKind.kernel_derived(
-            base_sym_idx=0, offset=128, arg_index=0
-        )
+        concrete = SymbolKind.kernel_derived(base_sym_idx=0, offset=128, arg_index=0)
         self.assertFalse(concrete.is_derived_symbolic)
         self.assertTrue(concrete.is_derived)
 
@@ -625,8 +623,7 @@ class TestGenerateSdscSymbolicPerCoreAddresses(InductorTestCase):
         hbm_allocate_nodes = [
             node
             for node in dsc["scheduleTree_"]
-            if node.get("nodeType_") == "allocate"
-            and node.get("component_") == "hbm"
+            if node.get("nodeType_") == "allocate" and node.get("component_") == "hbm"
         ]
         self.assertEqual(len(hbm_allocate_nodes), 3)
 
