@@ -44,17 +44,21 @@ class SymbolKind:
       - ``kernel_derived_symbolic(...)``:    per-core derived address when the
                                              tensor is split across cores on a
                                              *symbolic* dim.  The real byte offset
-                                             is ``core_idx * (S / split_count) *
-                                             inner_stride`` where ``S`` is the
+                                             is ``core_idx *
+                                             ceildiv(S, split_count) *
+                                             per_element_stride`` where ``S`` is the
                                              runtime size of the symbolic dim, so it
-                                             cannot be baked at compile time.  The
-                                             per-core split byte stride
-                                             (``inner_stride``) is carried in the
-                                             ``offset`` field for the future bundle
-                                             arm that emits the arith formula (that
-                                             arm depends on the dim ``input_arg`` SSA
-                                             and is out of scope here).  ``is_derived``
-                                             stays False so the existing bundle
+                                             cannot be baked at compile time.  This
+                                             variant only TAGS the per-core address
+                                             as symbolic, carrying ``core_idx``,
+                                             ``split_count`` and the ``pytorch_sym``
+                                             it depends on.  Emitting the actual
+                                             arith formula, and computing the
+                                             per-element stride it needs, is the
+                                             bundle-arm follow-up (which depends on
+                                             the dim ``input_arg`` SSA and is out of
+                                             scope here).  ``is_derived`` stays False
+                                             so the existing bundle
                                              ``kernel_derived`` addi branch does not
                                              match this variant.  At the SDSC-JSON
                                              layer this is identical to
@@ -108,13 +112,13 @@ class SymbolKind:
         split_count: int,
         base_sym_idx: int,
         pytorch_sym: str,
-        inner_stride: int,
     ) -> "SymbolKind":
         """Per-core derived address for a symbolic-dim core split.
 
-        ``inner_stride`` is the split dim's per-element byte stride on this
-        tensor; it is stored in ``offset`` for the future bundle arm that
-        emits ``core_idx * (S / split_count) * inner_stride``.
+        Tags the per-core address as symbolic. The runtime formula
+        ``core_idx * ceildiv(S, split_count) * per_element_stride`` and the
+        per-element stride it needs are emitted by the bundle-arm follow-up,
+        not here, so no stride is stored on this marker.
         """
         return cls(
             kind="kernel_derived_symbolic",
@@ -123,7 +127,6 @@ class SymbolKind:
             split_count=split_count,
             base_sym_idx=base_sym_idx,
             pytorch_sym=pytorch_sym,
-            offset=inner_stride,
         )
 
     @classmethod
@@ -648,12 +651,11 @@ def generate_sdsc(
             value for the symbolic path.
             """
             if symbolic_split is not None:
-                sdsc_dim_name, split_count, pytorch_sym = symbolic_split
-                dim_sym = Symbol(sdsc_dim_name)
-                inner_stride = int(
-                    tensor.strides.get(dim_sym, 0)
-                    * num_bytes(tensor.data_format)
-                )
+                _sdsc_dim_name, split_count, pytorch_sym = symbolic_split
+                # TODO:  only TAG the per-core address as symbolic. The
+                # runtime arith (core * ceildiv(S, split) * per_element_stride)
+                # and the per-element stride it needs are the bundle-arm
+                # follow-up, so nothing stride-related is computed here.
                 offset_as_symbol(
                     addr,
                     SymbolKind.kernel_derived_symbolic(
@@ -662,7 +664,6 @@ def generate_sdsc(
                         split_count=split_count,
                         base_sym_idx=sliced_base_sym_idx,
                         pytorch_sym=pytorch_sym,
-                        inner_stride=inner_stride,
                     ),
                 )
             else:
