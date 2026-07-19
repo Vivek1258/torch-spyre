@@ -168,7 +168,6 @@ class TestGenerateBundleDimensionSymbols(InductorTestCase):
                 self.output_dir,
                 op_specs,
                 use_symbols=False,
-                unroll_loops=False,
             )
         return self._read_bundle()
 
