@@ -153,7 +153,7 @@ class TestGenerateBundleDimensionSymbols(InductorTestCase):
         with open(os.path.join(self.output_dir, "bundle.mlir")) as f:
             return f.read()
 
-    def _run_bundle(self, compiled_entries, op_specs=None):
+    def _run_bundle(self, compiled_entries, op_specs=None, use_symbols=False):
         """Run generate_bundle with mocked compile_op_spec, return bundle.mlir text."""
         if op_specs is None:
             op_specs = [_minimal_op_spec() for _ in compiled_entries]
@@ -167,7 +167,7 @@ class TestGenerateBundleDimensionSymbols(InductorTestCase):
                 "test",
                 self.output_dir,
                 op_specs,
-                use_symbols=False,
+                use_symbols=use_symbols,
             )
         return self._read_bundle()
 
@@ -260,3 +260,47 @@ class TestGenerateBundleDimensionSymbols(InductorTestCase):
         self.assertIn("%sym_0_1 = sdscbundle.input_arg_extract", bundle)
         self.assertIn("%sym_0_2 = sdscbundle.input_arg_extract", bundle)
         self.assertIn("sdscbundle.sdsc_execute (%sym_0_1, %sym_0_2)", bundle)
+
+    def test_dimension_and_kernel_address_combination(self):
+        """A dimension symbol and a kernel-address symbol coexist in one bundle.
+
+        Both kinds must appear side by side, in the correct param/operand order,
+        when use_symbols=True and a dimension symbol is also present.
+        """
+        dim_kind = SymbolKind.dimension(granularity=56, max_value=616, pytorch_sym="s0")
+        kernel_kind = SymbolKind.kernel(arg_index=0)
+        entry = (
+            _make_sdsc_json(
+                dim_sym_ids={"mb": [-1]},
+                hbm_sym_ids_per_core={"[0, 0, 0]": -2},
+            ),
+            [0, 0],
+            [],
+            [dim_kind, kernel_kind],
+        )
+
+        bundle = self._run_bundle([entry], use_symbols=True)
+
+        # Kernel-address param comes before the dimension param in the signature.
+        self.assertIn(
+            "func.func @sdsc_bundle("
+            "%arg_0_base_addr: !sdscbundle.input_arg<index>, "
+            "%sym_0_1_base: !sdscbundle.input_arg<index, granularity=56,"
+            " max_value=616>)",
+            bundle,
+        )
+        self.assertIn(
+            "%arg_0 = sdscbundle.input_arg_extract value from"
+            " %arg_0_base_addr : !sdscbundle.input_arg<index> -> index",
+            bundle,
+        )
+        self.assertIn(
+            "%sym_0_1 = sdscbundle.input_arg_extract value from"
+            " %sym_0_1_base : !sdscbundle.input_arg<index, granularity=56,"
+            " max_value=616> -> index",
+            bundle,
+        )
+        # Dimension IDs precede HBM/kernel-address IDs (both in the operand
+        # list and in the symbol_ids attribute).
+        self.assertIn("sdscbundle.sdsc_execute (%sym_0_1, %arg_0)", bundle)
+        self.assertIn('"symbol_ids"=[-1, -2]', bundle)
