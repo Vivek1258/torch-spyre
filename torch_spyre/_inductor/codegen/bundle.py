@@ -223,8 +223,7 @@ def generate_bundle(
             for sym_idx in dimension_sym_indices:
                 dim_sk = symbol_kinds[sym_idx]
                 params.append(
-                    f"{dim_param_names[sym_idx]}_base: !sdscbundle.input_arg<index, "
-                    f"granularity={dim_sk.granularity}, max_value={dim_sk.max_value}>"
+                    f"{dim_param_names[sym_idx]}_base: {_dim_input_arg_type(dim_sk)}"
                 )
             f.write(f"\tfunc.func @sdsc_bundle({', '.join(params)}) {{\n")
             if has_pool:
@@ -243,9 +242,7 @@ def generate_bundle(
                 name = dim_param_names[sym_idx]
                 f.write(
                     f"\t\t{name} = sdscbundle.input_arg_extract value from"
-                    f" {name}_base : !sdscbundle.input_arg<index, "
-                    f"granularity={dim_sk.granularity}, max_value={dim_sk.max_value}>"
-                    " -> index\n"
+                    f" {name}_base : {_dim_input_arg_type(dim_sk)} -> index\n"
                 )
         else:
             f.write("\tfunc.func @sdsc_bundle() {\n")
@@ -536,6 +533,18 @@ def _mlir_count_value(count: sympy.Expr) -> str:
         return f"arith.constant {int(count)} : index"
     raise NotImplementedError(
         f"Symbolic loop counts are not yet supported in bundle.mlir generation: {count}"
+    )
+
+
+def _dim_input_arg_type(dim_sk: SymbolKind) -> str:
+    """MLIR input_arg type string for a dimension symbol.
+
+    Shared by the function-parameter declaration and the corresponding
+    input_arg_extract op so the two can't drift out of sync.
+    """
+    return (
+        f"!sdscbundle.input_arg<index, granularity={dim_sk.granularity}, "
+        f"max_value={dim_sk.max_value}>"
     )
 
 
