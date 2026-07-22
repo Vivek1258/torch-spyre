@@ -140,6 +140,11 @@ def generate_bundle(
                     sdsc_idx,
                     local_dim_ordinal,
                 )
+            elif not use_symbols:
+                raise AssertionError(
+                    "use_symbols=False but compute_op_spec registered a "
+                    f"non-dimension SymbolKind ({lk.kind!r}); address-symbol."
+                )
             symbol_kinds.append(lk)
 
     # Determine whether a pool parameter is needed (any pool symbol present).
