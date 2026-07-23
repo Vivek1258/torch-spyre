@@ -70,6 +70,12 @@ class SDSCArgs:
     is_index_tensor: bool = False
     related_value_tensor_idx: int = -1
     per_tile_fixed: bool = False
+    # Per-dim un-folded per-element device byte-stride (product of the INNER,
+    # static dims only, excluding the dim's own size).  This is max-safe: it is
+    # identical at warmup and at the symbolic max, so it is the correct
+    # multiplier for a per-core symbolic start-address formula.  Empty when not
+    # needed.  See compute_ops.generate_sdsc symbolDefinitions_ emission.
+    per_element_strides: dict[Symbol, int] = dataclasses.field(default_factory=dict)
 
     def __str__(self) -> str:
         scales = ", ".join(f"{k}={v}" for k, v in self.scales.items())
@@ -487,6 +493,7 @@ def _create_sdsc_tensors(
         offsets: dict = {}
         backGap: dict[Symbol, int] = {}
         max_dim_sizes: dict = {}
+        per_element_strides: dict = {}
         reduced_dims: list = []
 
         # Step 2: Handle reduced dimensions — skip for index tensors.
@@ -526,6 +533,11 @@ def _create_sdsc_tensors(
             strides[dim] = _calculate_device_stride(stride_idx, arg.device_size)
             offsets[dim] = 0
             dim_device_stride = math.prod(arg.device_size[-stride_idx - 1 :])
+            # Un-folded per-element stride for this dim: product of the inner
+            # (static) dims only, so it excludes this dim's own size and is
+            # therefore identical at warmup and at the symbolic max.  Consumed by
+            # the per-core symbolic start-address formula in compute_ops.
+            per_element_strides[dim] = dim_device_stride
 
             dev_dim_size = arg.device_size[-stride_idx - 2]
             it_dim_size = iteration_space[dim]
@@ -563,6 +575,9 @@ def _create_sdsc_tensors(
             strides[mb_sym] = _calculate_device_stride(0, arg.device_size)
             offsets[mb_sym] = 0
             max_dim_sizes[mb_sym] = -1
+            # Stride index 0 for the merged-batch dim, so the un-folded per-element
+            # stride is the product of the inner dims (device_size[-1:]).
+            per_element_strides[mb_sym] = math.prod(arg.device_size[-1:])
 
         effective_stick = op_stick_dim if stick_dim is None else stick_dim
         layout_labels = MATMUL_LAYOUT_LABELS if not use_op_dims else LAYOUT_LABELS
@@ -625,6 +640,7 @@ def _create_sdsc_tensors(
                 is_index_tensor=is_idx_tensor,
                 related_value_tensor_idx=related_val_idx,
                 per_tile_fixed=arg.per_tile_fixed,
+                per_element_strides=per_element_strides,
             )
         )
 
