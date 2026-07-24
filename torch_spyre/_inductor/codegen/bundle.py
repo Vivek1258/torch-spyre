@@ -370,12 +370,6 @@ def generate_bundle(
                 sym_canonical[sym_idx] = pool_addi_emitted[value]
             elif sk is not None and sk.is_dimension:
                 continue  # replaced by function parameter; resolved via sym_canonical
-            elif sk is not None and (sk.is_derived_symbolic or sk.is_derived_ceildiv):
-                # Per-core symbolic address and its ceildiv intermediate are
-                # DEFINED in the SDSC symbolDefinitions_ tree and resolved at
-                # dispatch, so they get no arith.constant here and (below) are
-                # never threaded as sdsc_execute operands.
-                continue
             else:
                 f.write(f"\t\t%sym_{sym_idx + 1} = arith.constant {value} : index\n")
 
@@ -399,7 +393,6 @@ def generate_bundle(
             use_symbols=use_symbols,
             kernel_sym_to_arg_idx=kernel_sym_to_arg_idx,
             sym_canonical=sym_canonical,
-            symbol_kinds=symbol_kinds,
         )
 
         f.write("\t\treturn\n")
@@ -574,15 +567,12 @@ def _emit_specs(
     use_symbols: bool = False,
     kernel_sym_to_arg_idx: dict | None = None,
     sym_canonical: dict | None = None,
-    symbol_kinds: list | None = None,
 ) -> None:
     """Recursively emit MLIR ops for specs into file f."""
     if kernel_sym_to_arg_idx is None:
         kernel_sym_to_arg_idx = {}
     if sym_canonical is None:
         sym_canonical = {}
-    if symbol_kinds is None:
-        symbol_kinds = []
 
     # Map from 0-based symbol index to the short SSA name for kernel-arg symbols.
     # sym_idx → %arg_{arg_index}  (the result of input_arg_extract in the function body)
@@ -623,7 +613,6 @@ def _emit_specs(
                 use_symbols=use_symbols,
                 kernel_sym_to_arg_idx=kernel_sym_to_arg_idx,
                 sym_canonical=sym_canonical,
-                symbol_kinds=symbol_kinds,
             )
             f.write(f"{tab}}}\n")
 
@@ -639,17 +628,8 @@ def _emit_specs(
             sdsc_filename = f"sdsc_{sdsc_idx}.json"
 
             # Extract symbol_ids from the negative IDs stored in the JSON
-            # (unique, in registration order).  Drop ids that the SDSC defines
-            # itself (per-core symbolic addresses): they resolve at dispatch from
-            # symbolDefinitions_ and must not be threaded as operands.  S (the
-            # dim) and the base addresses stay, since those ARE runtime inputs.
-            # Filtering symbol_ids keeps the operand list and the "symbol_ids"
-            # attribute co-ordered, since both are built from it below.
-            symbol_ids = [
-                sid
-                for sid in _extract_symbol_ids(sdsc_json)
-                if not _is_sdsc_defined_symbol(sid, symbol_kinds)
-            ]
+            # (unique, in registration order).
+            symbol_ids = _extract_symbol_ids(sdsc_json)
 
             # Build affine.apply ops for tiled tensors, tracking which
             # symbol IDs have been upgraded to per-iteration %addr_N names.
@@ -670,16 +650,6 @@ def _emit_specs(
                     base_sym_id = _get_tensor_core_sym_id(sdsc_json, tensor_idx, c)
                     if base_sym_id is None or base_sym_id in sym_id_to_operand:
                         continue
-                    if _is_sdsc_defined_symbol(base_sym_id, symbol_kinds):
-                        # A per-core symbolic address has no bundle SSA value to
-                        # feed affine.apply (it is resolved inside the SDSC), so a
-                        # tensor that is BOTH symbolic-split across cores AND tiled
-                        # cannot express its per-iteration address here.
-                        raise NotImplementedError(
-                            "Tensor is both symbolic-split across cores and "
-                            "tiled; per-core symbolic addresses inside affine.apply "
-                            "loops are not supported."
-                        )
                     stride_key = tuple(flat_strides)
                     map_idx = affine_map_index[stride_key]
                     addr_name = f"%addr_{addr_counter[0]}"
@@ -710,23 +680,6 @@ def _emit_specs(
                 f'{{sdsc_filename="{sdsc_filename}", '
                 f'"symbol_ids"=[{symbol_ids_str}]}}\n'
             )
-
-
-def _is_sdsc_defined_symbol(sid: int, symbol_kinds: list) -> bool:
-    """True if ``sid`` is DEFINED inside the SDSC ``symbolDefinitions_`` tree.
-
-    Per-core symbolic start-address ids (``kernel_derived_symbolic``) and their
-    shared ``ceildiv`` intermediate (``derived_ceildiv``) are resolved at
-    dispatch from the SDSC formula, not supplied as runtime inputs, so they must
-    never become ``sdsc_execute`` operands.  ``sid`` is a negative id;
-    ``abs(sid)-1`` indexes the flat ``symbol_kinds`` list, same as
-    ``_resolve_sym``.
-    """
-    sym_idx = abs(sid) - 1
-    if 0 <= sym_idx < len(symbol_kinds):
-        sk = symbol_kinds[sym_idx]
-        return sk.is_derived_symbolic or sk.is_derived_ceildiv
-    return False
 
 
 def _extract_symbol_ids(sdsc_json: dict) -> list[int]:

@@ -25,7 +25,6 @@ from torch._inductor.test_case import TestCase as InductorTestCase
 
 from torch_spyre._inductor.codegen.bundle import (
     _extract_symbol_ids,
-    _is_sdsc_defined_symbol,
     generate_bundle,
 )
 from torch_spyre._inductor.codegen.compute_ops import SymbolKind
@@ -305,86 +304,3 @@ class TestGenerateBundleDimensionSymbols(InductorTestCase):
         # list and in the symbol_ids attribute).
         self.assertIn("sdscbundle.sdsc_execute (%sym_0_1, %arg_0)", bundle)
         self.assertIn('"symbol_ids"=[-1, -2]', bundle)
-
-
-class TestIsSdscDefinedSymbol(InductorTestCase):
-    """Unit tests for _is_sdsc_defined_symbol (operand-exclusion predicate)."""
-
-    def test_derived_symbolic_is_defined(self):
-        kinds = [
-            SymbolKind.dimension(granularity=64, max_value=512, pytorch_sym="s0"),
-            SymbolKind.kernel(arg_index=0),
-            SymbolKind.kernel_derived_symbolic(
-                arg_index=0, core_idx=1, split_count=8, base_sym_idx=1, pytorch_sym="s0"
-            ),
-        ]
-        # id -3 -> index 2 -> the kernel_derived_symbolic kind.
-        self.assertTrue(_is_sdsc_defined_symbol(-3, kinds))
-
-    def test_derived_ceildiv_is_defined(self):
-        kinds = [SymbolKind.derived_ceildiv(pytorch_sym="s0", split_count=8)]
-        self.assertTrue(_is_sdsc_defined_symbol(-1, kinds))
-
-    def test_runtime_inputs_are_not_defined(self):
-        kinds = [
-            SymbolKind.dimension(granularity=64, max_value=512, pytorch_sym="s0"),
-            SymbolKind.kernel(arg_index=0),
-        ]
-        self.assertFalse(_is_sdsc_defined_symbol(-1, kinds))  # dim S
-        self.assertFalse(_is_sdsc_defined_symbol(-2, kinds))  # base address
-
-    def test_out_of_range_is_not_defined(self):
-        self.assertFalse(_is_sdsc_defined_symbol(-5, []))
-
-
-class TestBundleExcludesSdscDefinedIds(InductorTestCase):
-    """Per-core symbolic ids are SDSC-defined, so bundle.mlir must not thread
-    them as sdsc_execute operands; only S and the base address stay.
-    """
-
-    def setUp(self):
-        super().setUp()
-        self._tmpdir = tempfile.TemporaryDirectory()
-        self.output_dir = self._tmpdir.name
-
-    def tearDown(self):
-        self._tmpdir.cleanup()
-        super().tearDown()
-
-    def _run_bundle(self, compiled_entries, use_symbols=True):
-        op_specs = [_minimal_op_spec() for _ in compiled_entries]
-        with patch(
-            "torch_spyre._inductor.codegen.bundle.compile_op_spec",
-            side_effect=list(compiled_entries),
-        ):
-            generate_bundle(
-                "test", self.output_dir, op_specs, use_symbols=use_symbols
-            )
-        with open(os.path.join(self.output_dir, "bundle.mlir")) as f:
-            return f.read()
-
-    def _entry(self):
-        # dim s0 (-1), kernel arg0 base (-2), per-core symbolic addr c=1 (-3).
-        sdsc_json = _make_sdsc_json(
-            dim_sym_ids={"mb": [-1]},
-            hbm_sym_ids_per_core={"[0, 0, 0]": -2, "[1, 0, 0]": -3},
-            num_cores=2,
-        )
-        symbol_kinds = [
-            SymbolKind.dimension(granularity=64, max_value=512, pytorch_sym="s0"),
-            SymbolKind.kernel(arg_index=0),
-            SymbolKind.kernel_derived_symbolic(
-                arg_index=0, core_idx=1, split_count=8, base_sym_idx=1, pytorch_sym="s0"
-            ),
-        ]
-        # entry[1] (local_sym_values) only advances the offset counter here.
-        return (sdsc_json, [0, 0, 0], [], symbol_kinds)
-
-    def test_symbolic_id_excluded_from_operands(self):
-        bundle = self._run_bundle([self._entry()])
-        # S (%sym_0_1) and the base (%arg_0) are operands; the per-core symbolic
-        # id -3 is not, so its resolved name %sym_3 must not appear at all.
-        self.assertIn("sdscbundle.sdsc_execute (%sym_0_1, %arg_0)", bundle)
-        self.assertIn('"symbol_ids"=[-1, -2]', bundle)
-        self.assertNotIn("-3", bundle)
-        self.assertNotIn("%sym_3", bundle)

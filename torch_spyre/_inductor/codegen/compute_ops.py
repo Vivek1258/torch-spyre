@@ -130,22 +130,6 @@ class SymbolKind:
         )
 
     @classmethod
-    def derived_ceildiv(cls, pytorch_sym: str, split_count: int) -> "SymbolKind":
-        """Intermediate ``ceildiv(S, split_count)`` symbol.
-
-        Shared sub-expression of the per-core symbolic start-address formula.
-        It is DEFINED in the SDSC ``symbolDefinitions_`` tree, not a runtime
-        input, so ``bundle.py`` must skip it (no ``arith.constant``, never an
-        ``sdsc_execute`` operand).  Registered like any other symbol so its
-        negative id is globally unique and advances the cross-SDSC counter.
-        """
-        return cls(
-            kind="derived_ceildiv",
-            pytorch_sym=pytorch_sym,
-            split_count=split_count,
-        )
-
-    @classmethod
     def pool(cls) -> "SymbolKind":
         return cls(kind="pool")
 
@@ -167,10 +151,6 @@ class SymbolKind:
     @property
     def is_derived_symbolic(self) -> bool:
         return self.kind == "kernel_derived_symbolic"
-
-    @property
-    def is_derived_ceildiv(self) -> bool:
-        return self.kind == "derived_ceildiv"
 
     @property
     def is_pool(self) -> bool:
@@ -401,41 +381,6 @@ def _symbolic_split_info(
     return None
 
 
-def _kernel_base_offset_and_key(tensor) -> tuple[int, tuple]:
-    """Return ``(total_slice_offset, base_key)`` for a kernel tensor's core-0 base.
-
-    ``total_slice_offset`` is the compile-time byte offset above the raw
-    ``%arg_N`` base (per-tile advance + device-coordinate slice offset).
-    ``base_key`` is the ``local_symbols`` key that core 0 resolves to: a
-    ``kernel_slice`` entry when the offset is non-zero, otherwise the plain
-    ``kernel`` entry.
-
-    Single source of truth so the per-core registration, the
-    ``startAddressCoreCorelet_`` data, and the ``symbolDefinitions_`` formula all
-    reference the identical core-0 base symbol and can never drift.
-    """
-    nb = num_bytes(tensor.data_format)
-    slice_offset_bytes = sum(tensor.offsets.values()) * nb
-    tile_offset_bytes = tensor.start_address - tensor.arg_index
-    total_slice_offset = tile_offset_bytes + slice_offset_bytes
-    if total_slice_offset > 0:
-        return total_slice_offset, (
-            "kernel_slice",
-            tensor.arg_index,
-            total_slice_offset,
-        )
-    return total_slice_offset, ("kernel", tensor.arg_index)
-
-
-def _sym_ref(sym_id: int) -> str:
-    """Wire encoding of a symbol operand in a ``symbolDefinitions_`` node.
-
-    A leading ``V`` is the only flag DeepTools uses to tell a symbol reference
-    (e.g. ``"V-12"``) apart from a bare integer constant (e.g. ``"64"``).
-    """
-    return f"V{sym_id}"
-
-
 def _tensor_has_symbolic_split(
     tensor,
     work_slices: dict,
@@ -641,10 +586,6 @@ def generate_sdsc(
     local_symbols: dict[tuple | int, int] = {}
     # Parallel to local_symbols (insertion order): one SymbolKind per registered symbol.
     local_symbol_kind: list[SymbolKind] = []
-    # DeepTools VariableDefinition tree for the per-core symbolic start-address
-    # ids.  Flat map "V<id>" -> ["<OP>", "<operand>", ...].  Stays empty unless a
-    # symbolic dim is split across cores on the use_symbols path.
-    symbol_definitions: dict[str, list[str]] = {}
 
     def _derived_kind(
         arg_index: int,
@@ -679,12 +620,6 @@ def generate_sdsc(
                 # (arg_index, core_idx) is a distinct registration and never
                 # collides with a concrete kernel_derived key (a bare int addr).
                 key = ("kernel_derived_symbolic", kind.arg_index, kind.core_idx)
-            elif kind.is_derived_ceildiv:
-                # Shared ceildiv(S, split) intermediate: key by (pytorch_sym,
-                # split_count) so tensors/cores that split the same dim the same
-                # way reuse one definition.  s is a 0 placeholder (defined in the
-                # SDSC, never an arith.constant value).
-                key = ("derived_ceildiv", kind.pytorch_sym, kind.split_count)
             else:
                 # kernel_derived: s is a large per-core HBM byte address,
                 # distinct from pool offsets and sentinel values.
@@ -767,6 +702,7 @@ def generate_sdsc(
                 affine_strides.append([{} for _ in tiled_symbols])
                 continue
             nb = num_bytes(tensor.data_format)
+            slice_offset_bytes = sum(tensor.offsets.values()) * nb
             # core0_addr: compile-time address for core 0 including the tensor's
             # slice offset (device_coordinate constant terms, e.g. z0+3 → 3 rows).
             core0_addr = (
@@ -818,12 +754,15 @@ def generate_sdsc(
                 # registered already by an earlier tensor in this SDSC, in which case
                 # the offset_as_symbol call above was a no-op.
                 kernel_sym_idx = abs(local_symbols[("kernel", tensor.arg_index)]) - 1
-                # total_slice_offset: the per-tile byte advance plus any
-                # device-coordinate compile-time slice offset (e.g. from z0+3);
-                # base_key is the local_symbols key core 0 resolves to.  Both come
-                # from the shared helper so the registration here and the
-                # startAddressCoreCorelet_ / symbolDefinitions_ lookups agree.
-                total_slice_offset, slice_key = _kernel_base_offset_and_key(tensor)
+                # tile_offset_bytes: arg.allocation['hbm'] advances by i*stride for
+                # tile i, so start_address = arg_index + tile_offset. tile_offset_bytes
+                # == 0 for tile 0, positive for later tiles.
+                tile_offset_bytes = tensor.start_address - tensor.arg_index
+                # total_slice_offset: combine the per-tile byte offset with any
+                # device-coordinate compile-time slice offset (e.g. from z0+3 expressions).
+                # This is the total compile-time offset above the raw %arg_N base that the
+                # sliced-base SSA value represents in bundle.mlir.
+                total_slice_offset = tile_offset_bytes + slice_offset_bytes
                 # sliced_base_sym_idx: the symbols[] index that per-core derived symbols
                 # reference.  When total_slice_offset == 0 the kernel sym IS the sliced
                 # base; otherwise a kernel_slice sym is registered for the combined offset.
@@ -834,6 +773,7 @@ def generate_sdsc(
                             arg_index=tensor.arg_index, offset=total_slice_offset
                         ),
                     )
+                    slice_key = ("kernel_slice", tensor.arg_index, total_slice_offset)
                     sliced_base_sym_idx = abs(local_symbols[slice_key]) - 1
                 else:
                     sliced_base_sym_idx = kernel_sym_idx
@@ -948,7 +888,14 @@ def generate_sdsc(
             # Hoist kernel-tensor compile-time offsets so they are not
             # duplicated across the c==0 and c>0 branches.
             if not is_pool_tensor:
-                _, c0_slice_key = _kernel_base_offset_and_key(tensor)
+                slice_offset_bytes = sum(tensor.offsets.values()) * nb
+                tile_offset_bytes = tensor.start_address - tensor.arg_index
+                total_slice_offset = tile_offset_bytes + slice_offset_bytes
+                c0_slice_key: tuple | int = (
+                    ("kernel_slice", tensor.arg_index, total_slice_offset)
+                    if total_slice_offset > 0
+                    else ("kernel", tensor.arg_index)
+                )
                 core0_addr_lookup = (
                     tensor.start_address
                     + core_idx_to_slice_offset(
@@ -982,72 +929,6 @@ def generate_sdsc(
                     key = addr
                 result[f"[{c}, 0, 0]"] = str(local_symbols[key])
             return result
-
-        def _build_symbol_definitions() -> dict[str, list[str]]:
-            """Define every per-core ``kernel_derived_symbolic`` id in the SDSC.
-
-            For a tensor whose symbolic dim ``S`` is split ``split_count`` ways
-            across cores, core ``c``'s start address is::
-
-                addr_c = base + c * per_element_stride_bytes * ceildiv(S, split)
-
-            emitted as a DeepTools VariableDefinition tree: one shared
-            ``DIV_CEIL(S, split)`` node plus one ``MACC`` node per core c>0
-            folding ``coeff * ceildiv + base`` (coeff = c *
-            per_element_stride_bytes).  ``S`` and ``base`` are runtime inputs and
-            are NOT defined here; only the derived ids are.
-            """
-            defs: dict[str, list[str]] = {}
-            # One ceildiv(S, split) intermediate per (pytorch_sym, split_count),
-            # shared by every tensor/core that splits the same dim the same way.
-            ceildiv_ids: dict[tuple[str, int], int] = {}
-            for tensor in sdsc_spec.args:
-                split = _symbolic_split_info(
-                    tensor, sdsc_spec.work_slices, symbolic_dims
-                )
-                if split is None:
-                    continue
-                sdsc_dim_name, split_count, pytorch_sym = split
-                split_dim = Symbol(sdsc_dim_name)
-                s_id = dim_local_symbols[pytorch_sym]
-                _, base_key = _kernel_base_offset_and_key(tensor)
-                base_id = local_symbols[base_key]
-                # Un-folded (max-safe) per-element byte stride of the split dim.
-                per_element_stride_bytes = tensor.per_element_strides[
-                    split_dim
-                ] * num_bytes(tensor.data_format)
-
-                cd_key = (pytorch_sym, split_count)
-                if cd_key not in ceildiv_ids:
-                    cd_id = offset_as_symbol(
-                        0, SymbolKind.derived_ceildiv(pytorch_sym, split_count)
-                    )
-                    ceildiv_ids[cd_key] = cd_id
-                    defs[_sym_ref(cd_id)] = [
-                        "DIV_CEIL",
-                        _sym_ref(s_id),
-                        str(split_count),
-                    ]
-                cd_id = ceildiv_ids[cd_key]
-
-                for c in range(1, sdsc_spec.num_cores):
-                    core_key = ("kernel_derived_symbolic", tensor.arg_index, c)
-                    if core_key not in local_symbols:
-                        # This core shares core 0's address (not split for it);
-                        # no derived id was registered, so nothing to define.
-                        continue
-                    core_id = local_symbols[core_key]
-                    coeff = c * per_element_stride_bytes
-                    # MACC(coeff, ceildiv, base) == coeff * ceildiv + base.
-                    defs[_sym_ref(core_id)] = [
-                        "MACC",
-                        str(coeff),
-                        _sym_ref(cd_id),
-                        _sym_ref(base_id),
-                    ]
-            return defs
-
-        symbol_definitions = _build_symbol_definitions()
 
     else:
         # use_symbols=False: bake concrete HBM addresses directly into the JSON.
@@ -1354,7 +1235,7 @@ def generate_sdsc(
                             str(sym_id): pytorch_sym
                             for pytorch_sym, sym_id in dim_local_symbols.items()
                         },
-                        "symbolDefinitions_": symbol_definitions,
+                        "symbolDefinitions_": {},
                     }
                     if symbolic_dims
                     else {}

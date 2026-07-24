@@ -565,9 +565,9 @@ class TestGenerateSdscSymbolicPerCoreAddresses(InductorTestCase):
 
     Fixture mirrors TestSdscJsonSymbolicDimSmoke but with work_slices that
     actually split the symbolic dim across 8 cores (s0 max=512, granularity=64).
-    This asserts on the SDSC JSON only. The per-core arith formula lives in
-    symbolDefinitions_ (see TestGenerateSdscSymbolDefinitions below); this class
-    checks the per-core address ids and marker fields.
+    This asserts on the SDSC JSON only. The real per-core arith formula and its
+    symbolDefinitions_ content are a separate later PR, so symbolDefinitions_
+    stays empty here.
     """
 
     _DEVICE_SIZE = [4, 512, 64]
@@ -654,17 +654,15 @@ class TestGenerateSdscSymbolicPerCoreAddresses(InductorTestCase):
             self.assertEqual(sk.pytorch_sym, "s0")
             self.assertGreaterEqual(sk.core_idx, 1)
 
-        # The marker itself stores no per-element stride; the stride is applied
-        # when the symbolDefinitions_ formula is built, so the marker offset
-        # stays at its default sentinel for every symbolic per-core symbol.
+        # This PR only tags the symbolic split; no per-element stride is stored
+        # on the marker (that is the bundle-arm follow-up), so offset stays at
+        # its default sentinel for every symbolic per-core symbol.
         for sk in symbolic_kinds:
             self.assertEqual(sk.offset, 0)
 
-        # symbolDefinitions_ now defines every per-core symbolic id: one shared
-        # DIV_CEIL plus one MACC per (tensor, core c>0).
-        self.assertEqual(
-            len(top["symbolDefinitions_"]), 1 + 3 * (self._NUM_CORES - 1)
-        )
+        # SDSC-only change: the real per-core arith formula is a later PR, so
+        # symbolDefinitions_ stays empty.
+        self.assertEqual(top["symbolDefinitions_"], {})
 
     def test_dim_symbol_ids_lower_magnitude_than_address_ids(self):
         # Dim symbols must occupy the smallest-magnitude (closest to zero) ids
@@ -686,195 +684,3 @@ class TestGenerateSdscSymbolicPerCoreAddresses(InductorTestCase):
         self.assertTrue(
             any(sk.is_derived_symbolic for sk in symbol_kinds[first_address:])
         )
-
-
-def _eval_symbol_tree(defs: dict, node_id: str, inputs: dict) -> int:
-    """Minimal DeepTools VariableDefinition evaluator (DIV_CEIL/MACC/ADD/MUL).
-
-    Mirrors the dispatch-time computeVar semantics closely enough to prove the
-    emitted tree evaluates to the intended per-core address.  ``inputs`` binds
-    the runtime-input symbol refs (S and the base addresses).  Symbol operands
-    are ``"V<id>"``; bare strings are integer constants.
-    """
-
-    def _operand(tok: str) -> int:
-        if tok.startswith("V"):
-            if tok in inputs:
-                return inputs[tok]
-            return _eval_symbol_tree(defs, tok, inputs)
-        return int(tok)
-
-    op, *operands = defs[node_id]
-    vals = [_operand(t) for t in operands]
-    if op == "DIV_CEIL":
-        a, b = vals
-        return -(-a // b)  # ceil division
-    if op == "ADD":
-        return sum(vals)
-    if op == "MUL":
-        result = 1
-        for v in vals:
-            result *= v
-        return result
-    if op == "MACC":
-        # Pairs multiply, a trailing odd operand is added as K: c*a (+ b).
-        total = 0
-        i = 0
-        while i + 1 < len(vals):
-            total += vals[i] * vals[i + 1]
-            i += 2
-        if i < len(vals):
-            total += vals[i]
-        return total
-    raise AssertionError(f"unhandled op {op}")
-
-
-class TestGenerateSdscSymbolDefinitions(InductorTestCase):
-    """The per-core symbolic start-address FORMULA lives in symbolDefinitions_.
-
-    Same 8-core symbolic-batch add fixture as
-    TestGenerateSdscSymbolicPerCoreAddresses. Every per-core symbolic id from
-    startAddressCoreCorelet_ must be defined here as
-    ``base + c * per_element_stride_bytes * ceildiv(S, split)``.
-    """
-
-    _DEVICE_SIZE = [4, 512, 64]
-    _HBM_BASE = 0x400000000
-    _NUM_CORES = 8
-    _SPLIT = 8
-    # fp16: 2 bytes/elem; un-folded per-element stride of the split (mb) dim is
-    # the product of the inner static dims (device_size[-1:] == 64 elems), so
-    # 64 * 2 == 128 bytes.  This is the max-safe value (independent of S).
-    _PER_ELEMENT_STRIDE_BYTES = 64 * 2
-
-    def _make_symbolic_op_spec(self) -> OpSpec:
-        c_row, c_col = sympy.Symbol("c_row"), sympy.Symbol("c_col")
-        s0 = sympy.Symbol("s0", integer=True, positive=True)
-        coords = [c_col // 64, c_row, sympy.Mod(c_col, 64)]
-
-        def _tensor_arg(is_input, arg_index, hbm_base):
-            return TensorArg(
-                is_input=is_input,
-                arg_index=arg_index,
-                device_dtype=DataFormats.SEN169_FP16,
-                device_size=list(self._DEVICE_SIZE),
-                device_coordinates=coords,
-                allocation={"hbm": hbm_base},
-            )
-
-        return OpSpec(
-            op="add",
-            is_reduction=False,
-            iteration_space={
-                c_row: (s0, self._NUM_CORES),
-                c_col: (sympy.Integer(256), 1),
-            },
-            args=[
-                _tensor_arg(True, 0, self._HBM_BASE),
-                _tensor_arg(True, 1, self._HBM_BASE + 0x1000),
-                _tensor_arg(False, 2, self._HBM_BASE + 0x100000000),
-            ],
-            op_info={},
-            symbolic_dim_bounds={"s0": (512, 64)},
-        )
-
-    def _compile(self):
-        op_spec = self._make_symbolic_op_spec()
-        sdsc_json, _, _, _ = compile_op_spec(
-            idx=0, op_spec=op_spec, symbols=[], use_symbols=True
-        )
-        top = next(iter(sdsc_json.values()))
-        dsc = next(iter(top["dscs_"][0].values()))
-        return top, dsc
-
-    def _hbm_nodes(self, dsc):
-        return [
-            node
-            for node in dsc["scheduleTree_"]
-            if node.get("nodeType_") == "allocate"
-            and node.get("component_") == "hbm"
-        ]
-
-    def test_one_ceildiv_and_one_macc_per_core(self):
-        top, dsc = self._compile()
-        defs = top["symbolDefinitions_"]
-
-        div_ceil = [v for v in defs.values() if v[0] == "DIV_CEIL"]
-        macc = [v for v in defs.values() if v[0] == "MACC"]
-        self.assertEqual(len(div_ceil), 1)
-        self.assertEqual(len(macc), 3 * (self._NUM_CORES - 1))
-
-        # The single DIV_CEIL is ceildiv(S, split): S is the dim symbol -1, the
-        # divisor is the compile-time split count.
-        self.assertEqual(div_ceil[0], ["DIV_CEIL", "V-1", str(self._SPLIT)])
-
-    def test_keys_match_start_address_per_core_ids(self):
-        top, dsc = self._compile()
-        defs = top["symbolDefinitions_"]
-
-        # Collect the per-core (c>0) ids and the core-0 base id per tensor.
-        for node in self._hbm_nodes(dsc):
-            data = node["startAddressCoreCorelet_"]["data_"]
-            base_ref = f"V{data['[0, 0, 0]']}"
-            for c in range(1, self._NUM_CORES):
-                core_ref = f"V{data[f'[{c}, 0, 0]']}"
-                # Every per-core symbolic id must be defined.
-                self.assertIn(core_ref, defs)
-                op, coeff, cd_ref, base_in_def = defs[core_ref]
-                self.assertEqual(op, "MACC")
-                # Base operand of the MACC is exactly core 0's address symbol.
-                self.assertEqual(base_in_def, base_ref)
-                # Coefficient is c * per_element_stride_bytes.
-                self.assertEqual(
-                    int(coeff), c * self._PER_ELEMENT_STRIDE_BYTES
-                )
-                # The ceildiv ref points at the shared DIV_CEIL node.
-                self.assertEqual(defs[cd_ref][0], "DIV_CEIL")
-
-    def test_ids_unique_and_core0_not_defined(self):
-        top, dsc = self._compile()
-        defs = top["symbolDefinitions_"]
-
-        # Keys unique (dict guarantees) and none is the dim id or a core-0 base.
-        self.assertNotIn("V-1", defs)  # S is a runtime input, never defined
-        for node in self._hbm_nodes(dsc):
-            data = node["startAddressCoreCorelet_"]["data_"]
-            self.assertNotIn(f"V{data['[0, 0, 0]']}", defs)
-
-    def test_wire_format_all_strings(self):
-        top, _ = self._compile()
-        defs = top["symbolDefinitions_"]
-        for key, node in defs.items():
-            self.assertIsInstance(key, str)
-            self.assertTrue(key.startswith("V"))
-            self.assertTrue(all(isinstance(tok, str) for tok in node))
-            self.assertIn(node[0], ("DIV_CEIL", "MACC"))
-            for tok in node[1:]:
-                if tok.startswith("V"):
-                    # Symbol ref: the part after "V" is a (negative) int id.
-                    self.assertLess(int(tok[1:]), 0)
-                else:
-                    int(tok)  # bare integer constant parses cleanly
-
-    def test_numeric_addr_matches_formula_for_runtime_S(self):
-        top, dsc = self._compile()
-        defs = top["symbolDefinitions_"]
-
-        # A runtime S below the max (512) and divisible by the split.
-        runtime_s = 256
-        self.assertEqual(runtime_s % self._SPLIT, 0)
-
-        for node in self._hbm_nodes(dsc):
-            data = node["startAddressCoreCorelet_"]["data_"]
-            base_id = int(data["[0, 0, 0]"])
-            # Bind the runtime inputs: S and this tensor's base address.  The
-            # base value is arbitrary here; only the arithmetic must match.
-            base_value = 0x10000 * (abs(base_id) + 1)
-            inputs = {"V-1": runtime_s, f"V{base_id}": base_value}
-            for c in range(1, self._NUM_CORES):
-                core_ref = f"V{data[f'[{c}, 0, 0]']}"
-                got = _eval_symbol_tree(defs, core_ref, inputs)
-                expected = base_value + c * (
-                    runtime_s // self._SPLIT
-                ) * self._PER_ELEMENT_STRIDE_BYTES
-                self.assertEqual(got, expected)
