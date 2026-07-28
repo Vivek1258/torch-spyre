@@ -69,6 +69,11 @@ class SDSCArgs:
     start_address: int | Symbol
     backGap: dict[Symbol, int]
     arg_index: int = -1
+    # Un-folded per-element byte stride per dim (dim_device_stride, before the
+    # dim's own size is multiplied in).  Kept separate from ``strides`` because
+    # ``strides`` gets folded to the iteration size (warmup) for padded dims,
+    # while the per-core symbolic address needs the max-safe row stride.
+    dim_device_strides: dict[Symbol, Any] = dataclasses.field(default_factory=dict)
     is_index_tensor: bool = False
     related_value_tensor_idx: int = -1
     per_tile_fixed: bool = False
@@ -426,6 +431,7 @@ def _create_sdsc_tensors(
         offsets: dict = {}
         backGap: dict[Symbol, int] = {}
         max_dim_sizes: dict = {}
+        dim_device_strides: dict = {}
         reduced_dims: list = []
 
         # Step 2: Handle reduced dimensions — skip for index tensors.
@@ -465,6 +471,10 @@ def _create_sdsc_tensors(
             strides[dim] = _calculate_device_stride(stride_idx, arg.device_size)
             offsets[dim] = 0
             dim_device_stride = math.prod(arg.device_size[-stride_idx - 1 :])
+            # Keep the un-folded row stride: strides[dim] may get folded to the
+            # iteration size below, but the per-core symbolic address needs this
+            # max-safe value.
+            dim_device_strides[dim] = dim_device_stride
 
             dev_dim_size = arg.device_size[-stride_idx - 2]
             it_dim_size = iteration_space[dim]
@@ -502,6 +512,10 @@ def _create_sdsc_tensors(
             strides[mb_sym] = _calculate_device_stride(0, arg.device_size)
             offsets[mb_sym] = 0
             max_dim_sizes[mb_sym] = -1
+            # Un-folded per-element stride for the batch symbol, matching the
+            # loop above (stride_idx 0), so a symbolic-split batch dim can look
+            # it up without a KeyError.
+            dim_device_strides[mb_sym] = math.prod(arg.device_size[-1:])
 
         effective_stick = op_stick_dim if stick_dim is None else stick_dim
         layout_labels = MATMUL_LAYOUT_LABELS if not use_op_dims else LAYOUT_LABELS
@@ -567,6 +581,7 @@ def _create_sdsc_tensors(
                 is_index_tensor=is_idx_tensor,
                 related_value_tensor_idx=related_val_idx,
                 per_tile_fixed=arg.per_tile_fixed,
+                dim_device_strides=dim_device_strides,
             )
         )
 

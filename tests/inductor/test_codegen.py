@@ -440,6 +440,7 @@ class TestSymbolKindKernelDerivedSymbolic(InductorTestCase):
             split_count=8,
             base_sym_idx=3,
             pytorch_sym="s0",
+            per_element_stride=128,
         )
         self.assertEqual(sk.kind, "kernel_derived_symbolic")
         self.assertEqual(sk.arg_index, 2)
@@ -447,18 +448,21 @@ class TestSymbolKindKernelDerivedSymbolic(InductorTestCase):
         self.assertEqual(sk.split_count, 8)
         self.assertEqual(sk.base_sym_idx, 3)
         self.assertEqual(sk.pytorch_sym, "s0")
+        self.assertEqual(sk.per_element_stride, 128)
 
-    def test_no_stride_stored_on_marker(self):
-        # This PR only tags the symbolic split; no per-element stride is
-        # computed here (that is the bundle-arm follow-up), so offset stays at
-        # its default sentinel.
+    def test_stride_stored_on_marker(self):
+        # The bundle arm forms the coefficient core_idx * per_element_stride, so
+        # the marker now carries the un-folded per-element stride. offset is not
+        # used for this variant and stays at its default sentinel.
         sk = SymbolKind.kernel_derived_symbolic(
             arg_index=0,
             core_idx=1,
             split_count=4,
             base_sym_idx=0,
             pytorch_sym="s0",
+            per_element_stride=64,
         )
+        self.assertEqual(sk.per_element_stride, 64)
         self.assertEqual(sk.offset, 0)
 
     def test_is_derived_symbolic_true(self):
@@ -468,6 +472,7 @@ class TestSymbolKindKernelDerivedSymbolic(InductorTestCase):
             split_count=4,
             base_sym_idx=0,
             pytorch_sym="s0",
+            per_element_stride=128,
         )
         self.assertTrue(sk.is_derived_symbolic)
 
@@ -480,6 +485,7 @@ class TestSymbolKindKernelDerivedSymbolic(InductorTestCase):
             split_count=4,
             base_sym_idx=0,
             pytorch_sym="s0",
+            per_element_stride=128,
         )
         self.assertFalse(sk.is_derived)
         self.assertFalse(sk.is_pool)
@@ -674,13 +680,14 @@ class TestGenerateSdscSymbolicPerCoreAddresses(InductorTestCase):
             self.assertEqual(sk.pytorch_sym, "s0")
             self.assertGreaterEqual(sk.core_idx, 1)
 
-        # This PR only tags the symbolic split; no per-element stride is stored
-        # on the marker (that is the bundle-arm follow-up), so offset stays at
-        # its default sentinel for every symbolic per-core symbol.
+        # Each marker now carries the un-folded per-element stride the bundle
+        # arm needs; it is a positive byte stride. offset is unused for this
+        # variant and stays at its default sentinel.
         for sk in symbolic_kinds:
             self.assertEqual(sk.offset, 0)
+            self.assertGreater(sk.per_element_stride, 0)
 
-        # SDSC-only change: the real per-core arith formula is a later PR, so
+        # The per-core formula lives in bundle.mlir as arith, not in the SDSC, so
         # symbolDefinitions_ stays empty.
         self.assertEqual(top["symbolDefinitions_"], {})
 

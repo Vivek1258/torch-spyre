@@ -201,6 +201,14 @@ def generate_bundle(
         )
         for sym_idx in dimension_sym_indices
     }
+    # pytorch_sym -> the dim's input_arg SSA (the one the dim plumbing emits via
+    # input_arg_extract).  Reuses the existing dedup map (pytorch_sym -> canonical
+    # sym_idx) and dim_param_names (sym_idx -> SSA), so the per-core symbolic arm
+    # references the SAME %S the dim plumbing already declared; no new input_arg.
+    dim_ssa_by_pytorch_sym: dict[str, str] = {
+        pytorch_sym: dim_param_names[sym_idx]
+        for pytorch_sym, sym_idx in seen_dim_sym.items()
+    }
 
     with open(os.path.join(output_dir, "bundle.mlir"), "w") as f:
         logger.info(f"Generating {f.name}")
@@ -311,6 +319,32 @@ def generate_bundle(
         derived_addi_emitted: dict[tuple[str, int], str] = {}
         # pool_addi_emitted[pool_offset_value] → SSA name already emitted
         pool_addi_emitted: dict[int, str] = {}
+        # percore_rows_emitted[(S_ssa, split_count)] → SSA of ceildiv(S, split).
+        # ceildiv(S, split) is the per-core row count; it is identical for every
+        # core and every tensor that splits the same dim the same way, so emit it
+        # once and let all their per-core offsets reuse it.
+        percore_rows_emitted: dict[tuple[str, int], str] = {}
+
+        def _resolve_sliced_base(base_sym_idx: int) -> str | None:
+            """SSA name of the sliced base a per-core offset builds on.
+
+            Shared by the ``kernel_derived`` and ``kernel_derived_symbolic``
+            arms so their base resolution cannot drift.  Returns ``None`` when
+            the base is not a known kernel/slice symbol (the caller then falls
+            back to a bare constant).
+            """
+            if base_sym_idx in sym_canonical:
+                return sym_canonical[base_sym_idx]
+            if base_sym_idx in kernel_arg_sym_indices:
+                # slice_offset == 0: sliced base == raw arg extract (%arg_N)
+                return f"%arg_{symbol_kinds[base_sym_idx].arg_index}"
+            if base_sym_idx in kernel_dup_canonical:
+                canon = kernel_dup_canonical[base_sym_idx]
+                ai = kernel_sym_to_arg_idx.get(
+                    canon, symbol_kinds[base_sym_idx].arg_index
+                )
+                return f"%arg_{ai}"
+            return None
 
         for sym_idx, value in enumerate(symbols):
             if sym_idx in kernel_arg_sym_set:
@@ -332,21 +366,7 @@ def generate_bundle(
                 sym_canonical[sym_idx] = slice_addi_emitted[key]
             elif sk is not None and sk.is_derived:
                 # Resolve the SSA name of the sliced base that this core offset builds on.
-                base_sym_idx = sk.base_sym_idx
-                if base_sym_idx in sym_canonical:
-                    sliced_base_ssa = sym_canonical[base_sym_idx]
-                elif base_sym_idx in kernel_arg_sym_indices:
-                    # slice_offset == 0: sliced base == raw arg extract (%arg_N)
-                    ai = symbol_kinds[base_sym_idx].arg_index
-                    sliced_base_ssa = f"%arg_{ai}"
-                elif base_sym_idx in kernel_dup_canonical:
-                    canon = kernel_dup_canonical[base_sym_idx]
-                    ai = kernel_sym_to_arg_idx.get(
-                        canon, symbol_kinds[base_sym_idx].arg_index
-                    )
-                    sliced_base_ssa = f"%arg_{ai}"
-                else:
-                    sliced_base_ssa = None
+                sliced_base_ssa = _resolve_sliced_base(sk.base_sym_idx)
                 if sliced_base_ssa is not None:
                     key_d = (sliced_base_ssa, sk.offset)
                     if key_d not in derived_addi_emitted:
@@ -362,6 +382,53 @@ def generate_bundle(
                         derived_addi_emitted[key_d] = addi_ssa
                     sym_canonical[sym_idx] = derived_addi_emitted[key_d]
                 else:
+                    f.write(
+                        f"\t\t%sym_{sym_idx + 1} = arith.constant {value} : index\n"
+                    )
+            elif sk is not None and sk.is_derived_symbolic:
+                # Per-core start address for a symbolic-dim core split (#2289).
+                # Emit the live formula
+                #     base + ceildiv(S, split) * (core_idx * per_element_stride)
+                # so the per-core offset tracks the runtime dim size S instead of
+                # freezing at the warmup shape (the bare-constant bug).  S is the
+                # dim input_arg SSA the dim plumbing already declared; no new
+                # input_arg is added here.  ceildivsi is emitted as a first-class
+                # op (not hidden in affine.apply) so the backend sees the divide.
+                base_ssa = _resolve_sliced_base(sk.base_sym_idx)
+                s_ssa = dim_ssa_by_pytorch_sym.get(sk.pytorch_sym)
+                if base_ssa is not None and s_ssa is not None:
+                    rows_key = (s_ssa, sk.split_count)
+                    if rows_key not in percore_rows_emitted:
+                        s_name = s_ssa[1:]  # strip leading '%'
+                        split_ssa = f"%split_{s_name}_{sk.split_count}"
+                        rows_ssa = f"%percore_{s_name}_{sk.split_count}"
+                        f.write(
+                            f"\t\t{split_ssa} = arith.constant"
+                            f" {sk.split_count} : index\n"
+                        )
+                        f.write(
+                            f"\t\t{rows_ssa} = arith.ceildivsi"
+                            f" {s_ssa}, {split_ssa} : index\n"
+                        )
+                        percore_rows_emitted[rows_key] = rows_ssa
+                    rows_ssa = percore_rows_emitted[rows_key]
+                    coeff = sk.core_idx * sk.per_element_stride
+                    coeff_ssa = f"%symcoeff_{sym_idx + 1}"
+                    off_ssa = f"%symoff_{sym_idx + 1}"
+                    addr_ssa = f"%symcore_{sym_idx + 1}"
+                    f.write(f"\t\t{coeff_ssa} = arith.constant {coeff} : index\n")
+                    f.write(
+                        f"\t\t{off_ssa} = arith.muli"
+                        f" {rows_ssa}, {coeff_ssa} : index\n"
+                    )
+                    f.write(
+                        f"\t\t{addr_ssa} = arith.addi"
+                        f" {base_ssa}, {off_ssa} : index\n"
+                    )
+                    sym_canonical[sym_idx] = addr_ssa
+                else:
+                    # No resolvable base or dim SSA: fall back to the bare
+                    # constant (keeps behaviour for degenerate cases).
                     f.write(
                         f"\t\t%sym_{sym_idx + 1} = arith.constant {value} : index\n"
                     )

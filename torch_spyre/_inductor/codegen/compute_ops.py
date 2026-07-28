@@ -49,15 +49,15 @@ class SymbolKind:
                                              per_element_stride`` where ``S`` is the
                                              runtime size of the symbolic dim, so it
                                              cannot be baked at compile time.  This
-                                             variant only TAGS the per-core address
-                                             as symbolic, carrying ``core_idx``,
-                                             ``split_count`` and the ``pytorch_sym``
-                                             it depends on.  Emitting the actual
-                                             arith formula, and computing the
-                                             per-element stride it needs, is the
-                                             bundle-arm follow-up (which depends on
-                                             the dim ``input_arg`` SSA and is out of
-                                             scope here).  ``is_derived`` stays False
+                                             variant TAGS the per-core address as
+                                             symbolic, carrying ``core_idx``,
+                                             ``split_count``, ``per_element_stride``
+                                             and the ``pytorch_sym`` it depends on.
+                                             The bundle arm emits the actual arith
+                                             formula (``ceildivsi`` + ``muli`` +
+                                             ``addi`` over the runtime dim
+                                             ``input_arg`` SSA declared by the dim
+                                             plumbing).  ``is_derived`` stays False
                                              so the existing bundle
                                              ``kernel_derived`` addi branch does not
                                              match this variant.  At the SDSC-JSON
@@ -95,6 +95,10 @@ class SymbolKind:
     # Only meaningful for the kernel_derived_symbolic variant.
     core_idx: int = -1
     split_count: int = 0
+    # Un-folded per-element byte stride of the split dim (superdsc
+    # dim_device_stride, before the split dim size is multiplied in).  Used by
+    # the bundle arm to form the coefficient ``core_idx * per_element_stride``.
+    per_element_stride: int = 0
 
     @classmethod
     def kernel(cls, arg_index: int) -> "SymbolKind":
@@ -123,13 +127,16 @@ class SymbolKind:
         split_count: int,
         base_sym_idx: int,
         pytorch_sym: str,
+        per_element_stride: int,
     ) -> "SymbolKind":
         """Per-core derived address for a symbolic-dim core split.
 
-        Tags the per-core address as symbolic. The runtime formula
-        ``core_idx * ceildiv(S, split_count) * per_element_stride`` and the
-        per-element stride it needs are emitted by the bundle-arm follow-up,
-        not here, so no stride is stored on this marker.
+        Tags the per-core address as symbolic and carries the compile-time
+        constants the bundle arm needs to emit the runtime formula
+        ``base + ceildiv(S, split_count) * (core_idx * per_element_stride)``.
+        ``per_element_stride`` is the un-folded per-element byte stride of the
+        split dim (superdsc ``dim_device_stride``), so it does not depend on the
+        runtime dim size and stays max-safe.
         """
         return cls(
             kind="kernel_derived_symbolic",
@@ -138,6 +145,7 @@ class SymbolKind:
             split_count=split_count,
             base_sym_idx=base_sym_idx,
             pytorch_sym=pytorch_sym,
+            per_element_stride=per_element_stride,
         )
 
     @classmethod
@@ -662,11 +670,14 @@ def generate_sdsc(
             value for the symbolic path.
             """
             if symbolic_split is not None:
-                _sdsc_dim_name, split_count, pytorch_sym = symbolic_split
-                # TODO:  only TAG the per-core address as symbolic. The
-                # runtime arith (core * ceildiv(S, split) * per_element_stride)
-                # and the per-element stride it needs are the bundle-arm
-                # follow-up, so nothing stride-related is computed here.
+                sdsc_dim_name, split_count, pytorch_sym = symbolic_split
+                # Un-folded per-element byte stride of the split dim, carried
+                # from superdsc.  The bundle arm forms the per-core coefficient
+                # ``core_idx * per_element_stride`` from it.  Using the un-folded
+                # stride (not the folded ``strides[dim]``) keeps it max-safe.
+                per_element_stride = int(
+                    tensor.dim_device_strides[Symbol(sdsc_dim_name)]
+                )
                 offset_as_symbol(
                     addr,
                     SymbolKind.kernel_derived_symbolic(
@@ -675,6 +686,7 @@ def generate_sdsc(
                         split_count=split_count,
                         base_sym_idx=sliced_base_sym_idx,
                         pytorch_sym=pytorch_sym,
+                        per_element_stride=per_element_stride,
                     ),
                 )
             else:
