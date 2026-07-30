@@ -225,6 +225,25 @@ def generate_bundle(
                 )
                 percore_count_name[key] = f"%P_{dim_suffix}_{sk_i.split_count}"
 
+    # Side metadata channel for the runtime dispatch (POC): the runtime cannot
+    # infer S (the symbolic dim value) or P (= ceil(S/split)) or the split by
+    # itself, so codegen records the extra input_arg slots in the SAME order as
+    # the func params (dims first, then per-core P). At dispatch the runtime
+    # reads this file, computes S from the max-reserved tensor and P from split,
+    # and appends them to the program-correction input array. Written next to
+    # bundle.mlir; the runtime reads it from spyreCodeDir's parent.
+    symbolic_inputs = [
+        {"kind": "dim", "pytorch_sym": symbol_kinds[sym_idx].pytorch_sym}
+        for sym_idx in dimension_sym_indices
+    ]
+    symbolic_inputs += [
+        {"kind": "percore", "pytorch_sym": pytorch_sym, "split": split_count}
+        for (pytorch_sym, split_count) in percore_count_keys
+    ]
+    if symbolic_inputs:
+        with open(os.path.join(output_dir, "symbolic_inputs.json"), "w") as sf:
+            json.dump({"symbolic_inputs": symbolic_inputs}, sf, indent=2)
+
     with open(os.path.join(output_dir, "bundle.mlir"), "w") as f:
         logger.info(f"Generating {f.name}")
 

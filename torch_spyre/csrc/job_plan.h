@@ -400,6 +400,20 @@ class JobPlanStepCompute final : public JobPlanStep {
 };
 
 /**
+ * @brief Descriptor for one extra runtime input the bundle expects beyond the
+ * tensor base addresses: either a symbolic dim value S, or a per-core count
+ * P = ceil(S / split). The list is ordered to match the bundle.mlir func-param
+ * order (all dims first, then all per-core counts). Emitted by codegen into
+ * symbolic_inputs.json and consumed at dispatch by JobPlanStepHostCompute.
+ */
+struct SymbolicInput {
+  enum class Kind { Dim, Percore };
+  Kind kind;
+  std::string pytorch_sym;
+  int64_t split = 0;  // number of cores the dim is split across; Percore only
+};
+
+/**
  * @brief Host-side computation step (e.g., program correction)
  *
  * Stores compiler metadata (Hcm) and a shared output buffer during
@@ -441,11 +455,19 @@ class JobPlanStepHostCompute final : public JobPlanStep {
 
   void write(std::ostream& os) const override;
 
+  /// Attach the symbolic-input descriptors (S / P slots) parsed from
+  /// symbolic_inputs.json. When non-empty, construct() forwards the runtime
+  /// dim value(s) and per-core count(s) to program correction.
+  void set_symbolic_inputs(std::vector<SymbolicInput> symbolic_inputs) {
+    symbolic_inputs_ = std::move(symbolic_inputs);
+  }
+
  private:
   std::unique_ptr<Hcm> hcm_;
   void* output_buffer_;       // Non-owning pointer (JobPlan owns the buffer)
   const void* input_buffer_;  // Non-owning pointer (JobPlan owns the buffer)
   std::vector<int64_t> ishape_;
+  std::vector<SymbolicInput> symbolic_inputs_;
 };
 
 /**
