@@ -76,6 +76,12 @@ class SDSCArgs:
     related_value_tensor_idx: int = -1
     per_tile_fixed: bool = False
     device_tile_advance_expr: Expr | None = None
+    # Un-folded per-element device stride (in ELEMENTS) for each dim, i.e.
+    # math.prod(device_size innermost..dim-exclusive). Used by the bundle arm
+    # to form the per-core symbolic address coefficient
+    # (core_idx * per_element_stride) without re-deriving the stride. Not folded
+    # by the dim's own size, so it is independent of the symbolic dim's size.
+    dim_device_strides: dict[Symbol, Any] = dataclasses.field(default_factory=dict)
 
     def __str__(self) -> str:
         scales = ", ".join(f"{k}={v}" for k, v in self.scales.items())
@@ -589,6 +595,7 @@ def _create_sdsc_tensors(
         scales: dict = {}
         strides: dict = {}
         offsets: dict = {}
+        dim_device_strides: dict = {}
         backGap: dict[Symbol, int] = {}
         max_dim_sizes: dict = {}
         reduced_dims: list = []
@@ -630,6 +637,8 @@ def _create_sdsc_tensors(
             strides[dim] = _calculate_device_stride(stride_idx, arg.device_size)
             offsets[dim] = 0
             dim_device_stride = math.prod(arg.device_size[-stride_idx - 1 :])
+            # Carry the un-folded per-element stride for the bundle arm.
+            dim_device_strides[dim] = dim_device_stride
 
             if dim is stick_dim and dim in sdsc_dim_advance:
                 # Authoritative fact from coarse_tile.py: the stick dim's
@@ -693,6 +702,11 @@ def _create_sdsc_tensors(
             strides[mb_sym] = _calculate_device_stride(0, arg.device_size)
             offsets[mb_sym] = 0
             max_dim_sizes[mb_sym] = -1
+            # mb is handled outside the main dim loop, so store its un-folded
+            # per-element stride here too (stride_idx=0 => prod of the innermost
+            # dim). Keeps dim_device_strides complete when the symbolic split
+            # dim is the batch dim.
+            dim_device_strides[mb_sym] = math.prod(arg.device_size[-1:])
 
         effective_stick = op_stick_dim if stick_dim is None else stick_dim
         layout_labels = MATMUL_LAYOUT_LABELS if not use_op_dims else LAYOUT_LABELS
@@ -759,6 +773,7 @@ def _create_sdsc_tensors(
                 related_value_tensor_idx=related_val_idx,
                 per_tile_fixed=arg.per_tile_fixed,
                 device_tile_advance_expr=arg.device_tile_advance_expr,
+                dim_device_strides=dim_device_strides,
             )
         )
 

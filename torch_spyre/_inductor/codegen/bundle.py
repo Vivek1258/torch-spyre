@@ -202,6 +202,29 @@ def generate_bundle(
         for sym_idx in dimension_sym_indices
     }
 
+    # Per-core symbolic split (bundle-arm workaround, no divide): each
+    # (pytorch_sym, split_count) that has a symbolic per-core address with a
+    # known per-element stride needs one runtime P = ceil(S/split) bundle
+    # input_arg. P is a BUNDLE-ONLY input (dxp counts it from the func param
+    # list); it is not an sdsc_execute operand and is not in the SDSC JSON. The
+    # per-core address arm below references it as muli(P, coeff).
+    percore_count_keys: list[tuple[str, int]] = []  # ordered (pytorch_sym, split)
+    percore_count_name: dict[tuple[str, int], str] = {}  # key -> "%P_..." SSA name
+    _seen_percore: set[tuple[str, int]] = set()
+    for sk_i in symbol_kinds:
+        if sk_i.is_derived_symbolic and sk_i.per_element_stride > 0:
+            key = (sk_i.pytorch_sym, sk_i.split_count)
+            if key not in _seen_percore:
+                _seen_percore.add(key)
+                percore_count_keys.append(key)
+                canon = seen_dim_sym.get(sk_i.pytorch_sym)
+                dim_suffix = (
+                    dim_param_names[canon][1:]
+                    if canon is not None and canon in dim_param_names
+                    else sk_i.pytorch_sym
+                )
+                percore_count_name[key] = f"%P_{dim_suffix}_{sk_i.split_count}"
+
     with open(os.path.join(output_dir, "bundle.mlir"), "w") as f:
         logger.info(f"Generating {f.name}")
 
@@ -225,7 +248,12 @@ def generate_bundle(
         #     per unique dynamic-shape (mark_dynamic) symbol; emitted whenever
         #     present, independent of use_symbols (which only governs the
         #     pool/kernel-address params above).
-        if has_pool or kernel_arg_sym_indices or dimension_sym_indices:
+        if (
+            has_pool
+            or kernel_arg_sym_indices
+            or dimension_sym_indices
+            or percore_count_keys
+        ):
             params = []
             if has_pool:
                 params.append("%pool_base_addr: !sdscbundle.input_arg<index>")
@@ -236,6 +264,12 @@ def generate_bundle(
                 dim_sk = symbol_kinds[sym_idx]
                 params.append(
                     f"{dim_param_names[sym_idx]}_base: {_dim_input_arg_type(dim_sk)}"
+                )
+            # Per-core count P params LAST, so the runtime input array is
+            # [bases..., dims..., P...] positionally (dxp matches by position).
+            for key in percore_count_keys:
+                params.append(
+                    f"{percore_count_name[key]}_base: !sdscbundle.input_arg<index>"
                 )
             f.write(f"\tfunc.func @sdsc_bundle({', '.join(params)}) {{\n")
             if has_pool:
@@ -255,6 +289,12 @@ def generate_bundle(
                 f.write(
                     f"\t\t{name} = sdscbundle.input_arg_extract value from"
                     f" {name}_base : {_dim_input_arg_type(dim_sk)} -> index\n"
+                )
+            for key in percore_count_keys:
+                pname = percore_count_name[key]
+                f.write(
+                    f"\t\t{pname} = sdscbundle.input_arg_extract value from"
+                    f" {pname}_base : !sdscbundle.input_arg<index> -> index\n"
                 )
         else:
             f.write("\tfunc.func @sdsc_bundle() {\n")
@@ -362,6 +402,50 @@ def generate_bundle(
                         derived_addi_emitted[key_d] = addi_ssa
                     sym_canonical[sym_idx] = derived_addi_emitted[key_d]
                 else:
+                    f.write(
+                        f"\t\t%sym_{sym_idx + 1} = arith.constant {value} : index\n"
+                    )
+            elif (
+                sk is not None
+                and sk.is_derived_symbolic
+                and sk.per_element_stride > 0
+            ):
+                # Per-core symbolic address, workaround form (no divide):
+                #   addr = base + P * (core_idx * per_element_stride)
+                # P = ceil(S/split) is a runtime bundle input (%P_...); coeff is
+                # a compile-time constant. Resolve the base like the is_derived
+                # arm above.
+                base_sym_idx = sk.base_sym_idx
+                if base_sym_idx in sym_canonical:
+                    base_ssa = sym_canonical[base_sym_idx]
+                elif base_sym_idx in kernel_arg_sym_indices:
+                    base_ssa = f"%arg_{symbol_kinds[base_sym_idx].arg_index}"
+                elif base_sym_idx in kernel_dup_canonical:
+                    canon = kernel_dup_canonical[base_sym_idx]
+                    ai = kernel_sym_to_arg_idx.get(
+                        canon, symbol_kinds[base_sym_idx].arg_index
+                    )
+                    base_ssa = f"%arg_{ai}"
+                else:
+                    base_ssa = None
+                p_ssa = percore_count_name.get((sk.pytorch_sym, sk.split_count))
+                if base_ssa is not None and p_ssa is not None:
+                    coeff = sk.core_idx * sk.per_element_stride
+                    coeff_ssa = f"%symcoeff_{sym_idx + 1}"
+                    off_ssa = f"%symoff_{sym_idx + 1}"
+                    addr_ssa = f"%symcore_{sym_idx + 1}"
+                    f.write(f"\t\t{coeff_ssa} = arith.constant {coeff} : index\n")
+                    f.write(
+                        f"\t\t{off_ssa} = arith.muli"
+                        f" {p_ssa}, {coeff_ssa} : index\n"
+                    )
+                    f.write(
+                        f"\t\t{addr_ssa} = arith.addi"
+                        f" {base_ssa}, {off_ssa} : index\n"
+                    )
+                    sym_canonical[sym_idx] = addr_ssa
+                else:
+                    # base or P unresolved: keep the bare-constant address.
                     f.write(
                         f"\t\t%sym_{sym_idx + 1} = arith.constant {value} : index\n"
                     )
