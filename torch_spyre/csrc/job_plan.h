@@ -19,7 +19,9 @@
 #include <sys/mman.h>
 #include <torch/types.h>
 
+#include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <flex/flex.hpp>
 #include <iostream>
 #include <memory>
@@ -35,6 +37,29 @@ namespace spyre {
 // Forward declaration: JobPlanStep::construct() submits through SpyreStream
 // rather than the raw flex::RuntimeStream handle.
 class SpyreStream;
+
+// -------------------------------------------------------------------------
+// Perf tracing (opt-in via SPYRE_PERF_TRACE). Lightweight steady_clock probes
+// on the dispatch path so we can see WHERE symbolic-shape dispatch spends its
+// time: the host-side program correction (synchronous, on the critical path)
+// versus the async device launches and pipeline barriers that only drain later
+// at synchronize(). Off unless SPYRE_PERF_TRACE is set to a non-empty, non-"0"
+// value. Emits to std::cerr with a "[SPYRE_PERF]" prefix so it is greppable and
+// does not interleave with the benchmark's stdout.
+// -------------------------------------------------------------------------
+inline bool perfTraceOn() {
+  static const bool on = []() {
+    const char* e = std::getenv("SPYRE_PERF_TRACE");
+    return e != nullptr && e[0] != '\0' && e[0] != '0';
+  }();
+  return on;
+}
+
+inline double perfUsSince(std::chrono::steady_clock::time_point t0) {
+  return std::chrono::duration<double, std::micro>(
+             std::chrono::steady_clock::now() - t0)
+      .count();
+}
 
 /**
  * @brief RAII wrapper for page-aligned and pinned host memory
@@ -234,6 +259,13 @@ class JobPlanStep {
   virtual void write(std::ostream& os) const = 0;
 
   /**
+   * @brief Short step-kind label, used only by SPYRE_PERF_TRACE output.
+   */
+  virtual const char* kind() const {
+    return "Step";
+  }
+
+  /**
    * @brief Enable or disable pipeline barrier for this step
    *
    * Pipeline barriers control operation ordering within a stream. When enabled,
@@ -299,6 +331,10 @@ class JobPlanStepH2D final : public JobPlanStep {
 
   void construct(LaunchContext& ctx, const SpyreStream& stream) const override;
 
+  const char* kind() const override {
+    return "H2D";
+  }
+
   void write(std::ostream& os) const override;
 
  private:
@@ -347,6 +383,10 @@ class JobPlanStepD2H final : public JobPlanStep {
 
   void construct(LaunchContext& ctx, const SpyreStream& stream) const override;
 
+  const char* kind() const override {
+    return "D2H";
+  }
+
   void write(std::ostream& os) const override;
 
  private:
@@ -389,6 +429,10 @@ class JobPlanStepCompute final : public JobPlanStep {
         name_(std::move(name)) {}
 
   void construct(LaunchContext& ctx, const SpyreStream& stream) const override;
+
+  const char* kind() const override {
+    return "Compute";
+  }
 
   void write(std::ostream& os) const override;
 
@@ -452,6 +496,10 @@ class JobPlanStepHostCompute final : public JobPlanStep {
   }
 
   void construct(LaunchContext& ctx, const SpyreStream& stream) const override;
+
+  const char* kind() const override {
+    return "HostCompute";
+  }
 
   void write(std::ostream& os) const override;
 

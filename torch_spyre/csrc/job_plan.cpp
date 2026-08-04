@@ -168,6 +168,8 @@ void JobPlanStepHostCompute::construct(LaunchContext& ctx,
   // input_buffer_ so a real Case-1 pinned-buffer correction is never overridden
   // (the symbolic per-core correction always has input_buffer_ == nullptr).
   if (!symbolic_inputs_.empty() && input_buffer_ == nullptr) {
+    const bool trace = perfTraceOn();
+    const auto build_t0 = std::chrono::steady_clock::now();
     std::vector<int64_t> addresses;
     addresses.reserve(ctx.inputs_outputs.size() + symbolic_inputs_.size());
     auto& allocator = SpyreAllocator::instance();
@@ -199,8 +201,18 @@ void JobPlanStepHostCompute::construct(LaunchContext& ctx,
         addresses.push_back(s_val);  // the symbolic dim value S
       }
     }
-    launch_host_callback([this, addresses](void*) {
+    if (trace) {
+      std::cerr << "[SPYRE_PERF] hostcompute.symbolic addr_build="
+                << perfUsSince(build_t0) << "us S=" << s_val
+                << " n_addr=" << addresses.size() << "\n";
+    }
+    launch_host_callback([this, addresses, trace](void*) {
+      const auto corr_t0 = std::chrono::steady_clock::now();
       deeptools::processComputeOnHostCommand(*hcm_, output_buffer_, &addresses);
+      if (trace) {
+        std::cerr << "[SPYRE_PERF] hostcompute.symbolic correction_callback="
+                  << perfUsSince(corr_t0) << "us\n";
+      }
     });
     return;
   }
