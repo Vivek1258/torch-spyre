@@ -1,16 +1,14 @@
 # Symbolic Shapes: High-Level Design
 
 **Status:** draft for review
-**Owner:** torch-spyre compiler team
+
 **Epic:** [#43](https://github.com/torch-spyre/torch-spyre/issues/43)
 
 ## 1. Purpose, scope and terms
 
 ### 1.1 What this document decides
 
-How torch-spyre compiles a model once and runs it at many input sizes, without a recompile per size and without paying the host program correction cost at dispatch.
-
-In scope: the Inductor front-end path, from the FX graph down to the SDSC and the bundle. Out of scope, and owned elsewhere: HBM allocation for dynamic tensors, the runtime dispatch and launch path, and the backend device loop. Those are dependencies and are listed in Section 14.
+How torch-spyre compiles a model once and runs it at many input sizes without recompiling for each size. 
 
 ### 1.2 Terms
 
@@ -152,9 +150,7 @@ Most coverage questions are the same question in different words. A runtime vary
 | Innermost stick dimension | the dimension measured in sticks | **deferred, not ruled out** | see below |
 | Address or stride component | the value participates in computing where data sits | **ruled out by cost** | see below |
 
-### 5.1 The stick dimension is deferred, not impossible
-
-"Forbidden" is the wrong word here, and it is worth being precise about why.
+### 5.1 The stick dimension 
 
 With an explicit loop, the varying axis is tiled before anything downstream sees it, so inside the loop body that axis has the fixed extent G. The question is therefore not whether a symbolic dimension can be innermost. It is whether a G-wide tile of the innermost axis lands on stick boundaries. It does, as long as G is a multiple of the elements per stick for the dtype, which is 64 at fp16. That is an alignment condition on the granularity, nothing more.
 
@@ -164,7 +160,7 @@ One thing to be careful about when reading the current tree. There are guards to
 
 So the stick axis is out of Phase 1 because our usecases mark the outer axis, not because anything below us refuses it.
 
-### 5.2 Symbolic addresses are possible and we are still not doing it
+### 5.2 Symbolic addresses 
 
 The backend does support symbolic addresses. There is an agreed interface for it, and the earlier design went that way, ref [#2289](https://github.com/torch-spyre/torch-spyre/issues/2289). The front end would emit either per-core symbolic start addresses or one base symbol plus formulas for the backend to evaluate.
 
@@ -614,7 +610,7 @@ The divisibility check has to be ours in any case. A size can sit inside the dec
 
 For a graceful stop the public API is the compiler stance that fails on recompile. The stance that falls back to eager must never be used, because eager on this device means off the device path, a silent performance collapse rather than an error. Ticket ref [#4384](https://github.com/torch-spyre/torch-spyre/issues/4384), replacing the raw ConstraintViolationError of [#3005](https://github.com/torch-spyre/torch-spyre/issues/3005).
 
-## 12. Optimisations, deliberately deferred
+## 12. Optimisations [ In scope after functional enablement ] 
 
 None of these are needed for the feature to work. They are listed so the first release is not accidentally scoped to include them, and so the follow-on work is visible.
 
