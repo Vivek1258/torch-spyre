@@ -128,6 +128,7 @@ class _CondInnerFnRecorder(DefaultHandler):
     def __init__(self) -> None:
         self.loads: list[tuple[str, Any]] = []
         self.constants: list[Any] = []
+        self.index_exprs: list[Any] = []
         self.compare_ops: list[str] = []
 
     def _default(self, name: str, args: tuple[Any, ...], kwargs: dict[str, Any]) -> Any:
@@ -137,6 +138,13 @@ class _CondInnerFnRecorder(DefaultHandler):
         if name == "constant":
             self.constants.append(args[0])
             return f"__constant_{len(self.constants) - 1}__"
+        # A concrete trip count reaches the cond graph as ops.constant; a
+        # symbolic one reaches it as ops.index_expr carrying the sympy
+        # expression. Recording both is what lets a marked dynamic dimension
+        # produce a loop bound instead of declining here.
+        if name == "index_expr":
+            self.index_exprs.append(args[0])
+            return f"__index_expr_{len(self.index_exprs) - 1}__"
         if name in ("lt", "le", "gt", "ge", "eq", "ne"):
             self.compare_ops.append(name)
             return f"__cmp_{name}__"
@@ -213,7 +221,14 @@ def _extract_trip_count(cond_graph) -> sympy.Expr | None:
 
     if recorder.compare_ops != ["lt"]:
         return None
-    if len(recorder.loads) != 1 or len(recorder.constants) != 1:
+    if len(recorder.loads) != 1:
+        return None
+
+    # Exactly one bound, reached either as a constant (concrete trip count) or
+    # as an index_expr (symbolic trip count from a marked dynamic dimension).
+    # Seeing both, or neither, means this is not the shape we recognize.
+    bounds = [*recorder.constants, *recorder.index_exprs]
+    if len(bounds) != 1:
         return None
 
     (loaded_name, loaded_index) = recorder.loads[0]
@@ -222,7 +237,7 @@ def _extract_trip_count(cond_graph) -> sympy.Expr | None:
     if loaded_index != 0:
         return None
 
-    bound = recorder.constants[0]
+    bound = bounds[0]
     if isinstance(bound, bool):
         return None
     if not isinstance(bound, (int, sympy.Expr)):

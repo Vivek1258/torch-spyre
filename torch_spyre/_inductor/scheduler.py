@@ -36,7 +36,7 @@ from torch.utils._ordered_set import OrderedSet
 
 from .spyre_kernel import SpyreKernel
 from .ir import FixedTiledLayout
-from .pass_utils import iteration_space
+from .pass_utils import iteration_space, symbolic_count_bounds
 from .logging_utils import get_inductor_logger
 from .scratchpad.lx_relayout import (
     demote_lx_relayout_group,
@@ -727,7 +727,23 @@ class SuperDSCScheduling(BaseScheduling):
         # Wrap only the newly-added op_specs entries in this inner LoopSpec.
         body = kernel.op_specs[body_start:]
         kernel.op_specs = kernel.op_specs[:body_start]
-        kernel.op_specs.append(LoopSpec(count=node.loop_count, body=body))
+        # Resolve the count's symbol bounds here, while ShapeEnv is available,
+        # and carry them on the LoopSpec. The bundle needs granularity and max
+        # to declare the input_arg, and cannot recompute them later.
+        count_bounds = symbolic_count_bounds(node.loop_count)
+        if count_bounds:
+            logger.info(
+                "[symbolic-loop] nested LoopSpec count=%s bounds=%s",
+                node.loop_count,
+                count_bounds,
+            )
+        kernel.op_specs.append(
+            LoopSpec(
+                count=node.loop_count,
+                body=body,
+                count_symbol_bounds=count_bounds,
+            )
+        )
 
     def _codegen_into_kernel(
         self, nodes: list[BaseSchedulerNode], kernel: SpyreKernel

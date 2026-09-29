@@ -72,6 +72,7 @@ from .pass_utils import (
     is_restickify_coords,
     alignment_coordinates,
     per_trip_index,
+    symbolic_count_bounds,
 )
 from .views import align_tensors, tiling_expr_to_device_expr
 from .logging_utils import get_inductor_logger
@@ -1372,7 +1373,19 @@ class SpyreKernel(Kernel[CSEVariable]):
     def wrap_op_specs_in_loop(self, count: sympy.Expr) -> None:
         """Replace the current op_specs list with a single LoopSpec of the given count."""
         body = self.op_specs
-        self.op_specs = [LoopSpec(count=count, body=body)]
+        # A symbolic count needs its symbols' (max, granularity) captured now,
+        # while ShapeEnv is still reachable; the bundle declares one input_arg
+        # per symbol from these and derives the loop bound from it.
+        count_bounds = symbolic_count_bounds(count)
+        if count_bounds:
+            logger.info(
+                "[symbolic-loop] outer LoopSpec count=%s bounds=%s",
+                count,
+                count_bounds,
+            )
+        self.op_specs = [
+            LoopSpec(count=count, body=body, count_symbol_bounds=count_bounds)
+        ]
 
     def check_op_specs(self) -> None:
         """Validate and log the finished operation sequence after loop wrapping."""

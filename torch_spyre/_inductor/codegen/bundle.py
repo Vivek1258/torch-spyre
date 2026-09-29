@@ -167,6 +167,34 @@ def generate_bundle(
     loop_bounds: list[sympy.Expr] = []
     _collect_loop_bounds(specs_list, loop_bounds)
 
+    # Varying dimensions that drive a symbolic loop bound.
+    #
+    # These are deliberately kept OUT of the SDSC symbol table. On this route
+    # the loop is explicit and the SDSC describes one static tile, so the tile
+    # has no symbolic dim and nothing belongs in its dimToSymbolMapping_. The
+    # dimension exists only at the bundle level: one input_arg parameter, one
+    # extract, and the loop bound derived from it. That also keeps the existing
+    # symbol_kinds / symbol_values correspondence untouched.
+    loop_dim_bounds = _symbolic_count_bounds_in_specs(specs_list)
+    # symbol name -> the SSA value its input_arg extracts to.
+    loop_dim_ssa: dict[str, str] = {
+        sym_name: f"%dim_{sym_name}" for sym_name in loop_dim_bounds
+    }
+    if loop_dim_bounds:
+        logger.info(
+            "[symbolic-loop] bundle has %d symbolic loop bound(s); "
+            "dimension params=%s bounds=%s",
+            sum(1 for b in loop_bounds if getattr(b, "free_symbols", None)),
+            loop_dim_ssa,
+            loop_dim_bounds,
+        )
+    else:
+        logger.debug(
+            "[symbolic-loop] no symbolic loop bounds in this kernel "
+            "(loop_bounds=%s)",
+            loop_bounds,
+        )
+
     # Affine map deduplication: stride_key -> map index (0-based).
     # A stride_key is a tuple of stride values in outermost-first level order.
     # Strides from each level are appended in level order; within a level, in
@@ -278,7 +306,12 @@ def generate_bundle(
         # Built in lock-step with the params list so the two can never diverge.
         # Order: pool (when frontend_pool_allocation), kernel addresses, dimensions.
         param_symbol_kinds: list[SymbolKind] = []
-        if emit_pool_param or kernel_arg_sym_indices or dimension_sym_indices:
+        if (
+            emit_pool_param
+            or kernel_arg_sym_indices
+            or dimension_sym_indices
+            or loop_dim_bounds
+        ):
             params = []
             if emit_pool_param:
                 params.append("%pool_base_addr: !sdscbundle.input_arg<index>")
@@ -293,6 +326,19 @@ def generate_bundle(
                     f"{dim_param_names[sym_idx]}_base: {_dim_input_arg_type(dim_sk)}"
                 )
                 param_symbol_kinds.append(symbol_kinds[sym_idx])
+            # Loop-bound dimensions, emitted last so the positional order of
+            # every existing parameter is unchanged.
+            #
+            # NOTE: no entry is appended to param_symbol_kinds for these. That
+            # list mirrors the SDSC symbol table, and these dimensions are
+            # deliberately not in it (see loop_dim_bounds above). If the runtime
+            # later derives its argument list from param_symbol_kinds rather
+            # than from the parameter list, this is the first place to look.
+            for sym_name, (max_value, granularity) in loop_dim_bounds.items():
+                params.append(
+                    f"{loop_dim_ssa[sym_name]}_base: !sdscbundle.input_arg"
+                    f"<index, granularity={granularity}, max_value={max_value}>"
+                )
             f.write(f"\tfunc.func @sdsc_bundle({', '.join(params)}) {{\n")
         else:
             f.write("\tfunc.func @sdsc_bundle() {\n")
@@ -327,12 +373,33 @@ def generate_bundle(
                 f" {name}_base : {_dim_input_arg_type(dim_sk)} -> index\n"
             )
 
+        # Loop-bound dimension extracts, emitted before the loop constants so
+        # their SSA values are in scope where %loop_bound_N is derived.
+        for sym_name, (max_value, granularity) in loop_dim_bounds.items():
+            ssa = loop_dim_ssa[sym_name]
+            f.write(
+                f"\t\t{ssa} = sdscbundle.input_arg_extract value from"
+                f" {ssa}_base : !sdscbundle.input_arg"
+                f"<index, granularity={granularity}, max_value={max_value}>"
+                " -> index\n"
+            )
+
         # Standard loop constants (only emitted when there are loops).
         if loop_bounds:
             f.write("\t\t%c0 = arith.constant 0 : index\n")
             f.write("\t\t%c1 = arith.constant 1 : index\n")
             for lb_idx, lb in enumerate(loop_bounds):
-                f.write(f"\t\t%loop_bound_{lb_idx} = {_mlir_count_value(lb)}\n")
+                lines = _mlir_count_lines(lb, lb_idx, loop_dim_ssa)
+                for line in lines:
+                    f.write(f"\t\t{line}\n")
+                logger.info(
+                    "[symbolic-loop] loop_bound_%d from count=%s (symbolic=%s) "
+                    "emitted as: %s",
+                    lb_idx,
+                    lb,
+                    bool(getattr(lb, "free_symbols", None)),
+                    " ; ".join(lines),
+                )
 
         # Emit one declaration per symbol:
         #   - "kernel"          → skipped; already a function param + extract op above
@@ -589,6 +656,43 @@ def _collect_loop_bounds(specs: list, bounds: list) -> None:
             _collect_loop_bounds(entry.body, bounds)
 
 
+def _collect_loop_specs(specs: list, out: list) -> None:
+    """Collect LoopSpec objects in the SAME order as ``_collect_loop_bounds``.
+
+    The two walks must stay in lockstep: ``out[i]`` is the LoopSpec whose count
+    is ``bounds[i]``, and therefore the LoopSpec carrying the symbol bounds that
+    ``%loop_bound_i`` is emitted from.
+    """
+    for entry in specs:
+        if isinstance(entry, LoopSpec):
+            out.append(entry)
+            _collect_loop_specs(entry.body, out)
+
+
+def _symbolic_count_bounds_in_specs(specs: list) -> "dict[str, tuple[int, int]]":
+    """Union of every LoopSpec's ``count_symbol_bounds`` in the spec tree.
+
+    One entry per varying dimension that has to become a bundle parameter.
+    Conflicting bounds for the same symbol mean two loops disagree about the
+    same dimension, which would emit one parameter that is wrong for one of
+    them, so it raises rather than silently picking one.
+    """
+    merged: dict[str, tuple[int, int]] = {}
+    loops: list = []
+    _collect_loop_specs(specs, loops)
+    for loop in loops:
+        for sym_name, bound in getattr(loop, "count_symbol_bounds", {}).items():
+            existing = merged.get(sym_name)
+            if existing is not None and existing != bound:
+                raise RuntimeError(
+                    f"symbolic loop bound conflict for {sym_name}: "
+                    f"{existing} vs {bound}. Two loops in one kernel disagree "
+                    f"about the same dimension's granularity/max."
+                )
+            merged[sym_name] = bound
+    return merged
+
+
 # ---------------------------------------------------------------------------
 # Affine map deduplication
 # ---------------------------------------------------------------------------
@@ -666,6 +770,96 @@ def _mlir_count_value(count: sympy.Expr) -> str:
     raise NotImplementedError(
         f"Symbolic loop counts are not yet supported in bundle.mlir generation: {count}"
     )
+
+
+def _decompose_symbolic_count(count: sympy.Expr):
+    """Split a symbolic trip count into ``(symbol_name, divisor)``.
+
+    A tiled loop's trip count is the varying dimension divided by the tile size,
+    which Inductor represents as ``FloorDiv(S, G)``. We emit ``ceildivsi`` from
+    the same two pieces, so the device derives the count from the dimension
+    rather than the host precomputing it. A bare ``S`` (tile size 1) gives a
+    divisor of 1.
+
+    Args:
+        count: A trip count with free symbols.
+
+    Returns:
+        ``(symbol_name, divisor)``, or ``None`` when the expression is not a
+        shape this function recognizes. Callers must treat ``None`` as "cannot
+        emit", never as "emit something plausible".
+    """
+    from torch.utils._sympy.functions import FloorDiv
+
+    if isinstance(count, sympy.Symbol):
+        return (str(count), 1)
+
+    if isinstance(count, FloorDiv):
+        numerator, denominator = count.args
+        if isinstance(numerator, sympy.Symbol) and denominator.is_Integer:
+            return (str(numerator), int(denominator))
+
+    return None
+
+
+def _mlir_count_lines(
+    count: sympy.Expr,
+    lb_idx: int,
+    loop_dim_ssa: "dict[str, str]",
+) -> "list[str]":
+    """MLIR lines defining ``%loop_bound_{lb_idx}``.
+
+    A concrete count is a constant, exactly as before. A symbolic count becomes
+    ``ceildivsi`` over the dimension's own input_arg, which is the whole point of
+    this path: one binary serves the declared range and the device derives the
+    trip count, instead of the host baking one binary per count.
+
+    Args:
+        count: The loop's trip count.
+        lb_idx: Index used to name ``%loop_bound_{lb_idx}``.
+        loop_dim_ssa: Symbol name to the SSA value its input_arg extracted to.
+
+    Returns:
+        The lines to emit, in order.
+
+    Raises:
+        NotImplementedError: The count is symbolic but not a shape this emitter
+            recognizes, or names a symbol with no input_arg.
+    """
+    if isinstance(count, (sympy.Integer, int)):
+        return [f"%loop_bound_{lb_idx} = arith.constant {int(count)} : index"]
+
+    decomposed = _decompose_symbolic_count(count)
+    if decomposed is None:
+        raise NotImplementedError(
+            f"symbolic loop count {count!r} (type {type(count).__name__}, "
+            f"free_symbols={sorted(map(str, getattr(count, 'free_symbols', [])))}) "
+            "is not a recognized trip-count shape. Expected FloorDiv(symbol, "
+            "integer) or a bare symbol. Extend _decompose_symbolic_count if this "
+            "shape is legitimate."
+        )
+
+    sym_name, divisor = decomposed
+    if sym_name not in loop_dim_ssa:
+        raise NotImplementedError(
+            f"symbolic loop count {count} references {sym_name}, which has no "
+            f"input_arg parameter. Known dimension params: {sorted(loop_dim_ssa)}. "
+            "This means LoopSpec.count_symbol_bounds did not carry bounds for "
+            "that symbol, so scheduler/spyre_kernel is where to look."
+        )
+
+    dim_ssa = loop_dim_ssa[sym_name]
+    if divisor == 1:
+        # Trip count is the dimension itself. MLIR has no value aliasing, so
+        # bind it through an add of zero rather than referencing %dim_* directly
+        # at the scf.for, which would fork the loop-emission path.
+        return [
+            f"%loop_bound_{lb_idx} = arith.addi {dim_ssa}, %c0 : index",
+        ]
+    return [
+        f"%tile_{lb_idx} = arith.constant {divisor} : index",
+        f"%loop_bound_{lb_idx} = arith.ceildivsi {dim_ssa}, %tile_{lb_idx} : index",
+    ]
 
 
 def _dim_input_arg_type(dim_sk: SymbolKind) -> str:

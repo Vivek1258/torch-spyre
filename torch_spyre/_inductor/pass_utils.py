@@ -520,6 +520,53 @@ def compute_symbolic_bounds(expr: Union[Expr, int]) -> "tuple[int, int] | None":
     return (max_size, granularity)
 
 
+def symbolic_count_bounds(count: Union[Expr, int]) -> "dict[str, tuple[int, int]]":
+    """Return ``{symbol_name: (max_value, granularity)}`` for a loop trip count.
+
+    A symbolic trip count is the only way the varying dimension reaches the
+    device: the bundle turns each entry here into one
+    ``!sdscbundle.input_arg<index, granularity=G, max_value=M>`` parameter and
+    derives the loop bound from it. The bounds are resolved HERE, while ShapeEnv
+    is still available, and then carried on ``LoopSpec.count_symbol_bounds``,
+    because codegen also has to work during the reload phase when ShapeEnv is
+    gone (the same reason ``superdsc._resolve_sdsc_size`` reads carried ints).
+
+    Args:
+        count: The loop's trip count, concrete or symbolic.
+
+    Returns:
+        One entry per free symbol in ``count``. Empty for a concrete count, and
+        empty for any symbol whose bounds cannot be resolved, which the caller
+        should treat as "not eligible for a symbolic loop".
+    """
+    if not (hasattr(count, "free_symbols") and count.free_symbols):
+        return {}
+
+    bounds: dict[str, tuple[int, int]] = {}
+    for sym in sorted(count.free_symbols, key=str):
+        resolved = compute_symbolic_bounds(sym)
+        if resolved is None:
+            # Logged rather than raised: the caller decides whether a count it
+            # cannot bound is a hard error or a reason to stay concrete.
+            logger.warning(
+                "[symbolic-loop] count=%s symbol=%s has no resolvable bounds "
+                "(no finite ShapeEnv max, or no ShapeEnv). This symbol will not "
+                "become a bundle input_arg.",
+                count,
+                sym,
+            )
+            continue
+        bounds[str(sym)] = resolved
+        logger.info(
+            "[symbolic-loop] count=%s symbol=%s max=%d granularity=%d",
+            count,
+            sym,
+            resolved[0],
+            resolved[1],
+        )
+    return bounds
+
+
 def get_mem_deps_from_rw(read_writes: ReadWrites) -> list[SchedNodeArg]:
     res: list[SchedNodeArg] = []
     for arg in read_writes.reads:

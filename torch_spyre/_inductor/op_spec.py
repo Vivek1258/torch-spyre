@@ -421,12 +421,33 @@ class LoopSpec:
     contains it.  The unroller reads these per-op symbols rather than a shared
     list, so ops with different iteration-space layouts in the same loop are
     each advanced by the correct stride.
+
+    Attributes (symbolic loop support):
+        count_symbol_bounds: For a symbolic ``count``, the ``(max_value,
+            granularity)`` of every free symbol it mentions, keyed by symbol
+            name. Empty for a concrete count.
+
+            These are CARRIED rather than recomputed because the bundle needs
+            them after ShapeEnv is gone. ``superdsc._resolve_sdsc_size`` makes
+            the same point about its own bounds: they are serialized as plain
+            ints into the generated file so the reload phase still works.
+
+            The bundle turns each entry into one
+            ``!sdscbundle.input_arg<index, granularity=G, max_value=M>``
+            parameter, which is the only place the varying dimension enters the
+            program. Nothing that sizes a buffer or computes an address may read
+            ``count``; those all plan from the concrete maximum.
     """
 
     count: Expr
     # list[OpSpec | UnimplementedOp | LoopSpec], typed as Any to accommodate
     # the two distinct UnimplementedOp types (op_spec vs spyre_kernel).
     body: list[Any]
+    # symbol name -> (max_value, granularity); same shape as
+    # OpSpec.symbolic_dim_bounds so the two can be read by common code.
+    count_symbol_bounds: dict[str, tuple[int, int]] = dataclasses.field(
+        default_factory=dict
+    )
 
 
 def spyre_constant_tensor(const_val, device, dtype=torch.float16):
