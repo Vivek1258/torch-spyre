@@ -126,6 +126,12 @@ def _abs_tiled_fn(a, tile_size):
     """
     from torch_spyre._inductor.wsr.for_each_tile import for_each_tile
 
+    # NOTE: a torch._check here does NOT help, which was measured, not assumed.
+    # The bad tile extent is created by the view inside for_each_tile's own
+    # _xs_leaf, during scan's re-trace, which a guard added in this frame does
+    # not reach. The assertion has to live at the view itself, so it is in
+    # _xs_leaf now. Left as a comment so nobody re-tries it from here.
+
     def body(_, ops):
         (a_tile,) = ops
         return None, a_tile.abs()
