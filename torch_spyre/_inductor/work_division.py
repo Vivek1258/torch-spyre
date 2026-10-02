@@ -99,6 +99,32 @@ class TensorDep:
 SymbolMeta = dict[Symbol, tuple[int, int]]
 
 
+def _provably_constant_extent(expr: Expr) -> "int | None":
+    """Return the integer ``expr`` is provably equal to, or None.
+
+    Guesses a candidate from the size hint and then PROVES it with
+    ``statically_known_equals``. The proof is what matters: an expression whose
+    value merely happens to match the hint is rejected, so a varying extent can
+    never be mistaken for a constant one.
+
+    Exists because a derived extent such as ``S // (S // G)`` carries free
+    symbols while being mathematically fixed at ``G``.
+    """
+    from torch._inductor.virtualized import V
+
+    try:
+        sizevars = V.graph.sizevars
+        candidate = int(sizevars.size_hint(expr))
+    except Exception:  # noqa: BLE001 - no hint, no ShapeEnv, not concretizable
+        return None
+    try:
+        if sizevars.statically_known_equals(expr, candidate):
+            return candidate
+    except Exception:  # noqa: BLE001 - prover declined, treat as symbolic
+        return None
+    return None
+
+
 def _collect_symbol_metadata(it_space: dict[Symbol, Expr]) -> SymbolMeta:
     """Build ``{symbol: (max_size, granularity)}`` for opted-in symbolic dims.
 
@@ -127,6 +153,32 @@ def _collect_symbol_metadata(it_space: dict[Symbol, Expr]) -> SymbolMeta:
             expr,
             sorted(map(str, expr.free_symbols)),
         )
+
+        # An extent that still mentions a symbol but is PROVABLY a constant is
+        # not a symbolic dimension, and must not be run through the granularity
+        # machinery.
+        #
+        # for_each_tile's xs reshape produces exactly this. Splitting a symbolic
+        # S into (S // G, G) asks a view to reconcile (S // G) * G with S, which
+        # it cannot prove, so it re-derives the tile extent as S // (S // G).
+        # That value is always exactly G, but sympy never simplifies it, and
+        # interval arithmetic over it gives [G // max_tiles, S_max]. The
+        # granularity code then reads that bogus lower bound as the user's
+        # mark_dynamic(min=...) -- which is how a declared min=64 is reported
+        # back as "mark_dynamic(min=8)".
+        #
+        # The hint is only used to pick a candidate; statically_known_equals is
+        # what decides, so a wrong hint can never silently concretize a genuinely
+        # varying extent.
+        constant = _provably_constant_extent(expr)
+        if constant is not None:
+            logger.info(
+                "[symbolic-loop][work_division] extent %s is PROVABLY %d; "
+                "treating as concrete, not a symbolic dim",
+                expr,
+                constant,
+            )
+            continue
         if finite_upper_or_none(expr) is None:
             logger.debug(
                 f"[work_division/symbolic] skipping auto-dynamic symbol "
