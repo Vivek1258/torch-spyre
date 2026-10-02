@@ -1321,24 +1321,43 @@ def splice_while_loop(
             "cannot reconcile."
         )
 
+    from torch._inductor.ir import ShapeAsConstantBuffer
+
     for i in range(len(carries), len(body_graph_input_names)):
         placeholder_name = body_graph_input_names[i]
         real_input = real_inputs[i]
-        if not hasattr(real_input, "get_name"):
-            # A SymInt operand, e.g. the varying dimension under a marked
-            # dynamic shape. There is no buffer behind it, so there is nothing
-            # for redirect_computed_buffer_reads to point at. Logged rather
-            # than passed over in silence, because a missing entry here shows
-            # up much later as a stale placeholder name.
+
+        # A SymInt operand, e.g. the varying dimension under a marked dynamic
+        # shape, arrives as ShapeAsConstantBuffer: a sympy expression, not a
+        # buffer. There is nothing for redirect_computed_buffer_reads to point
+        # at, so it is skipped.
+        #
+        # Tested by type and NOT by hasattr(real_input, "get_name"). That
+        # check looks right and is wrong: ShapeAsConstantBuffer inherits
+        # IRNode.get_name, which exists as an attribute and raises
+        # NotImplementedError only when called, so hasattr returns True and
+        # the skip never happens.
+        if isinstance(real_input, ShapeAsConstantBuffer):
             logger.info(
-                "[symbolic-loop] body placeholder %r at index %d is a "
-                "non-buffer operand (%r); no read redirection needed",
+                "[symbolic-loop] body placeholder %r at index %d is a shape "
+                "expression (%s), not a buffer; no read redirection needed",
                 placeholder_name,
                 i,
-                type(real_input).__name__,
+                real_input.expr,
             )
             continue
-        real_name = real_input.get_name()
+
+        try:
+            real_name = real_input.get_name()
+        except NotImplementedError as exc:
+            raise AssertionError(
+                f"while_loop body placeholder {placeholder_name!r} at index "
+                f"{i} maps to {type(real_input).__name__}, which has no buffer "
+                "name. Only ShapeAsConstantBuffer is expected to be nameless "
+                "here. If this type is legitimate, teach the skip above about "
+                "it rather than widening the except."
+            ) from exc
+
         name_map[placeholder_name] = real_name
         ref_map[placeholder_name] = real_input
 
