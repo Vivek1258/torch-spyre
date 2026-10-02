@@ -97,9 +97,7 @@ class TestDecomposeSymbolicCount(unittest.TestCase):
 
     def test_floordiv_symbol_by_integer(self):
         sym = sympy.Symbol(SYM_NAME, positive=True, integer=True)
-        self.assertEqual(
-            _decompose_symbolic_count(FloorDiv(sym, 64)), (SYM_NAME, 64)
-        )
+        self.assertEqual(_decompose_symbolic_count(FloorDiv(sym, 64)), (SYM_NAME, 64))
 
     def test_bare_symbol_is_divisor_one(self):
         sym = sympy.Symbol(SYM_NAME, positive=True, integer=True)
@@ -123,9 +121,7 @@ class TestMlirCountLines(unittest.TestCase):
 
     def test_symbolic_count_uses_ceildivsi(self):
         sym = sympy.Symbol(SYM_NAME, positive=True, integer=True)
-        lines = _mlir_count_lines(
-            FloorDiv(sym, GRANULARITY), 0, {SYM_NAME: "%dim_s0"}
-        )
+        lines = _mlir_count_lines(FloorDiv(sym, GRANULARITY), 0, {SYM_NAME: "%dim_s0"})
         self.assertEqual(
             lines,
             [
@@ -211,9 +207,7 @@ class TestSymbolicLoopBundle(InductorTestCase):
 
     def test_loop_uses_the_derived_bound(self):
         bundle = self._bundle_with_symbolic_loop()
-        self.assert_in_bundle(
-            "scf.for %i_0 = %c0 to %loop_bound_0 step %c1", bundle
-        )
+        self.assert_in_bundle("scf.for %i_0 = %c0 to %loop_bound_0 step %c1", bundle)
 
     def test_execute_node_carries_no_symbols(self):
         """symbol_ids must stay empty or every dispatch pays program correction.
@@ -232,6 +226,92 @@ class TestSymbolicLoopBundle(InductorTestCase):
         self.assert_in_bundle("%loop_bound_0 = arith.constant 4 : index", bundle)
         self.assertNotIn("ceildivsi", bundle)
         self.assertNotIn("input_arg<index, granularity=", bundle)
+
+
+class TestLoopSpecPlumbing(unittest.TestCase):
+    """The three places a new LoopSpec field has to be taught about.
+
+    Every one of these is a real failure this POC shipped with. The bundle
+    tests above all passed while a real compile could not get past the first
+    of them, because they call generate_bundle directly and never go through
+    provenance or the reload path. That is the exact false-green shape the
+    design doc warns about, so these assert the plumbing rather than the
+    output.
+    """
+
+    def test_schema_validation_accepts_the_new_field(self):
+        """_validate_finalized_schema rejects any LoopSpec field it does not know.
+
+        Without the matching _EXPECTED_LOOP_SPEC_SCHEMA entry this raises
+        TypeError on EVERY compile, symbolic or not, because provenance is
+        built for every kernel.
+        """
+        from torch_spyre._inductor.kernel_provenance import (
+            build_kernel_provenance_descriptor,
+        )
+
+        descriptor = build_kernel_provenance_descriptor([_symbolic_loop()])
+        self.assertTrue(descriptor.key)
+
+    def test_concrete_loop_key_is_unchanged_by_the_new_field(self):
+        """A concrete loop must hash exactly as before, or the cache is invalidated."""
+        from torch_spyre._inductor.kernel_provenance import _canonical_spec
+
+        canonical = _canonical_spec(LoopSpec(count=sympy.Integer(4), body=[_op_spec()]))
+        self.assertNotIn(
+            "count_symbol_bounds",
+            canonical,
+            msg=f"concrete loop canonical form grew a key: {canonical}",
+        )
+
+    def test_different_bounds_give_different_cache_keys(self):
+        """Same count, different declared max, different bundle. Must not share a key.
+
+        The bounds are not metadata: they become granularity= and max_value=
+        on the input_arg, so a shared key would hand back a bundle built for
+        the wrong maximum.
+        """
+        from torch_spyre._inductor.kernel_provenance import (
+            build_kernel_provenance_descriptor,
+        )
+
+        key_512 = build_kernel_provenance_descriptor(
+            [_symbolic_loop(bounds={SYM_NAME: (512, 64)})]
+        ).key
+        key_1024 = build_kernel_provenance_descriptor(
+            [_symbolic_loop(bounds={SYM_NAME: (1024, 64)})]
+        ).key
+        self.assertNotEqual(key_512, key_1024)
+
+    def test_generated_source_round_trips_the_bounds(self):
+        """The generated wrapper IS the reload path.
+
+        ShapeEnv is gone by then, so bounds that are not written into the
+        source cannot be recovered, and the bundle fails with "no input_arg
+        parameter" for a symbol it can see in the count.
+        """
+        from torch._inductor.utils import IndentedBuffer
+        from torch_spyre._inductor.spyre_kernel import _codegen_op_spec_list
+
+        buf = IndentedBuffer()
+        _codegen_op_spec_list([_symbolic_loop()], buf, str)
+        src = buf.getvalue()
+
+        self.assertIn("count_symbol_bounds=", src, msg=src)
+        self.assertIn(repr(SYM_NAME), src, msg=src)
+        self.assertIn(str(MAX_VALUE), src, msg=src)
+        self.assertIn(str(GRANULARITY), src, msg=src)
+
+    def test_generated_source_omits_the_field_for_a_concrete_loop(self):
+        """Keeps generated output byte-identical for every existing kernel."""
+        from torch._inductor.utils import IndentedBuffer
+        from torch_spyre._inductor.spyre_kernel import _codegen_op_spec_list
+
+        buf = IndentedBuffer()
+        _codegen_op_spec_list(
+            [LoopSpec(count=sympy.Integer(4), body=[_op_spec()])], buf, str
+        )
+        self.assertNotIn("count_symbol_bounds", buf.getvalue())
 
 
 if __name__ == "__main__":

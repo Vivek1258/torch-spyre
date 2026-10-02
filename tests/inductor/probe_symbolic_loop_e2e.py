@@ -52,6 +52,24 @@ def stage(n: int, what: str) -> None:
     print(f"\n{BANNER}\nSTAGE {n}: {what}\n{BANNER}", flush=True)
 
 
+def _source_name(src) -> str:
+    """Name of a ShapeEnv source, whichever shape ``.name`` takes.
+
+    It is a method on older PyTorch and a plain str property on 2.13, and
+    calling the str is a TypeError that aborts the whole probe. A diagnostic
+    script must never be the thing that fails.
+    """
+    name = getattr(src, "name", None)
+    if callable(name):
+        try:
+            return str(name())
+        except Exception as exc:  # noqa: BLE001 - diagnostic only
+            return f"<name() raised {exc!r}>"
+    if name is not None:
+        return str(name)
+    return repr(src)
+
+
 def stage_1_symbol_and_range():
     """What Dynamo records for the marked dimension."""
     stage(1, "Dynamo symbol and range")
@@ -68,7 +86,7 @@ def stage_1_symbol_and_range():
         for sym, srcs in shape_env.var_to_sources.items():
             vr = shape_env.var_to_range.get(sym)
             print(
-                f"  symbol={sym}  sources={[s.name() for s in srcs]}  "
+                f"  symbol={sym}  sources={[_source_name(s) for s in srcs]}  "
                 f"range=[{getattr(vr, 'lower', '?')}, {getattr(vr, 'upper', '?')}]"
             )
             captured[str(sym)] = vr
@@ -195,9 +213,15 @@ def stage_4_find_bundles():
 def main() -> int:
     print(f"python  : {sys.version.split()[0]}")
     print(f"torch   : {torch.__version__}")
-    stage_1_symbol_and_range()
-    stage_2_and_3_specs()
-    stage_4_find_bundles()
+    # Each stage is isolated: an early stage blowing up must not hide the
+    # later ones, because the later ones are the interesting part. A probe
+    # that stops at the first traceback costs a whole round trip to the pod.
+    for fn in (stage_1_symbol_and_range, stage_2_and_3_specs, stage_4_find_bundles):
+        try:
+            fn()
+        except Exception:
+            print(f"\n  STAGE FUNCTION {fn.__name__} RAISED, continuing anyway:")
+            traceback.print_exc()
     print(f"\n{BANNER}\nProbe finished. Send this entire output back.\n{BANNER}")
     return 0
 

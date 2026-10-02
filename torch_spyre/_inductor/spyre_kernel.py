@@ -1591,6 +1591,16 @@ def _codegen_op_spec_list(specs, buf: IndentedBuffer, sympy_str) -> None:
             buf.writeline("LoopSpec(")
             with buf.indent():
                 buf.writeline(f"count={sympy_str(op_spec.count)},")
+                # POC (symbolic loop): this generated source IS the reload
+                # path. The bounds were resolved from ShapeEnv during the
+                # first compile and cannot be recomputed here, so dropping
+                # them makes a reloaded symbolic kernel fail in the bundle
+                # with "no input_arg parameter". Emitted as a plain literal
+                # because the values are ints by construction.
+                if op_spec.count_symbol_bounds:
+                    buf.writeline(
+                        f"count_symbol_bounds={op_spec.count_symbol_bounds!r},"
+                    )
                 buf.writeline("body=[")
                 with buf.indent():
                     _codegen_op_spec_list(op_spec.body, buf, sympy_str)

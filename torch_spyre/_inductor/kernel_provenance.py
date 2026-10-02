@@ -94,6 +94,10 @@ _EXPECTED_TENSOR_WORK_DIVISION_SCHEMA = {
 _EXPECTED_LOOP_SPEC_SCHEMA = {
     "count": "Expr",
     "body": "list[Any]",
+    # POC (symbolic loop): carried (max_value, granularity) per free symbol of
+    # a symbolic count. _validate_finalized_schema rejects any LoopSpec field
+    # it does not know about, so this entry is not optional.
+    "count_symbol_bounds": "dict[str, tuple[int, int]]",
 }
 
 
@@ -285,11 +289,22 @@ def _canonical_spec(spec: object) -> object:
             )
         return result
     if isinstance(spec, LoopSpec):
-        return {
+        result = {
             "kind": "loop",
             "count": _canonical_value(spec.count),
             "body": [_canonical_spec(child) for child in spec.body],
         }
+        # POC (symbolic loop): the bounds are part of the artifact, not just
+        # metadata -- they become granularity= and max_value= on the bundle's
+        # input_arg. Two kernels with the same symbolic count but different
+        # declared maxima emit different bundles, so they must not share a
+        # cache entry.
+        #
+        # Added only when non-empty, so every concrete kernel keeps the exact
+        # key it has today and the existing cache stays valid.
+        if spec.count_symbol_bounds:
+            result["count_symbol_bounds"] = _canonical_value(spec.count_symbol_bounds)
+        return result
     raise TypeError(f"Unsupported finalized kernel spec: {type(spec).__qualname__}")
 
 

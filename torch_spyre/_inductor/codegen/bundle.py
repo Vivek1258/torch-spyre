@@ -188,10 +188,29 @@ def generate_bundle(
             loop_dim_ssa,
             loop_dim_bounds,
         )
+        # Phase zero is deliberately compile-only. Two pieces downstream of
+        # this file do not exist yet, and both fail AFTER a successful
+        # emission, so say it here rather than let a pod run end in a
+        # confusing launch error:
+        #   1. dispatch does not bind a value for these parameters (#4964),
+        #      so the launch argument list is one short per dimension;
+        #   2. deeptools refuses a non-constant scf.for upper bound today
+        #      (DT_CHECK in ProgramCorrection.cpp), so dxp_standalone will
+        #      reject this bundle.
+        # Emitting it anyway is the point: the artifact is what we need to
+        # review and to hand over.
+        logger.warning(
+            "[symbolic-loop] EMITTING A COMPILE-ONLY BUNDLE. %d dimension "
+            "parameter(s) %s have no value bound at dispatch yet (#4964), and "
+            "a runtime-valued scf.for bound is not accepted by deeptools yet. "
+            "Expect this kernel to emit correctly and then fail to build or "
+            "launch. That is the known phase-zero boundary, not a regression.",
+            len(loop_dim_bounds),
+            sorted(loop_dim_ssa.values()),
+        )
     else:
         logger.debug(
-            "[symbolic-loop] no symbolic loop bounds in this kernel "
-            "(loop_bounds=%s)",
+            "[symbolic-loop] no symbolic loop bounds in this kernel (loop_bounds=%s)",
             loop_bounds,
         )
 
