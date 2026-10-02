@@ -230,7 +230,13 @@ def _xs_leaf(operand: torch.Tensor, spec: TileSpec) -> torch.Tensor:
     # inside one -- DeviceContext.__torch_function__ re-dispatches into that body
     # and dynamo cannot trace the `super()` call. The free function has no body.
     if isinstance(length, int):
-        return torch.unflatten(moved, 0, (length // spec.extent, spec.extent))
+        out = torch.unflatten(moved, 0, (length // spec.extent, spec.extent))
+        print(
+            f"[symbolic-loop][_xs_leaf] CONCRETE length={length} "
+            f"extent={spec.extent} -> {tuple(out.shape)}",
+            flush=True,
+        )
+        return out
 
     # Symbolic length. WHICH dimension we pin decides whether this backend
     # works at all, so it is spelled out separately rather than shared.
@@ -258,7 +264,13 @@ def _xs_leaf(operand: torch.Tensor, spec: TileSpec) -> torch.Tensor:
     # divisibility) was tried at this call site and in the caller. Neither
     # changes the inference, because the view does not consult deferred runtime
     # asserts when choosing which dimension to derive.
-    return torch.unflatten(moved, 0, (-1, spec.extent))
+    out = torch.unflatten(moved, 0, (-1, spec.extent))
+    print(
+        f"[symbolic-loop][_xs_leaf] SYMBOLIC length={length} "
+        f"extent={spec.extent} -> {tuple(out.shape)}",
+        flush=True,
+    )
+    return out
 
 
 def _tile(operand: torch.Tensor, spec: TileSpec, sliced: torch.Tensor) -> torch.Tensor:
