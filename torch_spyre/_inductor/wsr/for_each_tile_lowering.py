@@ -219,9 +219,28 @@ def _extract_trip_count(cond_graph) -> sympy.Expr | None:
     with V.set_ops_handler(recorder):
         inner_fn(())
 
+    # Every decline below is silent by default and the caller only sees
+    # "not accepted", so the recorder's contents are logged once up front.
+    logger.info(
+        "[symbolic-loop][trip-count] recorder: compare_ops=%s loads=%s "
+        "constants=%s index_exprs=%s",
+        recorder.compare_ops,
+        recorder.loads,
+        recorder.constants,
+        recorder.index_exprs,
+    )
+
     if recorder.compare_ops != ["lt"]:
+        logger.info(
+            "[symbolic-loop][trip-count] DECLINED: compare_ops=%s, expected ['lt']",
+            recorder.compare_ops,
+        )
         return None
     if len(recorder.loads) != 1:
+        logger.info(
+            "[symbolic-loop][trip-count] DECLINED: %d loads, expected exactly 1",
+            len(recorder.loads),
+        )
         return None
 
     # Exactly one bound, reached either as a constant (concrete trip count) or
@@ -229,20 +248,53 @@ def _extract_trip_count(cond_graph) -> sympy.Expr | None:
     # Seeing both, or neither, means this is not the shape we recognize.
     bounds = [*recorder.constants, *recorder.index_exprs]
     if len(bounds) != 1:
+        logger.info(
+            "[symbolic-loop][trip-count] DECLINED: %d candidate bounds "
+            "(constants=%s index_exprs=%s), expected exactly 1",
+            len(bounds),
+            recorder.constants,
+            recorder.index_exprs,
+        )
         return None
 
     (loaded_name, loaded_index) = recorder.loads[0]
     if loaded_name != first_placeholder:
+        logger.info(
+            "[symbolic-loop][trip-count] DECLINED: load is of %r, expected the "
+            "first placeholder %r",
+            loaded_name,
+            first_placeholder,
+        )
         return None
     if loaded_index != 0:
+        logger.info(
+            "[symbolic-loop][trip-count] DECLINED: load index is %s, expected 0",
+            loaded_index,
+        )
         return None
 
     bound = bounds[0]
     if isinstance(bound, bool):
+        logger.info("[symbolic-loop][trip-count] DECLINED: bound is a bool")
         return None
     if not isinstance(bound, (int, sympy.Expr)):
+        logger.info(
+            "[symbolic-loop][trip-count] DECLINED: bound type %s is neither int "
+            "nor sympy.Expr",
+            type(bound).__name__,
+        )
         return None
-    return sympy.sympify(bound)
+
+    recovered = sympy.sympify(bound)
+    logger.info(
+        "[symbolic-loop][trip-count] RECOVERED count=%s symbolic=%s "
+        "free_symbols=%s (from %s)",
+        recovered,
+        bool(getattr(recovered, "free_symbols", None)),
+        sorted(map(str, getattr(recovered, "free_symbols", []))),
+        "index_expr" if recorder.index_exprs else "constant",
+    )
+    return recovered
 
 
 def try_prove_for_each_tile(while_op: "ir.WhileLoop") -> ProverResult:
@@ -3225,6 +3277,14 @@ def splice_while_loops(graph) -> None:
             # enclosing levels before the final stamping phase.
             ancestor_level_indices = tuple(
                 getattr(while_op, "_for_each_tile_ancestor_level_indices", ())
+            )
+
+            logger.info(
+                "[symbolic-loop][splice] splicing while_loop: trip_count=%s "
+                "symbolic=%s loop_var=%s",
+                result.trip_count,
+                bool(getattr(result.trip_count, "free_symbols", None)),
+                loop_var,
             )
 
             carries = carry_bindings_for(

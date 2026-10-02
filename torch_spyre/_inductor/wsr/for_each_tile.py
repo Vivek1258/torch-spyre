@@ -220,7 +220,6 @@ def _xs_leaf(operand: torch.Tensor, spec: TileSpec) -> torch.Tensor:
             raise AssertionError("GATHER spec without an index table")
         return spec.index
     moved = _movedim(operand, spec.dim, 0)
-    length = moved.shape[0]
 
     # Splitting dim 0 is always expressible in strides, so this is a view.
     #
@@ -229,48 +228,36 @@ def _xs_leaf(operand: torch.Tensor, spec: TileSpec) -> torch.Tensor:
     # never reaches. Under an active `torch.device` mode -- vLLM runs its model
     # inside one -- DeviceContext.__torch_function__ re-dispatches into that body
     # and dynamo cannot trace the `super()` call. The free function has no body.
-    if isinstance(length, int):
-        out = torch.unflatten(moved, 0, (length // spec.extent, spec.extent))
-        print(
-            f"[symbolic-loop][_xs_leaf] CONCRETE length={length} "
-            f"extent={spec.extent} -> {tuple(out.shape)}",
-            flush=True,
-        )
-        return out
-
-    # Symbolic length. WHICH dimension we pin decides whether this backend
-    # works at all, so it is spelled out separately rather than shared.
+    # WHICH dimension is pinned decides whether a symbolic length works at all.
     #
-    # unflatten is a view, and a view given two sizes keeps what it is handed
-    # and INFERS whatever is needed to make the product equal numel. Passing
-    # (length // extent, extent) pins the tile COUNT -- the symbolic one -- and
-    # leaves the tile EXTENT to be inferred. Unable to prove
-    # (S // extent) * extent == S, the view then re-derives the extent as
-    # S // (S // extent): a value that is always exactly `extent`, that nothing
-    # simplifies, and whose interval is [extent // max_tiles, S_max].
+    # A view is given sizes and a numel it must match. It keeps what it is
+    # handed and INFERS whatever is needed to make the product come out. Passing
+    # (length // extent, extent) pins the tile COUNT, which is the symbolic one,
+    # and leaves the tile EXTENT to be inferred. Unable to prove
+    # (S // extent) * extent == S, the view re-derives the extent as
+    # S // (S // extent): always exactly `extent`, never simplified, and with an
+    # interval of [extent // max_tiles, S_max].
     #
-    # That is the wrong way round. The tile extent is a compile-time constant
-    # and the whole backend below here depends on it staying one: work_division
-    # reads the extent's lower bound as the user's mark_dynamic(min=...),
-    # coarse_tile's _raw_to_squeezed_pos calls int() on it, and the SDSC
-    # describes a tile of exactly that size. The tile COUNT is the only thing
-    # allowed to vary.
+    # That is backwards. The extent is a compile-time constant and everything
+    # below here needs it to stay one -- work_division reads its lower bound as
+    # the user's mark_dynamic(min=...), coarse_tile's _raw_to_squeezed_pos calls
+    # int() on it, and the SDSC describes a tile of exactly that size. The COUNT
+    # is the only thing allowed to vary.
     #
-    # So pin the extent and let the count be the inferred one. -1 is the view's
-    # own way of saying "derive this dimension", and because it is the count
-    # that is derived, the extent survives as the literal it was passed in as.
+    # So pin the extent and let the count be derived. -1 is the view's own way
+    # of saying "work this one out", and because the count is what gets derived,
+    # the extent survives as the literal it was passed in as.
     #
-    # Asserting the relationship instead (torch._check on the product or on
-    # divisibility) was tried at this call site and in the caller. Neither
-    # changes the inference, because the view does not consult deferred runtime
-    # asserts when choosing which dimension to derive.
-    out = torch.unflatten(moved, 0, (-1, spec.extent))
-    print(
-        f"[symbolic-loop][_xs_leaf] SYMBOLIC length={length} "
-        f"extent={spec.extent} -> {tuple(out.shape)}",
-        flush=True,
-    )
-    return out
+    # Unconditional on purpose. For a concrete length, -1 infers exactly
+    # length // extent, so the result is identical to spelling it out, and there
+    # is no symbolic-vs-concrete test to get wrong. An earlier version branched
+    # on isinstance(length, int) and silently sent the symbolic case down the
+    # concrete path, because a SymInt satisfies that check here.
+    #
+    # Asserting the relationship instead (torch._check on the product, or on
+    # divisibility, at this call site or in the caller) does not help: the view
+    # does not consult deferred runtime asserts when choosing what to derive.
+    return torch.unflatten(moved, 0, (-1, spec.extent))
 
 
 def _tile(operand: torch.Tensor, spec: TileSpec, sliced: torch.Tensor) -> torch.Tensor:

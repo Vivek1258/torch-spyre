@@ -379,6 +379,15 @@ def compute_granularity(expr: Expr, max_size: int) -> int:
         )
 
     user_min = _user_min_or_none(expr)
+    logger.info(
+        "[symbolic-loop][granularity] expr=%s max_size=%s user_min=%s "
+        "max_buckets=%s (user_min is read as the ShapeEnv LOWER bound of expr, "
+        "so a derived expr gives a bogus min)",
+        expr,
+        max_size,
+        user_min,
+        max_buckets,
+    )
     if user_min is not None:
         if max_size % user_min != 0:
             raise Unsupported(

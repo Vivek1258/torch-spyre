@@ -113,9 +113,20 @@ def _collect_symbol_metadata(it_space: dict[Symbol, Expr]) -> SymbolMeta:
     ``v in meta`` to detect both cases.
     """
     meta: SymbolMeta = {}
+    logger.info(
+        "[symbolic-loop][work_division] iteration space: %s",
+        {str(k): str(v) for k, v in it_space.items()},
+    )
     for sym, expr in it_space.items():
         if not (hasattr(expr, "free_symbols") and expr.free_symbols):
             continue
+        logger.info(
+            "[symbolic-loop][work_division] symbolic extent sym=%s expr=%s "
+            "free_symbols=%s",
+            sym,
+            expr,
+            sorted(map(str, expr.free_symbols)),
+        )
         if finite_upper_or_none(expr) is None:
             logger.debug(
                 f"[work_division/symbolic] skipping auto-dynamic symbol "
