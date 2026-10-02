@@ -27,10 +27,14 @@ so a failure at stage N tells us which change is wrong without another round
 trip. The expected first failure is stage 2 or 3, because those depend on the
 lowering path this probe has never been executed against.
 
-    python tests/inductor/probe_symbolic_loop_e2e.py 2>&1 | tee probe.log
+    TORCH_LOGS="+spyre.inductor" python tests/inductor/probe_symbolic_loop_e2e.py \
+        2>&1 | tee probe.log
 
-Add ``TORCH_LOGS="+torch_spyre"`` for the ``[symbolic-loop]`` lines the changed
-code emits.
+``+spyre.inductor`` is the right namespace for the ``[symbolic-loop]`` lines
+this change emits. torch_spyre parses TORCH_LOGS for its own ``spyre.*``
+namespaces (see torch_spyre/logging_config.py), so ``+torch_spyre`` is not a
+component and silently gives you nothing. ``SPYRE_INDUCTOR_LOG=1`` is the
+legacy equivalent.
 """
 
 import os
@@ -44,8 +48,11 @@ BANNER = "=" * 72
 # Same numbers as the HLD worked example.
 GRANULARITY = 64
 MAX_ROWS = 512
-WARMUP_ROWS = 320
-COLS = 1024
+# 320 rows is 5 tiles of 64 and sits inside [64, 512]. 128 cols is 2 sticks per
+# row at fp16, matching the STICK_COLS the passing fixtures use.
+ROWS = 320
+COLS = 128
+WARMUP_ROWS = ROWS
 
 
 def stage(n: int, what: str) -> None:
@@ -104,50 +111,84 @@ def stage_1_symbol_and_range():
     return captured
 
 
+def _abs_tiled_fn(a, tile_size):
+    """Byte-for-byte the shape of for_each_tile_fixtures.abs_tiled_fn.
+
+    Deliberately identical to a fixture that already passes on device, so the
+    only difference between the control and the experiment below is whether
+    dim 0 is marked dynamic. Anything else that breaks is then the harness,
+    not the feature.
+
+    Single operand on purpose. Marking two operands gives two independent
+    symbols and therefore two trip counts, which this design refuses until the
+    bridge emits a torch._check equality. That is a real constraint, but it is
+    not the one this probe is measuring, so it is kept out of the way.
+    """
+    from torch_spyre._inductor.wsr.for_each_tile import for_each_tile
+
+    def body(_, ops):
+        (a_tile,) = ops
+        return None, a_tile.abs()
+
+    _, out = for_each_tile(body, (a,), dims=(0,), tile_size=tile_size, out_dim=0)
+    return out
+
+
+def _compile_and_run(a_dev, label):
+    """Compile and run one case, reporting the outcome rather than raising.
+
+    ``fullgraph=True`` is NOT optional. Every for_each_tile test in this repo
+    uses it, and for_each_tile's own docstring says a direct user HOP relies on
+    fullgraph capture to permit the scalar read that Inductor's
+    scan-to-while-loop pass performs. Without it the compile dies far away in
+    post_grad with DataDependentOutputException on aten._local_scalar_dense,
+    which looks like a backend bug and is not one.
+    """
+    torch._dynamo.reset()
+    compiled = torch.compile(_abs_tiled_fn, backend="inductor", fullgraph=True)
+    try:
+        out = compiled(a_dev, GRANULARITY)
+        print(f"  {label}: compile COMPLETED, output shape {tuple(out.shape)}")
+        return out
+    except Exception:
+        print(f"  {label}: compile RAISED")
+        traceback.print_exc()
+        return None
+
+
 def stage_2_and_3_specs():
-    """Compile for Spyre and inspect the finished op_specs."""
+    """Compile for Spyre: first a concrete control, then the symbolic case."""
     stage(2, "symbolic count in LoopSpec, and its carried bounds")
     try:
         import torch_spyre  # noqa: F401
-        from torch_spyre._inductor.op_spec import LoopSpec
         from torch_spyre.constants import DEVICE_NAME
     except Exception:
         print("  torch_spyre import FAILED:")
         traceback.print_exc()
         return None
 
-    from torch_spyre._inductor.wsr.for_each_tile import for_each_tile
+    a = torch.randn(ROWS, COLS, dtype=torch.float16)
+    ref = a.float().abs()
 
-    def model(t):
-        # Hand-written HOP. The bridge that would author this from the marked
-        # dimension does not exist yet; that is deliberate POC scope.
-        _, out = for_each_tile(
-            lambda carry, tiles: (None, torch.nn.functional.gelu(tiles[0])),
-            (t,),
-            dims=(0,),
-            tile_size=GRANULARITY,
-            out_dim=0,
-        )
-        return out
+    # --- control: same kernel, concrete shape -------------------------------
+    # If this fails, the symbolic result below means nothing.
+    print("\n  [control] concrete shape, no mark_dynamic")
+    out = _compile_and_run(a.to(DEVICE_NAME), "control")
+    if out is not None:
+        err = (out.cpu().float() - ref).abs().max().item()
+        print(f"  control: max abs error vs CPU = {err:.4f}")
 
-    seen_specs = []
-    try:
-        from torch_spyre._inductor import codegen as _codegen  # noqa: F401
-    except Exception:
-        pass
-
-    x = torch.randn(WARMUP_ROWS, COLS, dtype=torch.float16)
-    torch._dynamo.mark_dynamic(x, 0, min=GRANULARITY, max=MAX_ROWS)
-    torch._dynamo.reset()
-
-    try:
-        x_dev = x.to(DEVICE_NAME)
-        compiled = torch.compile(model, dynamic=None)
-        compiled(x_dev)
-        print("  compile COMPLETED without raising")
-    except Exception:
-        print("  compile RAISED (this is informative, not necessarily wrong):")
-        traceback.print_exc()
+    # --- experiment: identical, but dim 0 is symbolic -----------------------
+    # Marked AFTER .to(), because .to() returns a NEW tensor and mark_dynamic
+    # records on the object. Marking the CPU tensor would silently lose it,
+    # which is what the first version of this probe did.
+    print("\n  [experiment] dim 0 marked dynamic")
+    a_dev = a.to(DEVICE_NAME)
+    torch._dynamo.mark_dynamic(a_dev, 0, min=GRANULARITY, max=MAX_ROWS)
+    out = _compile_and_run(a_dev, "experiment")
+    if out is not None:
+        err = (out.cpu().float() - ref).abs().max().item()
+        print(f"  experiment: max abs error vs CPU = {err:.4f}")
 
     print(
         "\n  If the run above produced a bundle, stage 4 reads it. Look in the\n"
@@ -157,9 +198,11 @@ def stage_2_and_3_specs():
         "    - 'bundle has N symbolic loop bound(s)'            (bundle)\n"
         "    - 'loop_bound_0 from count=... emitted as: ...'    (bundle)\n"
         "  Their ABSENCE is the finding: it says the symbolic count never got\n"
-        "  that far, and which stage it stopped at."
+        "  that far, and which stage it stopped at.\n"
+        "\n"
+        "  Read the control line first. If the control also failed, the harness\n"
+        "  is wrong and the experiment tells you nothing."
     )
-    _ = LoopSpec, seen_specs
     return True
 
 

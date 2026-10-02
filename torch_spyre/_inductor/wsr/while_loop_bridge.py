@@ -1294,9 +1294,50 @@ def splice_while_loop(
         name_map[placeholder_name] = read_target.get_name()
         ref_map[placeholder_name] = read_target
 
+    # ``while_op.inputs`` is NOT positionally aligned with the body graph's
+    # placeholders. WhileLoop.__init__ does
+    #     sym_args, tensor_args = _split_by_sym_type([*carried, *additional])
+    #     super().__init__(inputs=tensor_args, constant_args=sym_args)
+    # so a SymInt operand lands in constant_args and is absent from inputs,
+    # while body_graph_input_names (body_subgraph.graph.graph_inputs) still
+    # lists it. With no symbolic operand the two happen to line up, which is
+    # why this only breaks under dynamic shapes -- and breaks as a bare
+    # IndexError that says nothing about the cause.
+    #
+    # Rebuild the positional list the body was actually traced with:
+    # _trace_while_loop calls reenter_make_fx(fn)(*carried, *additional), so
+    # that concatenation IS the placeholder order.
+    real_inputs = [
+        *(while_op.carried_inputs or ()),
+        *(while_op.additional_inputs or ()),
+    ]
+    if len(real_inputs) < len(body_graph_input_names):
+        raise AssertionError(
+            f"while_loop body has {len(body_graph_input_names)} placeholders "
+            f"but only {len(real_inputs)} operands "
+            f"(carried={len(while_op.carried_inputs or ())}, "
+            f"additional={len(while_op.additional_inputs or ())}). "
+            "The body graph and the operand list disagree, which this pass "
+            "cannot reconcile."
+        )
+
     for i in range(len(carries), len(body_graph_input_names)):
         placeholder_name = body_graph_input_names[i]
-        real_input = while_op.inputs[i]
+        real_input = real_inputs[i]
+        if not hasattr(real_input, "get_name"):
+            # A SymInt operand, e.g. the varying dimension under a marked
+            # dynamic shape. There is no buffer behind it, so there is nothing
+            # for redirect_computed_buffer_reads to point at. Logged rather
+            # than passed over in silence, because a missing entry here shows
+            # up much later as a stale placeholder name.
+            logger.info(
+                "[symbolic-loop] body placeholder %r at index %d is a "
+                "non-buffer operand (%r); no read redirection needed",
+                placeholder_name,
+                i,
+                type(real_input).__name__,
+            )
+            continue
         real_name = real_input.get_name()
         name_map[placeholder_name] = real_name
         ref_map[placeholder_name] = real_input
