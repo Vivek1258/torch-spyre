@@ -221,28 +221,6 @@ def _xs_leaf(operand: torch.Tensor, spec: TileSpec) -> torch.Tensor:
         return spec.index
     moved = _movedim(operand, spec.dim, 0)
     length = moved.shape[0]
-    num_tiles = length // spec.extent
-
-    # POC (symbolic loop): tell the ShapeEnv the product identity that the view
-    # below is about to need.
-    #
-    # torch.unflatten IS a view (see torch/_refs/__init__.py). For a symbolic
-    # length, view cannot prove (S // extent) * extent == S, so instead of
-    # keeping the literal `extent` it back-computes that dimension as
-    # S // (S // extent) to force the product to match. The result is always
-    # exactly `extent`, but nothing simplifies it, and interval arithmetic on
-    # it yields a range of [extent // num_tiles_max, S_max]. Everything below
-    # then misbehaves: work_division reads the bogus lower bound as the user's
-    # mark_dynamic(min=...), and coarse_tile's _raw_to_squeezed_pos calls
-    # int() on a range that is no longer concrete.
-    #
-    # _normalize_in_specs already evaluates `length % tile_size != 0`, which
-    # guards divisibility, but that guard does not reach here: the buffer that
-    # carries the bad shape is created inside scan's decomposition, which
-    # re-traces through make_fx(..., tracing_mode="real"). Asserting it at the
-    # view itself is what puts the fact in the right context.
-    if not isinstance(length, int):
-        torch._check(num_tiles * spec.extent == length)
 
     # Splitting dim 0 is always expressible in strides, so this is a view.
     #
@@ -251,7 +229,36 @@ def _xs_leaf(operand: torch.Tensor, spec: TileSpec) -> torch.Tensor:
     # never reaches. Under an active `torch.device` mode -- vLLM runs its model
     # inside one -- DeviceContext.__torch_function__ re-dispatches into that body
     # and dynamo cannot trace the `super()` call. The free function has no body.
-    return torch.unflatten(moved, 0, (num_tiles, spec.extent))
+    if isinstance(length, int):
+        return torch.unflatten(moved, 0, (length // spec.extent, spec.extent))
+
+    # Symbolic length. WHICH dimension we pin decides whether this backend
+    # works at all, so it is spelled out separately rather than shared.
+    #
+    # unflatten is a view, and a view given two sizes keeps what it is handed
+    # and INFERS whatever is needed to make the product equal numel. Passing
+    # (length // extent, extent) pins the tile COUNT -- the symbolic one -- and
+    # leaves the tile EXTENT to be inferred. Unable to prove
+    # (S // extent) * extent == S, the view then re-derives the extent as
+    # S // (S // extent): a value that is always exactly `extent`, that nothing
+    # simplifies, and whose interval is [extent // max_tiles, S_max].
+    #
+    # That is the wrong way round. The tile extent is a compile-time constant
+    # and the whole backend below here depends on it staying one: work_division
+    # reads the extent's lower bound as the user's mark_dynamic(min=...),
+    # coarse_tile's _raw_to_squeezed_pos calls int() on it, and the SDSC
+    # describes a tile of exactly that size. The tile COUNT is the only thing
+    # allowed to vary.
+    #
+    # So pin the extent and let the count be the inferred one. -1 is the view's
+    # own way of saying "derive this dimension", and because it is the count
+    # that is derived, the extent survives as the literal it was passed in as.
+    #
+    # Asserting the relationship instead (torch._check on the product or on
+    # divisibility) was tried at this call site and in the caller. Neither
+    # changes the inference, because the view does not consult deferred runtime
+    # asserts when choosing which dimension to derive.
+    return torch.unflatten(moved, 0, (-1, spec.extent))
 
 
 def _tile(operand: torch.Tensor, spec: TileSpec, sliced: torch.Tensor) -> torch.Tensor:
