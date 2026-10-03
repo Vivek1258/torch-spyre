@@ -150,6 +150,39 @@ xs_case("X1 narrow + unflatten(0, (n, G))  (today)",
 xs_case("X2 narrow + as_strided((n, G, W), (G*W, W, 1))",
         lambda tr, n: tr.as_strided((n, G, WIDTH), (G * WIDTH, WIDTH, 1)))
 
+# WHO calls check_contiguous_sizes_strides? The real recompile names it:
+#   (a.size()[0] // 64) != 1  # _prims_common/__init__.py:285 in
+#                               check_contiguous_sizes_strides
+# as_strided added nothing in isolation (case D), so the likely caller is the
+# empty_strided that upstream's decompose_scan_to_while_loop uses to
+# pre-allocate scan's output buffer. If that is where it comes from, the guard
+# is not ours to remove at all.
+def alloc_case(name, build):
+    print("\n" + "=" * 78)
+    print(f"CASE {name}")
+    shape_env, mode, s, x = fresh()
+    try:
+        with mode:
+            count = s // G
+            before = set(guard_strs(shape_env))
+            out = build(count)
+            new = [g for g in guard_strs(shape_env) if g not in before]
+        print(f"  result shape = {list(out.shape)}")
+        print(f"  new guards ({len(new)}):")
+        for g in new:
+            print(f"    {g}")
+        suspicious = [g for g in new if "Ne" in g]
+        RESULTS.append((name, list(out.shape), len(new), suspicious))
+    except Exception as exc:  # noqa: BLE001
+        print(f"  RAISED {type(exc).__name__}: {exc}")
+        RESULTS.append((name, "RAISED", -1, [str(exc)]))
+
+
+alloc_case("P1 empty_strided((n, G, W), (G*W, W, 1))  <- what scan pre-allocates",
+           lambda n: torch.empty_strided((n, G, WIDTH), (G * WIDTH, WIDTH, 1)))
+alloc_case("P2 empty((n, G, W))  <- for comparison",
+           lambda n: torch.empty(n, G, WIDTH))
+
 print("\n" + "=" * 78)
 print("SUMMARY  (want: correct shape, and NO '!= 1' guard)")
 for name, shape, n_new, suspicious in RESULTS:
