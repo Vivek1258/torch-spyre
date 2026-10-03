@@ -104,6 +104,31 @@ class TestDecomposeSymbolicCount(unittest.TestCase):
         sym = sympy.Symbol(SYM_NAME, positive=True, integer=True)
         self.assertEqual(_decompose_symbolic_count(FloorDiv(sym, 64)), (SYM_NAME, 64))
 
+    def test_round_tripped_floor_form_decomposes_the_same(self):
+        """The generated source IS the reload path, and it loses the FloorDiv type.
+
+        Op specs are serialized as ``sympify('<str>')``. ``str(FloorDiv(s, 64))``
+        is ``(s//64)``, and sympy parses ``//`` back into ``sympy.floor(s/64)``
+        rather than torch's FloorDiv. Both spellings mean the same thing for a
+        positive integer, and both must decompose identically, or a kernel dies
+        in the bundle with "not a recognized trip-count shape" the moment its
+        specs come back through the generated source. This is the fourth place
+        that reload path has bitten this feature.
+        """
+        sym = sympy.Symbol(SYM_NAME, positive=True, integer=True)
+        direct = FloorDiv(sym, GRANULARITY)
+        round_tripped = sympy.sympify(str(direct))
+        self.assertEqual(
+            _decompose_symbolic_count(round_tripped),
+            (SYM_NAME, GRANULARITY),
+            msg=f"round-tripped {round_tripped!r} (type "
+            f"{type(round_tripped).__name__}) did not decompose",
+        )
+        self.assertEqual(
+            _decompose_symbolic_count(round_tripped),
+            _decompose_symbolic_count(direct),
+        )
+
     def test_bare_symbol_is_divisor_one(self):
         sym = sympy.Symbol(SYM_NAME, positive=True, integer=True)
         self.assertEqual(_decompose_symbolic_count(sym), (SYM_NAME, 1))

@@ -916,6 +916,17 @@ def _decompose_symbolic_count(count: sympy.Expr):
         if isinstance(numerator, sympy.Symbol) and denominator.is_Integer:
             return (str(numerator), int(denominator))
 
+    # The same count after a round trip through the generated source. That
+    # source IS the reload path: op specs are serialized as `sympify('<str>')`,
+    # `str(FloorDiv(s, 64))` is `(s//64)`, and sympy parses `//` back into
+    # `sympy.floor(s/64)` rather than into torch's FloorDiv. Both spellings mean
+    # the same thing for a positive integer, so accept both here, at the single
+    # point that interprets the count's shape.
+    if isinstance(count, sympy.floor):
+        numerator, denominator = count.args[0].as_numer_denom()
+        if isinstance(numerator, sympy.Symbol) and denominator.is_Integer:
+            return (str(numerator), int(denominator))
+
     return None
 
 
