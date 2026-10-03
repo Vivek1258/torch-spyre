@@ -28,6 +28,9 @@ from torch._inductor.utils import InputType
 from torch._inductor.virtualized import V
 
 from .constants import DEVICE_NAME
+from .logging_utils import get_inductor_logger
+
+logger = get_inductor_logger("patches")
 
 
 @contextmanager
@@ -224,6 +227,50 @@ def enable_spyre_context(example_inputs: list[InputType]):
 
     SchedulerNode.has_side_effects = _spyre_scheduler_node_has_side_effects  # type: ignore[method-assign]
 
+    # decompose_scan_to_while_loop (torch/_inductor/fx_passes/post_grad.py) rebuilds
+    # the scan output's shape as FX proxies through resolve_shape_to_proxy, against
+    # an env it builds as `{arg.node.expr: arg}` over the scan's SymInt args plus
+    # scan_length. But sympy_interp only consults that env for a bare sympy.Symbol
+    # leaf, so an expression key like FloorDiv(s97, 64) sits in the dict and is
+    # never looked up: it recurses into s97 instead and raises KeyError(s97).
+    #
+    # That fires exactly when the loop body is fully static and only the trip count
+    # is derived from the dynamic dim, which is the shape a symbolic loop bound is
+    # supposed to have. The proxy for the whole expression IS in the dict already,
+    # it is scan_length, so match the expression before falling back to the symbol
+    # walk. Nothing else changes: a concrete shape, a bare symbol, and any
+    # expression that is not a key all take the original path.
+    from torch._inductor.fx_passes import post_grad as _post_grad
+
+    old_resolve_shape_to_proxy = getattr(_post_grad, "resolve_shape_to_proxy", None)
+
+    if old_resolve_shape_to_proxy is not None:
+
+        @wraps(old_resolve_shape_to_proxy)
+        def _spyre_resolve_shape_to_proxy(shape, bound_symbols):
+            exprs = [getattr(getattr(s, "node", None), "expr", None) for s in shape]
+            # Logged BEFORE resolving, so the diagnostic survives the upstream
+            # KeyError if a symbolic element does not match after all.
+            if any(e is not None for e in exprs):
+                logger.info(
+                    "[symbolic-loop][resolve_shape] shape=%s matched_whole=%s "
+                    "bound_symbols=%s",
+                    [str(s) for s in shape],
+                    [str(e) for e in exprs if e is not None and e in bound_symbols],
+                    [str(k) for k in bound_symbols],
+                )
+            resolved = []
+            for s, expr in zip(shape, exprs):
+                if expr is not None and expr in bound_symbols:
+                    resolved.append(bound_symbols[expr])
+                else:
+                    # One element at a time, so the fallback keeps upstream's
+                    # own type checking and error messages for that element.
+                    resolved.append(old_resolve_shape_to_proxy([s], bound_symbols)[0])
+            return resolved
+
+        _post_grad.resolve_shape_to_proxy = _spyre_resolve_shape_to_proxy
+
     with (
         spyre_data_types(),
         _preserve_spyre_input_storage_offsets(),
@@ -239,6 +286,8 @@ def enable_spyre_context(example_inputs: list[InputType]):
             Loops.has_large_inner_fn = old_loop
             GraphLowering._update_scheduler = old_update_scheduler  # type: ignore[method-assign]
             SchedulerNode.has_side_effects = old_scheduler_node_has_side_effects  # type: ignore[method-assign]
+            if old_resolve_shape_to_proxy is not None:
+                _post_grad.resolve_shape_to_proxy = old_resolve_shape_to_proxy
 
 
 OBSERVER_HOOKS_KEY = "__spyre_hooks_meta"

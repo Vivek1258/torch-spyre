@@ -2116,6 +2116,25 @@ def _audit_symbolic_ranges(operations: list[Operation]) -> None:
             for i, r in enumerate(seq)
             if getattr(r, "free_symbols", None)
         ]
+        # Layouts too. A symbol in `ranges` breaks the squeeze tests inside a
+        # loop body; a symbol in a layout size, stride or device_size breaks
+        # stickification and addressing, and that one can bite an op OUTSIDE
+        # the loop as well (the loop's own output buffer is G * (S // G) long).
+        try:
+            layout = op.maybe_get_layout()
+        except Exception:  # noqa: BLE001
+            layout = None
+        if layout is not None:
+            device_layout = getattr(layout, "device_layout", None)
+            for label, seq in (
+                ("layout.size", getattr(layout, "size", None)),
+                ("layout.stride", getattr(layout, "stride", None)),
+                ("device_size", getattr(device_layout, "device_size", None)),
+                ("stride_map", getattr(device_layout, "stride_map", None)),
+            ):
+                for i, v in enumerate(seq or []):
+                    if getattr(v, "free_symbols", None):
+                        symbolic.append(f"{label}[{i}]={v}")
         if not symbolic:
             continue
         total += 1
@@ -2135,9 +2154,11 @@ def _audit_symbolic_ranges(operations: list[Operation]) -> None:
             symbolic,
         )
     logger.info(
-        "[symbolic-loop][audit] %d op(s) carry a symbolic iteration space. Any "
-        "of them with in_loop=True breaks the int(r) squeeze tests downstream; "
-        "the trip count itself belongs in loop_info, not in ranges",
+        "[symbolic-loop][audit] %d op(s) carry a symbol in their iteration space "
+        "or layout. A `range`/`reduction` entry with in_loop=True breaks the "
+        "int(r) squeeze tests downstream. A layout/device_size entry breaks "
+        "addressing whether it is in a loop or not. The trip count itself "
+        "belongs in loop_info, nowhere else",
         total,
     )
 

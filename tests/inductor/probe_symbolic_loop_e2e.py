@@ -27,14 +27,15 @@ so a failure at stage N tells us which change is wrong without another round
 trip. The expected first failure is stage 2 or 3, because those depend on the
 lowering path this probe has never been executed against.
 
-    TORCH_LOGS="+spyre.inductor" python tests/inductor/probe_symbolic_loop_e2e.py \
-        2>&1 | tee probe.log
+    SPYRE_INDUCTOR_LOG=1 SPYRE_INDUCTOR_LOG_LEVEL=INFO \
+        python tests/inductor/probe_symbolic_loop_e2e.py 2>&1 | tee probe.log
 
-``+spyre.inductor`` is the right namespace for the ``[symbolic-loop]`` lines
-this change emits. torch_spyre parses TORCH_LOGS for its own ``spyre.*``
-namespaces (see torch_spyre/logging_config.py), so ``+torch_spyre`` is not a
-component and silently gives you nothing. ``SPYRE_INDUCTOR_LOG=1`` is the
-legacy equivalent.
+Do NOT use ``TORCH_LOGS="+spyre.inductor"``. It breaks ``import torch`` itself
+with ``ModuleNotFoundError: No module named 'spyre'``, because torch's parser
+accepts only a registered log, an artifact, or an importable module. Measured.
+torch_spyre's own deprecation message recommending it is wrong. The default
+spyre log level is WARNING, so without SPYRE_INDUCTOR_LOG_LEVEL=INFO every
+``[symbolic-loop]`` line is silently dropped.
 """
 
 import os
