@@ -133,6 +133,29 @@ def _abs_tiled_fn(a, tile_size):
     # not reach. The assertion has to live at the view itself, so it is in
     # _xs_leaf now. Left as a comment so nobody re-tries it from here.
 
+    # Declare the admissible range HERE rather than through
+    # mark_dynamic(min=, max=).
+    #
+    # mark_dynamic with an explicit min/max is a CONSTRAINT: Dynamo promises
+    # every value in [min, max] works and then refuses any guard that narrows
+    # it. for_each_tile necessarily narrows it, because a tile_size that does
+    # not divide the length is refused, so S must be a multiple of G. That is
+    # the granularity contract, and mark_dynamic cannot express "multiples of
+    # 64 between 64 and 512", it only has min and max. Measured: with the
+    # constraint form this dies in `produce_guards` with
+    # ConstraintViolationError on `(S % 64) == 0`.
+    #
+    # torch._check refines the ShapeEnv range without making that promise, so
+    # compute_symbolic_bounds still reads max=512 and min=64 for the bundle's
+    # input_arg, while the divisibility guard stays an ordinary guard: a
+    # non-multiple recompiles instead of being rejected outright.
+    #
+    # This is exactly the gap the `to("spyre", dynamic={dim: {min, max,
+    # granularity}})` API exists to close. Until it lands, a caller declares
+    # the range this way.
+    torch._check(a.size(0) >= GRANULARITY)
+    torch._check(a.size(0) <= MAX_ROWS)
+
     def body(_, ops):
         (a_tile,) = ops
         return None, a_tile.abs()
@@ -158,8 +181,21 @@ def _compile_and_run(a_dev, label):
         print(f"  {label}: compile COMPLETED, output shape {tuple(out.shape)}")
         return out
     except Exception:
-        print(f"  {label}: compile RAISED")
-        traceback.print_exc()
+        tb = traceback.format_exc()
+        # Distinguish COMPILE from LAUNCH. Once the bundle is on disk the
+        # compile succeeded, and reporting "compile RAISED" then is actively
+        # misleading: the bundle IS the artifact phase zero is about, and a
+        # launch failure after it is a different and much later problem.
+        at_launch = "launch_jobplan" in tb or "kernel_runner.py" in tb
+        print(
+            f"  {label}: {'LAUNCH' if at_launch else 'COMPILE'} RAISED"
+            + (
+                "  (the bundle was emitted, see stage 4)"
+                if at_launch
+                else "  (no bundle from this case)"
+            )
+        )
+        print(tb)
         return None
 
 
@@ -214,7 +250,10 @@ def stage_2_and_3_specs():
         print(f"  input device layout: {a_dev.device_tensor_layout()}")
     except Exception as exc:  # noqa: BLE001
         print(f"  input device layout unavailable: {exc}")
-    torch._dynamo.mark_dynamic(a_dev, 0, min=GRANULARITY, max=MAX_ROWS)
+    # No min=/max= here on purpose: those make it a strict constraint that the
+    # divisibility guard then violates. The range is declared with torch._check
+    # inside _abs_tiled_fn instead, see the comment there.
+    torch._dynamo.mark_dynamic(a_dev, 0)
     out = _compile_and_run(a_dev, "experiment")
     if out is not None:
         err = (out.cpu().float() - ref).abs().max().item()
