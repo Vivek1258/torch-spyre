@@ -407,14 +407,44 @@ def compute_granularity(expr: Expr, max_size: int) -> int:
         )
 
     user_min = _user_min_or_none(expr)
+    # Print BOTH channels and the divisibility facts, because the one-line
+    # version was not enough to explain a measured wrong answer. On 2026-10-03
+    # matmul_split_k declared tile_size=64 and torch._check(>= 64) yet this
+    # read user_min=128, and the bundle then told the backend granularity=128
+    # while the loop stepped 64. A pure-torch probe RULED OUT the first
+    # explanation (that for_each_tile's num_tiles comparison tightens the
+    # bound: it does not), so the next device run has to say where 128 comes
+    # from rather than let us theorise a third time.
+    _shape_env = V.graph.sizevars.shape_env
+    _free = sorted(getattr(expr, "free_symbols", set()) or set(), key=str)
+    _ranges = {
+        str(sym): (
+            getattr(_shape_env.var_to_range.get(sym), "lower", "?"),
+            getattr(_shape_env.var_to_range.get(sym), "upper", "?"),
+        )
+        for sym in _free
+    }
+    try:
+        _bs = _shape_env.bound_sympy(expr)
+        _bound = (_bs.lower, _bs.upper)
+    except Exception as exc:  # noqa: BLE001
+        _bound = f"<raised {type(exc).__name__}>"
+    try:
+        _div = sorted(str(e) for e in _shape_env.divisible)
+    except Exception as exc:  # noqa: BLE001
+        _div = f"<unreadable {type(exc).__name__}>"
     logger.info(
         "[symbolic-loop][granularity] expr=%s max_size=%s user_min=%s "
-        "max_buckets=%s (user_min is read as the ShapeEnv LOWER bound of expr, "
-        "so a derived expr gives a bogus min)",
+        "max_buckets=%s | var_to_range=%s bound_sympy=%s divisible=%s "
+        "(user_min comes from bound_sympy(expr).lower, NOT from any "
+        "declaration, so anything that tightens the bound changes G)",
         expr,
         max_size,
         user_min,
         max_buckets,
+        _ranges,
+        _bound,
+        _div,
     )
     if user_min is not None:
         if max_size % user_min != 0:
