@@ -99,32 +99,6 @@ class TensorDep:
 SymbolMeta = dict[Symbol, tuple[int, int]]
 
 
-def _provably_constant_extent(expr: Expr) -> "int | None":
-    """Return the integer ``expr`` is provably equal to, or None.
-
-    Guesses a candidate from the size hint and then PROVES it with
-    ``statically_known_equals``. The proof is what matters: an expression whose
-    value merely happens to match the hint is rejected, so a varying extent can
-    never be mistaken for a constant one.
-
-    Exists because a derived extent such as ``S // (S // G)`` carries free
-    symbols while being mathematically fixed at ``G``.
-    """
-    from torch._inductor.virtualized import V
-
-    try:
-        sizevars = V.graph.sizevars
-        candidate = int(sizevars.size_hint(expr))
-    except Exception:  # noqa: BLE001 - no hint, no ShapeEnv, not concretizable
-        return None
-    try:
-        if sizevars.statically_known_equals(expr, candidate):
-            return candidate
-    except Exception:  # noqa: BLE001 - prover declined, treat as symbolic
-        return None
-    return None
-
-
 def _collect_symbol_metadata(it_space: dict[Symbol, Expr]) -> SymbolMeta:
     """Build ``{symbol: (max_size, granularity)}`` for opted-in symbolic dims.
 
@@ -154,29 +128,33 @@ def _collect_symbol_metadata(it_space: dict[Symbol, Expr]) -> SymbolMeta:
             sorted(map(str, expr.free_symbols)),
         )
 
-        # An extent that still mentions a symbol but is PROVABLY a constant is
-        # not a symbolic dimension, and must not be run through the granularity
-        # machinery.
+        # Granularity is a property of a dimension the USER marked, not of an
+        # arbitrary expression. compute_granularity recovers mark_dynamic(min=)
+        # by reading the ShapeEnv LOWER BOUND of whatever it is handed. For a
+        # bare symbol that bound IS the declared min. For a derived expression
+        # it is just interval arithmetic, and reading it as a user declaration
+        # is a category error.
         #
-        # for_each_tile's xs reshape produces exactly this. Splitting a symbolic
-        # S into (S // G, G) asks a view to reconcile (S // G) * G with S, which
-        # it cannot prove, so it re-derives the tile extent as S // (S // G).
-        # That value is always exactly G, but sympy never simplifies it, and
-        # interval arithmetic over it gives [G // max_tiles, S_max]. The
-        # granularity code then reads that bogus lower bound as the user's
-        # mark_dynamic(min=...) -- which is how a declared min=64 is reported
-        # back as "mark_dynamic(min=8)".
+        # for_each_tile's xs reshape produces exactly such an expression. A
+        # symbolic S split into (S // G, G) leaves a view unable to prove
+        # (S // G) * G == S, so it derives the tile extent as S // (S // G).
+        # That is NOT secretly G: at S=100 it is 100, not 64. It equals G only
+        # when S is a multiple of G, which for_each_tile does enforce (it raises
+        # on a ragged split) but which is not a fact the prover can apply to a
+        # nested FloorDiv. So the expression is correct and genuinely non-constant
+        # here, and nothing should be trying to simplify it away.
         #
-        # The hint is only used to pick a candidate; statically_known_equals is
-        # what decides, so a wrong hint can never silently concretize a genuinely
-        # varying extent.
-        constant = _provably_constant_extent(expr)
-        if constant is not None:
+        # Its interval is [8, 512], so the lower bound 8 gets reported back to
+        # the user as "mark_dynamic(min=8)" when they declared min=64, and the
+        # bucket count explodes. Skipping it is not a workaround: a derived
+        # extent was never a marked dimension and never had a granularity.
+        if not isinstance(expr, Symbol):
             logger.info(
-                "[symbolic-loop][work_division] extent %s is PROVABLY %d; "
-                "treating as concrete, not a symbolic dim",
+                "[symbolic-loop][work_division] extent %s is a DERIVED "
+                "expression, not a marked dimension; skipping granularity "
+                "(its ShapeEnv lower bound is interval arithmetic, not a "
+                "user-declared min)",
                 expr,
-                constant,
             )
             continue
         if finite_upper_or_none(expr) is None:
