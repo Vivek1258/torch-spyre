@@ -110,12 +110,19 @@ def _concretize_loop_invariant_restickify(restick_buff, old_name: str) -> None:
     if not symbolic:
         return
 
+    # A plain attribute assignment raises FrozenInstanceError: Loops is a frozen
+    # dataclass. object.__setattr__ is the idiom this codebase already uses for
+    # exactly this (lowering.py's "buf.data is a frozen Loops" comment, and
+    # _inline_direct_read_body a few hundred lines below in this same file).
+    # Measured 2026-10-03: the first version assigned directly and turned both
+    # blocked scenarios from a stick-dim error into
+    # "FrozenInstanceError: cannot assign to field 'ranges'".
     if before_ranges:
-        data.ranges = _fix(before_ranges)
+        object.__setattr__(data, "ranges", _fix(before_ranges))
     if before_size:
-        layout.size = _fix(before_size)
+        object.__setattr__(layout, "size", _fix(before_size))
     if before_stride:
-        layout.stride = _fix(before_stride)
+        object.__setattr__(layout, "stride", _fix(before_stride))
 
     logger.info(
         "[symbolic-loop][restickify] %s is a fixed full copy of %s inside a loop "

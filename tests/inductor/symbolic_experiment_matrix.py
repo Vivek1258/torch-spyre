@@ -154,23 +154,46 @@ class SymbolicLogCollector(logging.Handler):
 # ---------------------------------------------------------------------------
 
 
-def find_bundles() -> list:
-    """Every bundle.mlir under the cache root, oldest first."""
-    roots = [
-        os.environ.get("TORCHINDUCTOR_CACHE_DIR", ""),
-        os.path.expanduser("~/.cache/torch_spyre"),
-        "/tmp",
-    ]
-    for root in roots:
-        if not root or not os.path.isdir(root):
-            continue
-        found = []
-        for dirpath, _, filenames in os.walk(root):
-            if "bundle.mlir" in filenames:
-                found.append(os.path.join(dirpath, "bundle.mlir"))
-        if found:
-            return sorted(found, key=os.path.getmtime)
-    return []
+_BUNDLE_ROOT = None
+
+
+def bundle_root() -> str:
+    """Resolve the cache root ONCE, and create it if it does not exist yet.
+
+    This used to pick the first of three candidate roots that happened to
+    contain a bundle, re-deciding on every call. That is a false-green
+    generator, and it produced one: on 2026-10-03 the run began with
+    /tmp/sym_cache freshly deleted, so the first snapshot fell through to /tmp
+    and counted every bundle on the machine, while the snapshot after the
+    compile found the newly created /tmp/sym_cache and counted ONE. The delta
+    came out negative, `added > 0` was False, and a real recompile was reported
+    as "same binary" with ok=True. Reuse of one binary is the headline claim of
+    this whole project, so a measurement that can fake it is the worst possible
+    bug to have here.
+    """
+    global _BUNDLE_ROOT
+    if _BUNDLE_ROOT is None:
+        root = os.environ.get("TORCHINDUCTOR_CACHE_DIR", "") or os.path.join(
+            "/tmp", f"sym_matrix_{os.getpid()}"
+        )
+        os.makedirs(root, exist_ok=True)
+        _BUNDLE_ROOT = root
+    return _BUNDLE_ROOT
+
+
+def find_bundles() -> set:
+    """Every bundle.mlir under the one pinned root, as a SET of paths.
+
+    A set, not a count: comparing sets means a deleted or relocated file can
+    never make the delta negative, and the names of the new bundles are
+    available for the record instead of just how many there were.
+    """
+    root = bundle_root()
+    found = set()
+    for dirpath, _, filenames in os.walk(root):
+        if "bundle.mlir" in filenames:
+            found.add(os.path.join(dirpath, "bundle.mlir"))
+    return found
 
 
 def bundle_facts(path: str) -> dict:
@@ -243,7 +266,7 @@ def run_one_size(sc, compiled, size, device_name, collector, first):
         else:
             dev_args.append(a)
 
-    before = len(find_bundles())
+    before = find_bundles()
     t0 = time.perf_counter()
     try:
         out = compiled(*dev_args)
@@ -257,11 +280,12 @@ def run_one_size(sc, compiled, size, device_name, collector, first):
             "stage": "launch" if at_launch else "compile",
             "error": f"{type(exc).__name__}: {str(exc)[:300]}",
             "where": _blame(tb),
-            "bundles_added": len(find_bundles()) - before,
+            "bundles_added": len(find_bundles() - before),
             "logs": collector.take(),
         }
 
-    added = len(find_bundles()) - before
+    new_bundles = find_bundles() - before
+    added = len(new_bundles)
     outs = out if isinstance(out, (tuple, list)) else (out,)
     refs = ref if isinstance(ref, (tuple, list)) else (ref,)
     errs, shapes = [], []
@@ -286,6 +310,9 @@ def run_one_size(sc, compiled, size, device_name, collector, first):
         "shapes": shapes,
         "recompiled": added > 0,
         "bundles_added": added,
+        # The names, so a disputed "same binary" can be checked after the fact
+        # rather than argued about.
+        "new_bundles": sorted(os.path.basename(os.path.dirname(b)) for b in new_bundles),
         "reservation": sorted(reservation),
         "wall_s": round(wall, 4),
         "logs": collector.take(),
@@ -327,13 +354,13 @@ def run_scenario(sc: Scenario, device_name: str, collector) -> dict:
     collector.take()
     compiled = torch.compile(traced_factory(sc), backend="inductor", fullgraph=True)
 
-    bundles_before = len(find_bundles())
+    bundles_before = find_bundles()
     warm = run_one_size(sc, compiled, sc.warm, device_name, collector, first=True)
     rec["sizes"].append(warm)
     _print_size(warm, sc.warm, sc.granularity)
 
-    new_bundles = find_bundles()[bundles_before:]
-    rec["bundle"] = bundle_facts(new_bundles[-1]) if new_bundles else None
+    fresh = sorted(find_bundles() - bundles_before, key=os.path.getmtime)
+    rec["bundle"] = bundle_facts(fresh[-1]) if fresh else None
 
     if warm["ok"]:
         for size in sc.sizes:
@@ -717,6 +744,7 @@ def main() -> int:
     print(f"python  : {sys.version.split()[0]}")
     print(f"torch   : {torch.__version__}")
     print(f"results : {args.out}  (rewritten after every scenario)")
+    print(f"bundles : {bundle_root()}  (pinned; binary reuse is measured against this)")
 
     # tests/ is not a package on sys.path when run as a script.
     here = os.path.dirname(os.path.abspath(__file__))
