@@ -166,6 +166,29 @@ def _normalize_in_specs(operands, dims, tile_size: int) -> tuple[list[TileSpec],
                     f"which is not a multiple of tile_size={tile_size} (ragged tiles "
                     f"are not supported)"
                 )
+
+            # Having just REFUSED a ragged split, record that refusal as a fact
+            # the ShapeEnv can use, for a symbolic length.
+            #
+            # Without it, _xs_leaf's view cannot prove (S // G) * G == S and
+            # derives the tile extent as S // (S // G) instead of keeping the
+            # literal G. That derived extent is not secretly G -- at S=100,
+            # G=64 it is 100 -- so nothing downstream can simplify it away, and
+            # every pass that assumes a concrete tile then fails: work_division
+            # misreads its interval lower bound as mark_dynamic(min=...), and
+            # coarse_tile's _raw_to_squeezed_pos calls int() on it.
+            #
+            # The branch above only RAISES on a ragged split; passing it does
+            # not by itself leave the fact behind in a form the view's size
+            # inference consults. Stating it explicitly does.
+            #
+            # Deliberately unguarded by any isinstance(length, int) test. A
+            # SymInt satisfies that check here, so such a guard silently skips
+            # the symbolic case -- which is exactly how an earlier version of
+            # this fix did nothing at all. torch._check on a concrete bool is a
+            # cheap no-op, so there is nothing to guard against.
+            torch._check(length % tile_size == 0)
+            torch._check((length // tile_size) * tile_size == length)
             spec = TileSpec(
                 Kind.SLICE,
                 axis,
