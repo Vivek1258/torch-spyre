@@ -2142,10 +2142,27 @@ def _audit_symbolic_ranges(operations: list[Operation], graph=None) -> None:
         if not sym_sizes and not sym_strides:
             continue
         total += 1
+        # The DEVICE layout too, not just the host one. Same blind-spot class
+        # as walking only graph.operations: a hint-sized axis in an input's
+        # device_size is invisible from the host side, and that is exactly
+        # where split-K's A operand goes wrong (device_size=[1, 5, 512, 64],
+        # where 5 is hint//64 while the loop runs to the max 8). Printing both
+        # side by side makes the mismatch attributable in one run instead of
+        # needing a hunt through the layout passes.
+        dev = getattr(layout, "device_layout", None)
+        dev_desc = ""
+        if dev is not None:
+            dev_desc = (
+                f" device_size={list(getattr(dev, 'device_size', []) or [])}"
+                f" stride_map={list(getattr(dev, 'stride_map', []) or [])}"
+            )
         logger.info(
-            "[symbolic-loop][audit] input=%s SYMBOLIC %s",
+            "[symbolic-loop][audit] input=%s SYMBOLIC %s host_size=%s host_stride=%s%s",
             name,
             sym_sizes + sym_strides,
+            [str(v) for v in (getattr(layout, "size", None) or [])],
+            [str(v) for v in (getattr(layout, "stride", None) or [])],
+            dev_desc,
         )
         if sym_strides:
             logger.warning(

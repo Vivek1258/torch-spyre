@@ -29,7 +29,7 @@ from .ir import FixedTiledLayout, SpyreEmptyFallback
 from .loop_info import ReadCopyElisionRecord
 from .optimize_restickify import AnyInNode, EdgeCostMap
 from .logging_utils import get_inductor_logger
-from .pass_utils import patch_env
+from .pass_utils import concretize_expr, patch_env
 from torch._inductor.dependencies import MemoryDep, index_vars_squeeze
 from torch._inductor.graph import GraphLowering
 from torch._inductor.ir import (
@@ -62,6 +62,77 @@ class RestickifyArgInfo:
     dep_index: sympy.Expr | None
     occurrence: int
     target_layout: FixedTiledLayout
+
+
+def _concretize_loop_invariant_restickify(restick_buff, old_name: str) -> None:
+    """Make an in-loop restickify's extent concrete.
+
+    A restickify of a source that is not itself a tiled stage is a FIXED FULL
+    COPY of that source, made once, whose output every trip reads at a fixed
+    address. The code above says so and deliberately hands it a loop_info with
+    no advance on either side; it sits in the loop group only to stay
+    contiguous in build_loop_scheduler_nodes.
+
+    Its range, though, comes from ``base.get_size()`` in lower_restickify, so
+    under a dynamic shape it is the SYMBOL. That breaks the one invariant the
+    symbolic-loop path rests on: inside a loop body everything stays concrete
+    and only the trip count carries a symbol. The failure surfaces a long way
+    downstream and blames the wrong thing -- measured as
+    ``Unsupported: symbolic stick dim d0 is not supported yet (tensor buf32)``
+    from adjust_it_space_for_sticks, which sent us after layouts for a session.
+    It blocked attention and transposed split-K, both at that same line.
+
+    Concretizing to the ShapeEnv MAX (not the hint) is the right value, and it
+    is the same choice concretize_expr already made for this tensor's
+    device_size, so the two agree by construction. A full copy of the
+    max extent is valid at every runtime size because the max-strided HBM
+    reservation has already padded the device buffer to that max. The padded
+    tail may hold garbage, which is harmless: the consumer only reads the tiles
+    the loop actually visits.
+    """
+    if getattr(restick_buff, "loop_info", None) is None:
+        return  # outside a loop a symbolic extent is fine, and already works
+
+    def _fix(seq):
+        return [
+            concretize_expr(v) if getattr(v, "free_symbols", None) else v for v in seq
+        ]
+
+    data = getattr(restick_buff, "data", None)
+    layout = getattr(restick_buff, "layout", None)
+    before_ranges = list(getattr(data, "ranges", None) or [])
+    before_size = list(getattr(layout, "size", None) or [])
+    before_stride = list(getattr(layout, "stride", None) or [])
+    symbolic = [
+        v for v in (*before_ranges, *before_size, *before_stride)
+        if getattr(v, "free_symbols", None)
+    ]
+    if not symbolic:
+        return
+
+    if before_ranges:
+        data.ranges = _fix(before_ranges)
+    if before_size:
+        layout.size = _fix(before_size)
+    if before_stride:
+        layout.stride = _fix(before_stride)
+
+    logger.info(
+        "[symbolic-loop][restickify] %s is a fixed full copy of %s inside a loop "
+        "(count=%s), so its extent must be concrete. ranges %s -> %s, "
+        "layout.size %s -> %s, layout.stride %s -> %s (ShapeEnv max, not the "
+        "hint). Without this the symbol reaches adjust_it_space_for_sticks and "
+        "is reported as an unsupported symbolic stick dim",
+        getattr(restick_buff, "get_name", lambda: "<restickify>")(),
+        old_name,
+        getattr(restick_buff.loop_info, "loop_count", None),
+        [str(v) for v in before_ranges],
+        [str(v) for v in (getattr(data, "ranges", None) or [])],
+        [str(v) for v in before_size],
+        [str(v) for v in (getattr(layout, "size", None) or [])],
+        [str(v) for v in before_stride],
+        [str(v) for v in (getattr(layout, "stride", None) or [])],
+    )
 
 
 def _restickify_dep_index(
@@ -451,6 +522,10 @@ def insert_restickify_on_node_inputs(
             restick_li.squeezed_advance_per_read = []
             restick_li.output_tiled_dims = [[] for _ in range(n_levels)]
             restick_buff.loop_info = restick_li
+
+        # Whichever branch assigned loop_info, an in-loop restickify must not
+        # carry a symbolic extent. See the helper for why and for what breaks.
+        _concretize_loop_invariant_restickify(restick_buff, old_name)
 
         # A saved direct-read form can sit on an identity whose committed
         # layout is incompatible with its consumer.  The deferred restickify
