@@ -179,7 +179,7 @@ def _compile_and_run(a_dev, label):
     try:
         out = compiled(a_dev, GRANULARITY)
         print(f"  {label}: compile COMPLETED, output shape {tuple(out.shape)}")
-        return out
+        return out, compiled
     except Exception:
         tb = traceback.format_exc()
         # Distinguish COMPILE from LAUNCH. Once the bundle is on disk the
@@ -196,7 +196,7 @@ def _compile_and_run(a_dev, label):
             )
         )
         print(tb)
-        return None
+        return None, compiled
 
 
 def stage_2_and_3_specs():
@@ -216,7 +216,7 @@ def stage_2_and_3_specs():
     # --- control: same kernel, concrete shape -------------------------------
     # If this fails, the symbolic result below means nothing.
     print("\n  [control] concrete shape, no mark_dynamic")
-    out = _compile_and_run(a.to(DEVICE_NAME), "control")
+    out, _ = _compile_and_run(a.to(DEVICE_NAME), "control")
     if out is not None:
         err = (out.cpu().float() - ref).abs().max().item()
         print(f"  control: max abs error vs CPU = {err:.4f}")
@@ -254,7 +254,7 @@ def stage_2_and_3_specs():
     # divisibility guard then violates. The range is declared with torch._check
     # inside _abs_tiled_fn instead, see the comment there.
     torch._dynamo.mark_dynamic(a_dev, 0)
-    out = _compile_and_run(a_dev, "experiment")
+    out, compiled = _compile_and_run(a_dev, "experiment")
     if out is not None:
         err = (out.cpu().float() - ref).abs().max().item()
         print(f"  experiment: max abs error vs CPU = {err:.4f}")
@@ -273,33 +273,100 @@ def stage_2_and_3_specs():
         "  Read the control line first. If the control also failed, the harness\n"
         "  is wrong and the experiment tells you nothing."
     )
-    return True
+    return compiled
 
 
-def stage_4_find_bundles():
-    """Locate and print any bundle.mlir this run produced."""
-    stage(4, "emitted bundle.mlir")
+def _find_bundles() -> list:
+    """Every bundle.mlir under the cache root, newest-last.
+
+    Also the recompile detector: one more bundle after a call means that call
+    compiled a new kernel, which is the opposite of "one binary, many sizes".
+    """
     roots = [
         os.environ.get("TORCHINDUCTOR_CACHE_DIR", ""),
         os.path.expanduser("~/.cache/torch_spyre"),
         "/tmp",
         os.getcwd(),
     ]
-    found = []
     for root in roots:
         if not root or not os.path.isdir(root):
             continue
+        found = []
         for dirpath, _, filenames in os.walk(root):
             if "bundle.mlir" in filenames:
                 found.append(os.path.join(dirpath, "bundle.mlir"))
         if found:
-            break
+            return sorted(found, key=os.path.getmtime)
+    return []
+
+
+def stage_5_one_binary_many_sizes(compiled):
+    """The other half of the acceptance gate: does ONE binary serve N sizes?
+
+    A live symbolic bound in the bundle is necessary but not sufficient. The
+    claim that matters operationally is that the SAME compiled artifact runs at
+    a different runtime size with no recompile and correct numbers. This calls
+    the already-compiled callable at other multiples of the granularity and
+    checks both.
+
+    Expect this to be where the hint-sized output buffer shows up. The bundle
+    bakes the output's per-core offset from device_size, which is built from the
+    warm-up size, while the input's is max-based thanks to #4326. A per-core
+    offset is an ADDRESS, so a wrong one gives wrong numbers rather than a
+    crash. If a size other than the warm-up one is wrong, that is the finding,
+    and it is the argument for sizing wrapper-allocated buffers from the
+    symbol's upper bound.
+    """
+    stage(5, "one binary, many sizes (the acceptance gate's other half)")
+    if compiled is None:
+        print("  no compiled callable from stage 2, nothing to try")
+        return
+    from torch_spyre.constants import DEVICE_NAME
+
+    results = []
+    for rows in (GRANULARITY, 2 * GRANULARITY, 4 * GRANULARITY, 7 * GRANULARITY, MAX_ROWS):
+        if rows == ROWS:
+            continue
+        before = len(_find_bundles())
+        a = torch.randn(rows, COLS, dtype=torch.float16)
+        ref = a.float().abs()
+        try:
+            try:
+                a_dev = a.to(DEVICE_NAME, max=MAX_ROWS)
+            except (TypeError, ValueError):
+                a_dev = a.to(DEVICE_NAME)
+            torch._dynamo.mark_dynamic(a_dev, 0)
+            out = compiled(a_dev, GRANULARITY)
+            err = (out.cpu().float() - ref).abs().max().item()
+            after = len(_find_bundles())
+            recompiled = after > before
+            ok = err < 0.01 and not recompiled
+            results.append((rows, f"err={err:.4f}", "RECOMPILED" if recompiled else "same binary", ok))
+        except Exception as exc:  # noqa: BLE001
+            results.append((rows, f"RAISED {type(exc).__name__}: {exc}", "-", False))
+
+    print(f"  warm-up size was {ROWS} rows ({ROWS // GRANULARITY} tiles)\n")
+    for rows, detail, binary, ok in results:
+        print(f"  [{'yes' if ok else 'NO '}] {rows:>4} rows ({rows // GRANULARITY} tiles)  "
+              f"{detail}  {binary}")
+    passed = sum(1 for *_, ok in results if ok)
+    print(
+        f"\n  {passed}/{len(results)} other sizes ran correctly on the same binary.\n"
+        f"  Anything other than all of them means the artifact is specialised to\n"
+        f"  one size, which is the false-green the contract warns about."
+    )
+
+
+def stage_4_find_bundles():
+    """Locate and print any bundle.mlir this run produced."""
+    stage(4, "emitted bundle.mlir")
+    found = _find_bundles()
 
     if not found:
         print("  no bundle.mlir found. Set TORCHINDUCTOR_CACHE_DIR and rerun.")
         return
 
-    newest = max(found, key=os.path.getmtime)
+    newest = found[-1]
     print(f"  newest of {len(found)} bundle(s): {newest}\n")
     with open(newest) as f:
         text = f.read()
@@ -355,12 +422,21 @@ def main() -> int:
     # Each stage is isolated: an early stage blowing up must not hide the
     # later ones, because the later ones are the interesting part. A probe
     # that stops at the first traceback costs a whole round trip to the pod.
+    compiled = None
     for fn in (stage_1_symbol_and_range, stage_2_and_3_specs, stage_4_find_bundles):
         try:
-            fn()
+            result = fn()
+            if fn is stage_2_and_3_specs:
+                compiled = result
         except Exception:
             print(f"\n  STAGE FUNCTION {fn.__name__} RAISED, continuing anyway:")
             traceback.print_exc()
+    # Last, because it reuses the artifact stage 2 built and stage 4 printed.
+    try:
+        stage_5_one_binary_many_sizes(compiled)
+    except Exception:
+        print("\n  STAGE FUNCTION stage_5_one_binary_many_sizes RAISED:")
+        traceback.print_exc()
     print(f"\n{BANNER}\nProbe finished. Send this entire output back.\n{BANNER}")
     return 0
 

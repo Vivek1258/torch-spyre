@@ -293,12 +293,40 @@ def concretize_expr(expr: Union[Expr, int]) -> int:
     output expressions are never touched, so the generated coordinate
     expressions remain symbolic and will carry through to the SDSC when
     symbolic SDSC generation is implemented.
+
+    A structural parameter that depends on a varying dimension resolves to that
+    dimension's MAXIMUM, not to this call's hint. One binary has to stay valid
+    for every runtime size in the declared range, and the hint is one warm-up
+    call's size.
+
+    MEASURED, 2026-10-03, with the hint: one binary was correct at 128 and 256
+    rows against a geometry built for the 320-row warm-up, and WRONG at 448
+    (err 3.96) and 512 (err 4.37). So over-declaring the geometry is harmless
+    and under-declaring it is fatal, which puts the max at the safe end. This is
+    the same reasoning as ``spyre_empty_reserved`` (torch-spyre#4326), which
+    builds the SpyreTensorLayout from a padded shape while the DMA stays at the
+    real shape; that covers tensors the user moves to the device, and this
+    covers the ones the compiler allocates.
+
+    Only when the symbol has a DECLARED finite upper bound. Without one there is
+    nothing better than the hint, so that path is unchanged.
     """
     if isinstance(expr, int):
         return expr
     if isinstance(expr, sympy.Integer):
         return int(expr)
     if hasattr(expr, "free_symbols") and expr.free_symbols:
+        upper = finite_upper_or_none(expr)
+        if upper is not None:
+            logger.info(
+                "[symbolic-loop][concretize] %s -> %d (ShapeEnv max, not the "
+                "hint %s). One binary must stay valid at every size in the "
+                "declared range",
+                expr,
+                upper,
+                V.graph.sizevars.optimization_hint(expr),
+            )
+            return upper
         return V.graph.sizevars.optimization_hint(expr)
     return int(expr)
 

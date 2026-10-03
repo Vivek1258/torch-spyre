@@ -1,0 +1,111 @@
+"""Which guards does the output-side flatten add, and can a spelling avoid them?
+
+Pure PyTorch. No torch_spyre import, no device, no compile, so it needs NO
+reinstall -- just `python tests/inductor/probe_output_flatten_guards.py`.
+
+Background. for_each_tile's `_stacked_to_full` folds scan's stacked output
+[count, extent, W] down to [count*extent, W] with `flatten(0, 1)`. Under a
+symbolic count that flatten installs guards, and one of them showed up in a real
+ConstraintViolationError as:
+
+    (L['a'].size()[0] // 64) != 1
+
+which makes the compiled artifact valid only for count != 1, so a 1-tile call
+recompiles. Measured: 64 rows is CORRECT but on a second binary.
+
+Two more appeared alongside it, both always-true-but-unprovable:
+
+    0 <= S - 64*(S//64)                        <- the narrow's own bounds check
+    ((S//64) % (64*(S//64))) != 0
+
+This asks torch directly which spelling of the fold adds which guards, so a fix
+is chosen from evidence rather than from a guess about the reshape helper.
+"""
+
+import traceback
+
+import torch
+from torch._dynamo.source import LocalSource
+from torch._subclasses.fake_tensor import FakeTensorMode
+from torch.fx.experimental.symbolic_shapes import DimDynamic, ShapeEnv
+
+G = 64
+S_HINT = 320
+MAX_ROWS = 512
+WIDTH = 128
+
+print(f"torch {torch.__version__}")
+
+RESULTS = []
+
+
+def fresh():
+    """A fake [S, 128] with dim 0 symbolic and the range we actually declare."""
+    shape_env = ShapeEnv()
+    mode = FakeTensorMode(shape_env=shape_env)
+    src = LocalSource("a")
+    with mode:
+        sym = shape_env.create_symbol(S_HINT, src, DimDynamic.DYNAMIC)
+        s = shape_env.create_symintnode(sym, hint=S_HINT, source=src)
+        x = torch.empty(s, WIDTH)
+        # Same way the probe declares it, so the guard set is comparable.
+        torch._check(s >= G)
+        torch._check(s <= MAX_ROWS)
+    return shape_env, mode, s, x
+
+
+def guard_strs(shape_env) -> list:
+    out = []
+    for g in getattr(shape_env, "guards", []) or []:
+        expr = getattr(g, "expr", g)
+        out.append(str(expr))
+    return out
+
+
+def case(name, fold):
+    """Build the stacked ys, fold it, and report only the NEW guards."""
+    print("\n" + "=" * 78)
+    print(f"CASE {name}")
+    shape_env, mode, s, x = fresh()
+    try:
+        with mode:
+            count = s // G
+            # What scan hands back: [count, extent, W], stacked on dim 0.
+            ys = torch.empty(count, G, WIDTH)
+            before = set(guard_strs(shape_env))
+            out = fold(ys, count)
+            new = [g for g in guard_strs(shape_env) if g not in before]
+        print(f"  result shape = {list(out.shape)}")
+        print(f"  new guards ({len(new)}):")
+        for g in new:
+            print(f"    {g}")
+        suspicious = [g for g in new if "!= 1" in g or "Ne" in g]
+        RESULTS.append((name, list(out.shape), len(new), suspicious))
+    except Exception as exc:  # noqa: BLE001
+        print(f"  RAISED {type(exc).__name__}: {exc}")
+        print("  " + "\n  ".join(traceback.format_exc().splitlines()[-3:]))
+        RESULTS.append((name, "RAISED", -1, [str(exc)]))
+
+
+# What for_each_tile does today.
+case("A flatten(0, 1)  (today)", lambda ys, n: ys.flatten(0, 1))
+
+# Spellings that might avoid the per-dim walk in the reshape helper.
+case("B reshape(-1, W)", lambda ys, n: ys.reshape(-1, WIDTH))
+case("C view(n*G, W)", lambda ys, n: ys.view(n * G, WIDTH))
+case("D as_strided((n*G, W), (W, 1))  -- sizes taken verbatim",
+     lambda ys, n: ys.as_strided((n * G, WIDTH), (WIDTH, 1)))
+
+print("\n" + "=" * 78)
+print("SUMMARY  (want: correct shape, and NO '!= 1' guard)")
+for name, shape, n_new, suspicious in RESULTS:
+    flag = "OK  " if n_new >= 0 and not suspicious else "    "
+    print(f"  {flag}{name}")
+    print(f"        shape={shape}  new_guards={n_new}")
+    for g in suspicious:
+        print(f"        SUSPICIOUS: {g}")
+print(
+    "\n  A spelling with no '!= 1' guard and the right shape is the fix for the\n"
+    "  1-tile recompile. If every spelling adds it, the guard is inherent to\n"
+    "  folding a symbolic leading dim and the recompile is the cost of it."
+)
