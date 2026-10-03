@@ -32,6 +32,7 @@ if TYPE_CHECKING:
 import torch
 import torch._prims_common as utils
 from torch._higher_order_ops.scan import scan
+from torch.fx.experimental.symbolic_shapes import statically_known_true
 from torch.utils._pytree import tree_leaves
 
 __all__ = ["Gather", "for_each_tile"]
@@ -282,7 +283,27 @@ def _stacked_to_full(ys: torch.Tensor, dim: int) -> torch.Tensor:
     storage, since the flatten merges two contiguous leading axes. For dim != 0 the
     flatten crosses the moved axis, which strides cannot express, so it copies the whole
     output ((3, 8, 2) -> (8, 6)); Phase 7 removes that by writing tile i in place.
+
+    For the dim == 0 case this folds with `as_strided` rather than `flatten`, which
+    produces the identical tensor but installs no guards. `flatten`, `reshape` and
+    `view` all walk the dims and, on a symbolic leading extent, each add two:
+
+        Ne(count, 1)        and        Ne(Mod(count, G * count), 0)
+
+    The first makes the compiled artifact invalid for a one-tile call, so a request
+    at exactly the granularity recompiles instead of reusing the binary. Measured
+    in tests/inductor/probe_output_flatten_guards.py, where as_strided is the only
+    spelling of the four that adds nothing.
+
+    Guarded on the leading axes being PROVABLY contiguous, with
+    `statically_known_true` so the check itself installs no guard. as_strided takes
+    strides on trust, so a non-contiguous ys would be silently wrong, where flatten
+    would correctly copy. If it cannot be proven we take the flatten and accept the
+    two guards: slower to specialise, never wrong.
     """
+    if dim == 0 and statically_known_true(ys.stride(0) == ys.size(1) * ys.stride(1)):
+        folded = (ys.size(0) * ys.size(1), *ys.shape[2:])
+        return ys.as_strided(folded, ys.stride()[1:])
     return _movedim(ys, 0, dim).flatten(dim, dim + 1)
 
 
