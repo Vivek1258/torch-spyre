@@ -40,6 +40,7 @@ from torch.utils._sympy.functions import FloorDiv
 from torch_spyre._inductor.codegen.bundle import (
     _decompose_symbolic_count,
     _loop_level,
+    _scaled_level_strides,
     generate_bundle,
 )
 from torch_spyre._inductor.op_spec import LoopSpec, OpSpec
@@ -179,6 +180,43 @@ class TestLoopLevelPlan(unittest.TestCase):
             _loop_level(FloorDiv(sym, 64), 0, {SYM_NAME: "%dim_s0"})
         self.assertIn("s9", str(ctx.exception))
         self.assertIn("count_symbol_bounds", str(ctx.exception))
+
+
+class TestScaledLevelStrides(unittest.TestCase):
+    """The affine stride scaling, which TWO call sites depend on agreeing.
+
+    _collect_affine_maps builds the map index from this and _emit_specs looks it
+    up. When only the building side scaled, emission died with a bare
+    `KeyError: (8192,)` against a table keyed `(128,)`. Both now call this one
+    function, so the divergence is structurally impossible, and these pin its
+    behaviour.
+    """
+
+    def test_symbolic_level_shrinks_by_its_step(self):
+        # 8192 elements per tile, loop steps by 64, so 128 per unit of loop var.
+        self.assertEqual(
+            list(_scaled_level_strides([{"s": 8192}], [GRANULARITY])), [(0, 128)]
+        )
+
+    def test_concrete_level_is_untouched(self):
+        self.assertEqual(list(_scaled_level_strides([{"s": 8192}], [1])), [(0, 8192)])
+
+    def test_missing_scale_defaults_to_one(self):
+        """A level with no recorded scale must behave exactly as before."""
+        self.assertEqual(list(_scaled_level_strides([{"s": 8192}], [])), [(0, 8192)])
+
+    def test_empty_levels_are_skipped_but_keep_their_index(self):
+        """The index is what aligns a stride to its loop variable."""
+        self.assertEqual(
+            list(_scaled_level_strides([{}, {"s": 8192}], [1, GRANULARITY])),
+            [(1, 128)],
+        )
+
+    def test_non_divisible_stride_raises(self):
+        """Silently mis-addressing is the worst outcome here, so refuse."""
+        with self.assertRaises(AssertionError) as ctx:
+            list(_scaled_level_strides([{"s": 100}], [GRANULARITY]))
+        self.assertIn("not divisible", str(ctx.exception))
 
 
 class TestSymbolicLoopBundle(InductorTestCase):

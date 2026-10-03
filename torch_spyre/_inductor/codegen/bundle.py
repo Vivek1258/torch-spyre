@@ -779,6 +779,37 @@ def _symbolic_count_sources_in_specs(specs: list) -> "dict[str, tuple[int, int]]
 # ---------------------------------------------------------------------------
 
 
+def _scaled_level_strides(per_level_strides, scale_stack):
+    """Yield ``(level_idx, stride)`` in affine-map key order, scaled per level.
+
+    ONE place does this. ``_collect_affine_maps`` BUILDS the map index from this
+    and ``_emit_specs`` LOOKS IT UP, so if the two compute the key even slightly
+    differently the result is a bare ``KeyError`` at emit time with nothing to
+    say why. That has happened once already, ``(8192,)`` looked up against a
+    table keyed ``(128,)``, when only the building side applied the scale.
+
+    A symbolic level's loop variable steps by its tile size instead of by 1, so
+    every stride multiplying it shrinks by that same factor. Exact by
+    construction: the stride IS the tile size times the per-element step.
+    """
+    for level_idx, level_strides in enumerate(per_level_strides):
+        if not level_strides:
+            continue
+        scale = scale_stack[level_idx] if level_idx < len(scale_stack) else 1
+        for stride in level_strides.values():
+            if scale != 1:
+                if stride % scale != 0:
+                    raise AssertionError(
+                        f"affine stride {stride} is not divisible by the loop "
+                        f"step {scale} at level {level_idx}. A symbolic level "
+                        f"steps by its tile size, so its strides must be a "
+                        f"multiple of it, or the loop variable and the stride "
+                        f"disagree about what one step means."
+                    )
+                stride = stride // scale
+            yield level_idx, stride
+
+
 def _collect_affine_maps(
     specs: list,
     compiled_iter,
@@ -836,35 +867,16 @@ def _collect_affine_maps(
                 # Build stride_key and lv_indices by iterating levels explicitly.
                 stride_vals: list[int] = []
                 lv_idxs: list[int] = []
-                for level_idx, level_strides in enumerate(per_level_strides):
-                    if not level_strides:
-                        continue
+                for level_idx, stride in _scaled_level_strides(
+                    per_level_strides, scale_stack
+                ):
                     assert level_idx < len(loop_var_depth), (
                         f"affine_strides has {len(per_level_strides)} levels but "
                         f"only {len(loop_var_depth)} enclosing loop(s); "
                         "create_op_spec built more tiled_syms levels than LoopSpec ancestors"
                     )
-                    lv = loop_var_depth[level_idx]
-                    scale = (
-                        scale_stack[level_idx] if level_idx < len(scale_stack) else 1
-                    )
-                    for stride in level_strides.values():
-                        if scale != 1:
-                            # Exact by construction: this level's stride is its
-                            # per-element step times the tile size, and `scale`
-                            # IS that tile size. If it ever is not, the loop
-                            # variable and the stride disagree about what one
-                            # step means, which would silently mis-address.
-                            if stride % scale != 0:
-                                raise AssertionError(
-                                    f"affine stride {stride} is not divisible by "
-                                    f"the loop step {scale} at level {level_idx}. "
-                                    f"A symbolic level steps by its tile size, so "
-                                    f"its strides must be a multiple of it."
-                                )
-                            stride = stride // scale
-                        stride_vals.append(stride)
-                        lv_idxs.append(lv)
+                    stride_vals.append(stride)
+                    lv_idxs.append(loop_var_depth[level_idx])
                 if not stride_vals:
                     per_tensor_lv_indices.append([])
                     continue
@@ -1042,12 +1054,17 @@ def _emit_specs(
     indent: int,
     kernel_sym_to_arg_idx: dict | None = None,
     sym_canonical: dict | None = None,
+    loop_scales: list | None = None,
 ) -> None:
     """Recursively emit MLIR ops for specs into file f."""
     if kernel_sym_to_arg_idx is None:
         kernel_sym_to_arg_idx = {}
     if sym_canonical is None:
         sym_canonical = {}
+    # Parallel to loop_vars: the stride scale of each enclosing loop level, in
+    # the same order. Threaded the same way so the two cannot get out of step.
+    if loop_scales is None:
+        loop_scales = []
 
     # Map from 0-based symbol index to the short SSA name for kernel-arg symbols.
     # sym_idx → %arg_{arg_index}  (the result of input_arg_extract in the function body)
@@ -1089,6 +1106,7 @@ def _emit_specs(
                 indent + 1,
                 kernel_sym_to_arg_idx=kernel_sym_to_arg_idx,
                 sym_canonical=sym_canonical,
+                loop_scales=loop_scales + [level.stride_scale],
             )
             f.write(f"{tab}}}\n")
 
@@ -1119,8 +1137,9 @@ def _emit_specs(
                 # outermost-first order used by _collect_affine_maps.
                 flat_strides: list[int] = [
                     stride
-                    for level_strides in per_level_strides
-                    for stride in level_strides.values()
+                    for _, stride in _scaled_level_strides(
+                        per_level_strides, loop_scales
+                    )
                 ]
                 if not flat_strides:
                     continue
