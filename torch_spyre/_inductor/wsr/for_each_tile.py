@@ -167,28 +167,15 @@ def _normalize_in_specs(operands, dims, tile_size: int) -> tuple[list[TileSpec],
                     f"are not supported)"
                 )
 
-            # Having just REFUSED a ragged split, record that refusal as a fact
-            # the ShapeEnv can use, for a symbolic length.
-            #
-            # Without it, _xs_leaf's view cannot prove (S // G) * G == S and
-            # derives the tile extent as S // (S // G) instead of keeping the
-            # literal G. That derived extent is not secretly G -- at S=100,
-            # G=64 it is 100 -- so nothing downstream can simplify it away, and
-            # every pass that assumes a concrete tile then fails: work_division
-            # misreads its interval lower bound as mark_dynamic(min=...), and
-            # coarse_tile's _raw_to_squeezed_pos calls int() on it.
-            #
-            # The branch above only RAISES on a ragged split; passing it does
-            # not by itself leave the fact behind in a form the view's size
-            # inference consults. Stating it explicitly does.
-            #
-            # Deliberately unguarded by any isinstance(length, int) test. A
-            # SymInt satisfies that check here, so such a guard silently skips
-            # the symbolic case -- which is exactly how an earlier version of
-            # this fix did nothing at all. torch._check on a concrete bool is a
-            # cheap no-op, so there is nothing to guard against.
+            # Having just refused a ragged split, record that refusal as a
+            # fact, for a symbolic length. The `!=` test above already guards
+            # it, but stating it puts Mod(S, G) in ShapeEnv.divisible, which is
+            # what lets simplify fold the G * (S // G) that _xs_leaf's trim
+            # produces back to S. It does NOT help the view keep the extent
+            # literal, the trim in _xs_leaf does that. Unguarded by any
+            # isinstance(length, int) test on purpose: a SymInt passes that
+            # check, so such a guard would skip the symbolic case silently.
             torch._check(length % tile_size == 0)
-            torch._check((length // tile_size) * tile_size == length)
             spec = TileSpec(
                 Kind.SLICE,
                 axis,
@@ -244,43 +231,33 @@ def _xs_leaf(operand: torch.Tensor, spec: TileSpec) -> torch.Tensor:
         return spec.index
     moved = _movedim(operand, spec.dim, 0)
 
-    # Splitting dim 0 is always expressible in strides, so this is a view.
+    # Trim to num_tiles * extent, THEN split. Both are views, so no copy, and
+    # the rows the trim drops are the ragged tail _normalize_in_specs has
+    # already refused to accept. For a concrete length it drops nothing.
+    #
+    # The trim is what keeps the tile extent a literal under a symbolic length.
+    # A view has to reconcile the sizes it is handed against numel. Given S it
+    # cannot prove (S // G) * G == S, so it re-derives the extent as S // (S // G).
+    # That is not secretly G, at S=100 it is 100, so nothing downstream can fold
+    # it and every pass that assumes a concrete tile breaks. Given G * (S // G)
+    # instead, the trailing factor it computes is FloorDiv(G * n, n), which
+    # cancels by gcd to the literal G with no prover involved.
+    #
+    # Measured on torch 2.13 over every spelling, see
+    # tests/inductor/probe_view_extent_spellings.py: pinning the count, pinning
+    # the extent with -1, view, reshape, and torch._check on the product all
+    # give the derived extent. Trimming first is the only form that keeps it a
+    # literal. as_strided also does, but it takes sizes verbatim with no numel
+    # check at all, which is a worse thing to rely on.
     #
     # `torch.unflatten`, not `Tensor.unflatten`: the method has a Python body
     # (`return super().unflatten(...)`, torch/_tensor.py) that dynamo normally
     # never reaches. Under an active `torch.device` mode -- vLLM runs its model
     # inside one -- DeviceContext.__torch_function__ re-dispatches into that body
     # and dynamo cannot trace the `super()` call. The free function has no body.
-    # WHICH dimension is pinned decides whether a symbolic length works at all.
-    #
-    # A view is given sizes and a numel it must match. It keeps what it is
-    # handed and INFERS whatever is needed to make the product come out. Passing
-    # (length // extent, extent) pins the tile COUNT, which is the symbolic one,
-    # and leaves the tile EXTENT to be inferred. Unable to prove
-    # (S // extent) * extent == S, the view re-derives the extent as
-    # S // (S // extent): always exactly `extent`, never simplified, and with an
-    # interval of [extent // max_tiles, S_max].
-    #
-    # That is backwards. The extent is a compile-time constant and everything
-    # below here needs it to stay one -- work_division reads its lower bound as
-    # the user's mark_dynamic(min=...), coarse_tile's _raw_to_squeezed_pos calls
-    # int() on it, and the SDSC describes a tile of exactly that size. The COUNT
-    # is the only thing allowed to vary.
-    #
-    # So pin the extent and let the count be derived. -1 is the view's own way
-    # of saying "work this one out", and because the count is what gets derived,
-    # the extent survives as the literal it was passed in as.
-    #
-    # Unconditional on purpose. For a concrete length, -1 infers exactly
-    # length // extent, so the result is identical to spelling it out, and there
-    # is no symbolic-vs-concrete test to get wrong. An earlier version branched
-    # on isinstance(length, int) and silently sent the symbolic case down the
-    # concrete path, because a SymInt satisfies that check here.
-    #
-    # Asserting the relationship instead (torch._check on the product, or on
-    # divisibility, at this call site or in the caller) does not help: the view
-    # does not consult deferred runtime asserts when choosing what to derive.
-    return torch.unflatten(moved, 0, (-1, spec.extent))
+    tiles = spec.num_tiles
+    trimmed = moved.narrow(0, 0, tiles * spec.extent)
+    return torch.unflatten(trimmed, 0, (tiles, spec.extent))
 
 
 def _tile(operand: torch.Tensor, spec: TileSpec, sliced: torch.Tensor) -> torch.Tensor:

@@ -2093,9 +2093,59 @@ def _apply_input_layout_overrides(
     ]
 
 
+def _audit_symbolic_ranges(operations: list[Operation]) -> None:
+    """Report every op whose iteration space is not concrete, once, by name.
+
+    The invariant the symbolic-loop path relies on is that inside a loop body
+    everything stays concrete and only the trip count carries a symbol. Every
+    squeeze test below here does ``int(r)`` on a range (nine of them across
+    coarse_tile and work_division_constraints), so a symbol that reaches
+    ``ranges`` fails much later as a bare "Cannot convert symbols to int" with
+    no op name attached. Say it here instead, before anything consumes it.
+    """
+    if not logger.isEnabledFor(logging.INFO):
+        return
+    total = 0
+    for op in operations:
+        data = getattr(op, "data", None)
+        ranges = list(getattr(data, "ranges", None) or [])
+        reduction_ranges = list(getattr(data, "reduction_ranges", None) or [])
+        symbolic = [
+            f"{kind}[{i}]={r}"
+            for kind, seq in (("range", ranges), ("reduction", reduction_ranges))
+            for i, r in enumerate(seq)
+            if getattr(r, "free_symbols", None)
+        ]
+        if not symbolic:
+            continue
+        total += 1
+        loop_info = getattr(op, "loop_info", None)
+        try:
+            name = op.get_name()
+        except Exception:  # noqa: BLE001  # some ops have no name yet
+            name = repr(op)
+        logger.info(
+            "[symbolic-loop][audit] op=%s in_loop=%s loop_count=%s ranges=%s "
+            "reduction_ranges=%s SYMBOLIC=%s",
+            name,
+            loop_info is not None,
+            getattr(loop_info, "loop_count", None),
+            [str(r) for r in ranges],
+            [str(r) for r in reduction_ranges],
+            symbolic,
+        )
+    logger.info(
+        "[symbolic-loop][audit] %d op(s) carry a symbolic iteration space. Any "
+        "of them with in_loop=True breaks the int(r) squeeze tests downstream; "
+        "the trip count itself belongs in loop_info, not in ranges",
+        total,
+    )
+
+
 def span_reduction(graph: GraphLowering) -> None:
     """Pass 1: compute minimum per-op splits required by MAX_SPAN_BYTES."""
     operations = graph.operations
+    _audit_symbolic_ranges(operations)
     max_cores = _validate_max_cores()
     for op in _iter_computed_buffers(operations):
         rw = op_read_writes(op)
