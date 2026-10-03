@@ -752,6 +752,19 @@ def main() -> int:
     if repo not in sys.path:
         sys.path.insert(0, repo)
 
+    # Turn the spyre loggers up BEFORE importing torch_spyre. get_logger()
+    # sets each child logger's level from the config AT CREATION TIME, so
+    # raising the level afterwards on the parent "spyre" logger does nothing:
+    # a child with its own explicit level ignores the parent's. That is why an
+    # earlier run captured only WARNINGs while this harness advertised "the
+    # captured [symbolic-loop] trace for every scenario". setdefault, so an
+    # explicit env from the command line still wins.
+    #
+    # NOT TORCH_LOGS. TORCH_LOGS="+spyre.inductor" breaks `import torch`
+    # itself; these are torch-spyre's own variables and are safe.
+    os.environ.setdefault("SPYRE_INDUCTOR_LOG", "1")
+    os.environ.setdefault("SPYRE_INDUCTOR_LOG_LEVEL", "INFO")
+
     try:
         import torch_spyre  # noqa: F401
         from torch_spyre.constants import DEVICE_NAME
@@ -764,6 +777,15 @@ def main() -> int:
     spyre_log = logging.getLogger("spyre")
     spyre_log.addHandler(collector)
     spyre_log.setLevel(logging.INFO)
+    # Any spyre.* logger created before this point carries its own level, so
+    # lower it explicitly. Without this the collector sees only WARNINGs no
+    # matter what the parent says.
+    forced = 0
+    for name, obj in list(logging.Logger.manager.loggerDict.items()):
+        if name.startswith("spyre") and isinstance(obj, logging.Logger):
+            obj.setLevel(logging.INFO)
+            forced += 1
+    print(f"logging : {forced} existing spyre.* logger(s) forced to INFO")
 
     scenarios = build_matrix()
     if args.skip_size:
@@ -848,8 +870,16 @@ def main() -> int:
         if rec.get("predict") and v != "works":
             print(f"         predicted: {rec['predict'][:100]}")
     print(f"\n  wrote {args.out}")
+    n_logs = sum(
+        len(r.get("logs") or [])
+        for rec in out["scenarios"]
+        for r in rec.get("sizes", [])
+    )
     print("  Send that file back. It carries the per-size numbers, the bundle")
-    print("  facts and the captured [symbolic-loop] trace for every scenario.")
+    print(f"  facts and {n_logs} captured [symbolic-loop] log line(s).")
+    if n_logs < 5 * max(1, len(out["scenarios"])):
+        print("  WARNING: that is suspiciously few log lines. The spyre loggers")
+        print("  were probably still at WARNING, so the trace is INCOMPLETE.")
     return 0
 
 

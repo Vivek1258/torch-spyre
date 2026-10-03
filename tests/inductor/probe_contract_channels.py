@@ -810,6 +810,15 @@ print("  comparison does NOT move the lower bound, so that explanation is dead."
 print("  These cases reproduce the real setup one element at a time.")
 
 
+def lower_of(shape_env, s):
+    """The lower bound compute_granularity would actually read."""
+    expr = s.node.expr if hasattr(s, "node") else s
+    try:
+        return int(shape_env.bound_sympy(expr).lower)
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def bounds_report(shape_env, s, label):
     """Both channels side by side: var_to_range AND bound_sympy.
 
@@ -845,7 +854,11 @@ def _():
         torch._check(s >= 64)
         torch._check(s <= MAX_SIZE)
         torch._check(s % 64 == 0)
-    return bounds_report(shape_env, s, "after >=64, <=512, %64==0:"), "as_predicted"
+    low = lower_of(shape_env, s)
+    return (
+        bounds_report(shape_env, s, "after >=64, <=512, %64==0:"),
+        "as_predicted" if low == 64 else "SURPRISE",
+    )
 
 
 @case(
@@ -874,7 +887,7 @@ def _():
     return (
         bounds_report(shape_env, s, "two marks, one of them a stride:")
         + f"\n  a.stride() = {a.stride()}",
-        "as_predicted",
+        "as_predicted" if lower_of(shape_env, s) == 64 else "SURPRISE",
     )
 
 
@@ -902,7 +915,10 @@ def _():
         n = a.size(1) // 64
         trimmed = a.narrow(1, 0, n * 64)
         _ = torch.unflatten(trimmed, 1, (n, 64))
-    return before + "\n" + bounds_report(shape_env, s, "after trim and split:"), "as_predicted"
+    return (
+        before + "\n" + bounds_report(shape_env, s, "after trim and split:"),
+        "as_predicted" if lower_of(shape_env, s) == 64 else "SURPRISE",
+    )
 
 
 @case(
@@ -911,8 +927,9 @@ def _():
     "If something asserts divisibility by 128 as well as 64, does bound_sympy's "
     "lower become 128? That would explain the device reading, since the real "
     "flow has several operands and several checks.",
-    "a %128 fact plus >=64 could legitimately lift the lower bound to 128, "
-    "because the smallest multiple of 128 at or above 64 IS 128",
+    "the bound stays at 64. Divisibility and range are tracked separately, so "
+    "a stronger divisibility fact does NOT narrow the range, even though the "
+    "smallest multiple of 128 at or above 64 is mathematically 128",
 )
 def _():
     shape_env, mode, s, _x = fresh(hint=256)
@@ -922,7 +939,11 @@ def _():
         first = bounds_report(shape_env, s, "after >=64 and %64:")
         torch._check(s % 128 == 0)
         second = bounds_report(shape_env, s, "after ALSO %128:")
-    return first + "\n" + second, "as_predicted"
+    # The real question: did the extra %128 fact lift the bound? It must NOT.
+    return (
+        first + "\n" + second,
+        "as_predicted" if lower_of(shape_env, s) == 64 else "SURPRISE",
+    )
 
 
 # ---------------------------------------------------------------------------
