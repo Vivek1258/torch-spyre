@@ -67,6 +67,7 @@ from .pass_utils import (
     finite_upper_or_none,
     iteration_space,
     iteration_space_with_splits,
+    max_trip_count,
     indirect_access_subs_from_kernel,
     input_layout_for_operation,
     is_restickify_coords,
@@ -1000,7 +1001,10 @@ class SpyreKernel(Kernel[CSEVariable]):
                     level_syms.append(self._get_or_mint_level_symbol(lvl, op_name))
                 tiled_syms_per_level_outermost.append(level_syms)
                 if lvl < len(loop_count):
-                    trip_count = int(loop_count[lvl])
+                    # Not int(): a symbolic count has no single value, and what
+                    # SDSC needs here is the dimension's largest extent. See
+                    # max_trip_count.
+                    trip_count = max_trip_count(loop_count[lvl])
                     for sym in level_syms:
                         tiled_symbol_trip_counts[sym] = trip_count
             # Reverse so index 0 = innermost level.
@@ -1445,12 +1449,92 @@ class SpyreKernel(Kernel[CSEVariable]):
                     else tensor_arg.arg_index
                 ]
 
+        self._resolve_loop_dimension_sources(actuals)
+
         buf = IndentedBuffer()
         buf.writeline("[")
         with buf.indent():
             _codegen_op_spec_list(self.op_specs, buf, sympy_str)
         buf.writeline("]")
         return buf.getvalue()
+
+    def _logical_size_for(self, name: str):
+        """The LOGICAL (PyTorch-visible) size of a launch argument, or None.
+
+        Not the device geometry. Under a max-strided reservation the two differ
+        on purpose, and it is the logical size that varies per call, which is
+        exactly what the loop bound has to track.
+        """
+        node = getattr(V.graph, "graph_inputs", {}).get(name)
+        if node is None:
+            try:
+                node = V.graph.get_buffer(name)
+            except Exception:  # noqa: BLE001 - name may not be a buffer at all
+                return None
+        try:
+            return list(node.get_size())
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _resolve_loop_dimension_sources(self, actuals: list[str]) -> None:
+        """Record which launch tensor and dim each symbolic loop count reads from.
+
+        The bundle declares one ``input_arg`` per varying dimension, and the
+        runtime fills it from ``inputs_outputs[arg_index].size(dim_index)`` on
+        every launch (``SymbolicArgKind::kDimension``). Nothing downstream of
+        here can work that mapping out: ``TensorArg`` carries device geometry
+        rather than logical sizes, and by bundle-generation time the FX graph is
+        gone. Here both the argument ordering (``actuals``, which is what
+        ``arg_index`` indexes into) and the buffer layouts are still live.
+
+        A symbol that cannot be placed is LEFT OUT rather than guessed.
+        generate_bundle then refuses to emit a parameter for it, which is the
+        right failure: a wrong ``(arg_index, dim_index)`` binds the wrong number
+        and gives silently wrong results for every launch.
+        """
+
+        def walk(specs):
+            for spec in specs:
+                if isinstance(spec, LoopSpec):
+                    yield spec
+                    yield from walk(spec.body)
+
+        loops = [loop for loop in walk(self.op_specs) if loop.count_symbol_bounds]
+        if not loops:
+            return
+
+        # name -> logical size, computed once per distinct launch argument.
+        sizes = {name: self._logical_size_for(name) for name in actuals}
+        for loop in loops:
+            sources: dict[str, tuple[int, int]] = {}
+            for sym_name in loop.count_symbol_bounds:
+                for arg_index, name in enumerate(actuals):
+                    size = sizes.get(name)
+                    if not size:
+                        continue
+                    for dim_index, extent in enumerate(size):
+                        if str(extent) == sym_name:
+                            sources[sym_name] = (arg_index, dim_index)
+                            break
+                    if sym_name in sources:
+                        break
+                if sym_name not in sources:
+                    logger.warning(
+                        "[symbolic-loop] could not place symbol %s on any launch "
+                        "argument. Looked at %s. Without a source the runtime has "
+                        "nothing to bind, so the bundle will refuse to declare a "
+                        "parameter for it.",
+                        sym_name,
+                        {n: [str(e) for e in (s or [])] for n, s in sizes.items()},
+                    )
+            loop.count_symbol_sources = sources
+            logger.info(
+                "[symbolic-loop] loop count=%s reads its dimension(s) from "
+                "%s (launch args in order: %s)",
+                loop.count,
+                {k: f"args[{a}].size({d})" for k, (a, d) in sources.items()},
+                actuals,
+            )
 
     def _kernel_uses_hbm_pool(self) -> bool:
         """Return True if any op in this kernel references an HBM-pool-allocated tensor."""
@@ -1600,6 +1684,10 @@ def _codegen_op_spec_list(specs, buf: IndentedBuffer, sympy_str) -> None:
                 if op_spec.count_symbol_bounds:
                     buf.writeline(
                         f"count_symbol_bounds={op_spec.count_symbol_bounds!r},"
+                    )
+                if op_spec.count_symbol_sources:
+                    buf.writeline(
+                        f"count_symbol_sources={op_spec.count_symbol_sources!r},"
                     )
                 buf.writeline("body=[")
                 with buf.indent():

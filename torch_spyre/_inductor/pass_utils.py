@@ -576,6 +576,41 @@ def symbolic_count_bounds(count: Union[Expr, int]) -> "dict[str, tuple[int, int]
     return bounds
 
 
+def max_trip_count(count: Union[Expr, int]) -> int:
+    """The largest number of iterations one loop level can run.
+
+    SDSC codegen multiplies a tiled tensor's per-step device advance by this to
+    get that dimension's full pre-tiling extent, which is what
+    ``OpSpec.tiled_symbol_trip_counts`` carries. A symbolic trip count has no
+    single value, and the extent has to be the LARGEST one, for two reasons.
+    HBM is max-strided so addresses stay static across calls, and the bundle's
+    own loop bound is what limits how many iterations actually execute. So take
+    the ShapeEnv upper bound of the count, never its hint: the hint is one
+    call's size and baking it in would silently specialise the SDSC.
+
+    For ``S // G`` with ``S`` in ``[G, M]`` this is ``M // G``, the same tile
+    count the bundle's ``ceildivsi`` can reach, so the two cannot disagree.
+    """
+    if not (hasattr(count, "free_symbols") and count.free_symbols):
+        return int(count)
+
+    upper = finite_upper_or_none(count)
+    if upper is None:
+        raise Unsupported(
+            f"symbolic loop count {count} has no finite upper bound, so SDSC "
+            f"codegen cannot describe the tiled dimension's extent. Declare "
+            f"mark_dynamic(max=...) for its symbol."
+        )
+    logger.info(
+        "[symbolic-loop] max_trip_count(%s) = %d, from the ShapeEnv upper "
+        "bound. This is the SDSC's full extent, NOT the number of iterations: "
+        "that comes from the bundle's own loop bound at run time",
+        count,
+        int(upper),
+    )
+    return int(upper)
+
+
 def get_mem_deps_from_rw(read_writes: ReadWrites) -> list[SchedNodeArg]:
     res: list[SchedNodeArg] = []
     for arg in read_writes.reads:

@@ -98,6 +98,9 @@ _EXPECTED_LOOP_SPEC_SCHEMA = {
     # a symbolic count. _validate_finalized_schema rejects any LoopSpec field
     # it does not know about, so this entry is not optional.
     "count_symbol_bounds": "dict[str, tuple[int, int]]",
+    # POC (symbolic loop): where each symbol's value is read from at launch,
+    # (arg_index, dim_index). Same reason this entry is not optional.
+    "count_symbol_sources": "dict[str, tuple[int, int]]",
 }
 
 
@@ -304,6 +307,11 @@ def _canonical_spec(spec: object) -> object:
         # key it has today and the existing cache stays valid.
         if spec.count_symbol_bounds:
             result["count_symbol_bounds"] = _canonical_value(spec.count_symbol_bounds)
+        # Part of the key too: two kernels with the same count and bounds but a
+        # different (arg_index, dim_index) read their dimension from different
+        # tensors, so they must not share a cache entry.
+        if spec.count_symbol_sources:
+            result["count_symbol_sources"] = _canonical_value(spec.count_symbol_sources)
         return result
     raise TypeError(f"Unsupported finalized kernel spec: {type(spec).__qualname__}")
 

@@ -190,7 +190,30 @@ def stage_2_and_3_specs():
     # records on the object. Marking the CPU tensor would silently lose it,
     # which is what the first version of this probe did.
     print("\n  [experiment] dim 0 marked dynamic")
-    a_dev = a.to(DEVICE_NAME)
+    # Reserve the HBM buffer at MAX along dim 0 (torch-spyre#4326). That builds
+    # the SpyreTensorLayout from the PADDED shape while dma_sizes stay at the
+    # real shape, so the device geometry the SDSC describes covers the largest
+    # trip count the bundle can reach. Without it the layout is hint-sized: the
+    # loop count is max-based but the geometry is sized for this one call, and
+    # phase zero can go green while being specialised to a single size.
+    #
+    # Falls back so this probe still runs on a tree without #4326, and says
+    # which path it took, because the two give different device_size and that
+    # changes how the rest of the output should be read.
+    try:
+        a_dev = a.to(DEVICE_NAME, max=MAX_ROWS)
+        print(f"  HBM reserved at max={MAX_ROWS} (#4326 present)")
+    except (TypeError, ValueError) as exc:
+        a_dev = a.to(DEVICE_NAME)
+        print(
+            f"  NO max reservation, falling back to a plain .to() "
+            f"({type(exc).__name__}: {exc}). #4326 is not applied, so "
+            f"device_size will be hint-sized at {ROWS}, not {MAX_ROWS}."
+        )
+    try:
+        print(f"  input device layout: {a_dev.device_tensor_layout()}")
+    except Exception as exc:  # noqa: BLE001
+        print(f"  input device layout unavailable: {exc}")
     torch._dynamo.mark_dynamic(a_dev, 0, min=GRANULARITY, max=MAX_ROWS)
     out = _compile_and_run(a_dev, "experiment")
     if out is not None:
@@ -243,21 +266,47 @@ def stage_4_find_bundles():
     print(text)
 
     print(f"\n{BANNER}\nWHAT TO CHECK IN THE TEXT ABOVE\n{BANNER}")
+    # The accepted shape is `scf.for %i = %c0 to %dim_<sym> step %step_N`, NOT
+    # an authored divide: arith.ceildivsi is on the backend's reject list, while
+    # a runtime-valued bound is accepted, so the device derives the trip count
+    # as (ub - lb) / step itself.
     checks = [
         ("input_arg<index, granularity=", "dimension declared as a parameter"),
         ("input_arg_extract", "dimension extracted to an SSA value"),
-        ("ceildivsi", "bound DERIVED from the dimension"),
+        ("to %dim_", "loop bound IS the dimension, not a constant"),
+        ("step %step_", "loop steps by the granularity, so the device divides"),
         ("scf.for", "a loop exists"),
-        ('"symbol_ids"=[]', "execute node carries NO symbols"),
     ]
     for needle, meaning in checks:
         print(f"  [{'yes' if needle in text else 'NO '}] {meaning}  ({needle!r})")
-    if "arith.constant" in text and "ceildivsi" not in text:
+    if "ceildivsi" in text:
         print(
-            "\n  NOTE: a constant bound with no ceildivsi means the count was\n"
-            "  concrete by the time it reached emission. That is the failure\n"
-            "  mode this whole change exists to prevent."
+            "\n  WRONG: an authored arith.ceildivsi is on the backend reject\n"
+            "  list (dxp.cpp). The bound must be the dimension with step=G."
         )
+    if "to %loop_bound_" in text and "to %dim_" not in text:
+        print(
+            "\n  NOTE: a constant bound means the count was concrete by the\n"
+            "  time it reached emission. That is the failure mode this whole\n"
+            "  change exists to prevent."
+        )
+
+    # symbol_ids is NOT expected to be empty. deeptools confirmed it still
+    # carries symbolic ADDRESSES, and our own bundles show "symbol_ids"=[-1,-2].
+    # An earlier version of this probe checked for an empty list, which always
+    # reads as a failure and tells us nothing. The property that actually
+    # matters is narrower: the VARYING DIMENSION must never reach an execute
+    # node. Addresses are patched when an allocation changes, which is rare. A
+    # value derived from the varying size would be patched on every call, which
+    # is the ~795us per dispatch this whole design exists to avoid.
+    execute_lines = [ln for ln in text.splitlines() if "sdsc_execute" in ln]
+    leaked = [ln.strip() for ln in execute_lines if "%dim_" in ln]
+    print(
+        f"  [{'NO ' if leaked else 'yes'}] varying dimension stays OUT of every "
+        f"sdsc_execute  ({len(execute_lines)} execute node(s))"
+    )
+    for ln in leaked:
+        print(f"        LEAKED: {ln}")
 
 
 def main() -> int:

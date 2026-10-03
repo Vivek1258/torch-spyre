@@ -16,7 +16,7 @@
 
 The property under test: one binary serves a declared range. The varying
 dimension arrives as an ``!sdscbundle.input_arg``, the device derives the trip
-count from it with ``ceildivsi``, and nothing is specialized per count.
+count from it as (ub - lb) / step, and nothing is specialized per count.
 
 ``compile_op_spec`` is mocked, so no Spyre hardware is needed. The specs are
 hand-built here, which is deliberate: this file tests the EMISSION, and building
@@ -39,7 +39,7 @@ from torch.utils._sympy.functions import FloorDiv
 
 from torch_spyre._inductor.codegen.bundle import (
     _decompose_symbolic_count,
-    _mlir_count_lines,
+    _loop_level,
     generate_bundle,
 )
 from torch_spyre._inductor.op_spec import LoopSpec, OpSpec
@@ -80,7 +80,11 @@ def _op_spec() -> OpSpec:
     )
 
 
-def _symbolic_loop(count=None, bounds=None) -> LoopSpec:
+# Where the runtime reads the dimension from: args[0].size(0).
+SOURCE = (0, 0)
+
+
+def _symbolic_loop(count=None, bounds=None, sources=None) -> LoopSpec:
     """A LoopSpec whose trip count is S // GRANULARITY."""
     sym = sympy.Symbol(SYM_NAME, positive=True, integer=True)
     return LoopSpec(
@@ -89,6 +93,7 @@ def _symbolic_loop(count=None, bounds=None) -> LoopSpec:
         count_symbol_bounds=(
             {SYM_NAME: (MAX_VALUE, GRANULARITY)} if bounds is None else bounds
         ),
+        count_symbol_sources=({SYM_NAME: SOURCE} if sources is None else sources),
     )
 
 
@@ -110,32 +115,43 @@ class TestDecomposeSymbolicCount(unittest.TestCase):
         self.assertIsNone(_decompose_symbolic_count(a * b))
 
 
-class TestMlirCountLines(unittest.TestCase):
-    """The lines that define %loop_bound_N."""
+class TestLoopLevelPlan(unittest.TestCase):
+    """How one scf.for level is emitted, and what it does to that level's strides."""
 
-    def test_concrete_count_is_a_constant(self):
-        self.assertEqual(
-            _mlir_count_lines(sympy.Integer(8), 0, {}),
-            ["%loop_bound_0 = arith.constant 8 : index"],
-        )
+    def test_concrete_count_is_a_constant_bound_stepping_by_one(self):
+        level = _loop_level(sympy.Integer(8), 0, {})
+        self.assertEqual(level.setup, ("%loop_bound_0 = arith.constant 8 : index",))
+        self.assertEqual(level.bound, "%loop_bound_0")
+        self.assertEqual(level.step, "%c1")
+        self.assertEqual(level.stride_scale, 1)
 
-    def test_symbolic_count_uses_ceildivsi(self):
+    def test_symbolic_count_steps_by_granularity_over_the_dimension(self):
+        """The accepted shape. An authored ceildivsi is on the backend reject list."""
         sym = sympy.Symbol(SYM_NAME, positive=True, integer=True)
-        lines = _mlir_count_lines(FloorDiv(sym, GRANULARITY), 0, {SYM_NAME: "%dim_s0"})
+        level = _loop_level(FloorDiv(sym, GRANULARITY), 0, {SYM_NAME: "%dim_s0"})
+        self.assertEqual(level.setup, (f"%step_0 = arith.constant {GRANULARITY} : index",))
+        self.assertEqual(level.bound, "%dim_s0", msg="bound must BE the dimension")
+        self.assertEqual(level.step, "%step_0")
         self.assertEqual(
-            lines,
-            [
-                f"%tile_0 = arith.constant {GRANULARITY} : index",
-                "%loop_bound_0 = arith.ceildivsi %dim_s0, %tile_0 : index",
-            ],
-            msg=f"emitted lines were: {lines}",
+            level.stride_scale,
+            GRANULARITY,
+            msg="the loop var now counts elements, so strides must shrink by G",
         )
+        self.assertNotIn("ceildivsi", " ".join(level.setup))
+
+    def test_tile_size_one_needs_no_step_constant(self):
+        sym = sympy.Symbol(SYM_NAME, positive=True, integer=True)
+        level = _loop_level(sym, 0, {SYM_NAME: "%dim_s0"})
+        self.assertEqual(level.setup, ())
+        self.assertEqual(level.bound, "%dim_s0")
+        self.assertEqual(level.step, "%c1")
+        self.assertEqual(level.stride_scale, 1)
 
     def test_missing_input_arg_names_the_symbol(self):
         """An unbound symbol must fail loudly and say which one, for the pod log."""
         sym = sympy.Symbol("s9", positive=True, integer=True)
         with self.assertRaises(NotImplementedError) as ctx:
-            _mlir_count_lines(FloorDiv(sym, 64), 0, {SYM_NAME: "%dim_s0"})
+            _loop_level(FloorDiv(sym, 64), 0, {SYM_NAME: "%dim_s0"})
         self.assertIn("s9", str(ctx.exception))
         self.assertIn("count_symbol_bounds", str(ctx.exception))
 
@@ -160,7 +176,9 @@ class TestSymbolicLoopBundle(InductorTestCase):
             "torch_spyre._inductor.codegen.bundle.compile_op_spec",
             side_effect=side_effects,
         ):
-            generate_bundle("test", self.output_dir, op_specs, pool_size=0)
+            self.symbol_kinds = generate_bundle(
+                "test", self.output_dir, op_specs, pool_size=0
+            )
         with open(os.path.join(self.output_dir, "bundle.mlir")) as f:
             return f.read()
 
@@ -193,21 +211,26 @@ class TestSymbolicLoopBundle(InductorTestCase):
         )
 
     def test_bound_is_derived_not_baked(self):
-        """The heart of it: the count comes from the argument, not a constant."""
+        """The heart of it: the bound IS the argument, not a constant."""
         bundle = self._bundle_with_symbolic_loop()
-        self.assert_in_bundle(
-            f"%loop_bound_0 = arith.ceildivsi %dim_{SYM_NAME}, %tile_0 : index",
-            bundle,
-        )
+        self.assert_in_bundle(f"%step_0 = arith.constant {GRANULARITY} : index", bundle)
         self.assertNotIn(
             "%loop_bound_0 = arith.constant",
             bundle,
             msg=f"loop bound was baked to a constant:\n{bundle}",
         )
+        self.assertNotIn(
+            "ceildivsi",
+            bundle,
+            msg=f"an authored divide is on the backend reject list:\n{bundle}",
+        )
 
-    def test_loop_uses_the_derived_bound(self):
+    def test_loop_steps_over_the_dimension(self):
+        """bound=S step=G, so the device derives (ub - lb) / step itself."""
         bundle = self._bundle_with_symbolic_loop()
-        self.assert_in_bundle("scf.for %i_0 = %c0 to %loop_bound_0 step %c1", bundle)
+        self.assert_in_bundle(
+            f"scf.for %i_0 = %c0 to %dim_{SYM_NAME} step %step_0", bundle
+        )
 
     def test_execute_node_carries_no_symbols(self):
         """symbol_ids must stay empty or every dispatch pays program correction.
@@ -217,6 +240,35 @@ class TestSymbolicLoopBundle(InductorTestCase):
         """
         bundle = self._bundle_with_symbolic_loop()
         self.assert_in_bundle('"symbol_ids"=[]', bundle)
+
+    def test_symbol_kinds_carry_the_dispatch_binding(self):
+        """The runtime builds its payload from this list, so the dimension
+        must be in it, last, and must say which tensor dim to read."""
+        self._bundle_with_symbolic_loop()
+        loop_dims = [sk for sk in self.symbol_kinds if sk.is_loop_dimension]
+        self.assertEqual(len(loop_dims), 1, msg=f"kinds were {self.symbol_kinds}")
+        self.assertIs(
+            self.symbol_kinds[-1],
+            loop_dims[0],
+            msg="loop dimensions are emitted last, so they must be appended last",
+        )
+        sk = loop_dims[0]
+        self.assertEqual((sk.arg_index, sk.dim_index), SOURCE)
+        self.assertEqual(sk.granularity, GRANULARITY)
+        self.assertEqual(sk.max_value, MAX_VALUE)
+        self.assertEqual(sk.pytorch_sym, SYM_NAME)
+        self.assertFalse(
+            sk.is_dimension,
+            msg="must not look like an SDSC dimension symbol, async_compile "
+            "refuses those",
+        )
+
+    def test_missing_source_refuses_to_emit(self):
+        """A parameter nobody can bind is worse than a loud failure."""
+        entry = (_sdsc_json(), [0], [], [])
+        with self.assertRaises(NotImplementedError) as ctx:
+            self._run([_symbolic_loop(sources={})], [entry])
+        self.assertIn(SYM_NAME, str(ctx.exception))
 
     def test_concrete_loop_is_unchanged(self):
         """A non-symbolic loop must emit exactly as it did before."""

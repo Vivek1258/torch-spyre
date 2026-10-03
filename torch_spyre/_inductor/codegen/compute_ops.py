@@ -104,6 +104,9 @@ class SymbolKind:
     # Only meaningful for the kernel_derived_symbolic variant.
     core_idx: int = -1
     split_count: int = 0
+    # Only meaningful for the loop_dimension variant: which dim of the tensor
+    # at `arg_index` the runtime reads this dimension's value from.
+    dim_index: int = -1
 
     @classmethod
     def kernel(cls, arg_index: int) -> "SymbolKind":
@@ -176,9 +179,44 @@ class SymbolKind:
     def is_pool(self) -> bool:
         return self.kind == "pool"
 
+    @classmethod
+    def loop_dimension(
+        cls,
+        granularity: int,
+        max_value: int,
+        pytorch_sym: str,
+        arg_index: int,
+        dim_index: int,
+    ) -> "SymbolKind":
+        """A bundle-level loop dimension, bound from a launch tensor's shape.
+
+        Deliberately a different variant from ``dimension``. That one lives in
+        an SDSC's ``dimToSymbolMapping_``, the symbolic-SDSC route where a
+        symbol stays inside one op's iteration space. This one never reaches
+        the SDSC at all: the loop is explicit, the body is a static tile, and
+        the dimension exists only as a bundle parameter whose value the runtime
+        reads from ``inputs_outputs[arg_index].size(dim_index)`` on every
+        launch (``SymbolicArgKind::kDimension``).
+
+        ``is_dimension`` stays False for it on purpose, so the guard in
+        async_compile that refuses SDSC dimension symbols does not refuse this.
+        """
+        return cls(
+            kind="loop_dimension",
+            granularity=granularity,
+            max_value=max_value,
+            pytorch_sym=pytorch_sym,
+            arg_index=arg_index,
+            dim_index=dim_index,
+        )
+
     @property
     def is_dimension(self) -> bool:
         return self.kind == "dimension"
+
+    @property
+    def is_loop_dimension(self) -> bool:
+        return self.kind == "loop_dimension"
 
 
 def core_idx_to_slice_offset(

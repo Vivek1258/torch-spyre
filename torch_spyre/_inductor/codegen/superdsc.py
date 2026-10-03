@@ -1274,6 +1274,29 @@ def _create_sdsc_tensors(
                     trip_count = op_spec.tiled_symbol_trip_counts.get(sym, 1)
                     sdsc_sym = symbol_mapping[sym]
                     sdsc_dim_advance[sdsc_sym] = (tile_size, trip_count)
+                    # The extent this implies, against the geometry actually
+                    # declared. Under a symbolic loop count the trip count is
+                    # the ShapeEnv MAX (see pass_utils.max_trip_count) while
+                    # device_size may still be hint-sized, and the two have to
+                    # agree or the SDSC describes a different tensor than the
+                    # one HBM holds. Logged so a mismatch is a stated number
+                    # rather than a confusing failure further down.
+                    declared_bytes = (
+                        math.prod(int(d) for d in arg.device_size) * arg_elem_bytes
+                        if all(not getattr(d, "free_symbols", None) for d in arg.device_size)
+                        else None
+                    )
+                    logger.info(
+                        "[symbolic-loop][sdsc] dim %s: tile_size=%d bytes x "
+                        "trip_count=%d implies extent=%d bytes; declared "
+                        "device_size=%s (%s bytes)",
+                        sym,
+                        tile_size,
+                        trip_count,
+                        tile_size * trip_count,
+                        list(arg.device_size),
+                        declared_bytes,
+                    )
                     element_advance = int(coeff)
                     candidates = [
                         axis

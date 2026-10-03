@@ -437,6 +437,17 @@ class LoopSpec:
             parameter, which is the only place the varying dimension enters the
             program. Nothing that sizes a buffer or computes an address may read
             ``count``; those all plan from the concrete maximum.
+
+        count_symbol_sources: For a symbolic ``count``, where each of its
+            symbols is READ FROM at launch: symbol name -> ``(arg_index,
+            dim_index)``, meaning ``inputs_outputs[arg_index].size(dim_index)``.
+
+            Carried for the same reason as the bounds, but a step further:
+            nothing downstream of the kernel can work this mapping out at all.
+            ``TensorArg`` holds device geometry, not logical sizes, and by
+            bundle-generation time the FX graph is gone. So it is resolved once
+            in ``SpyreKernel`` where the argument ordering and the buffer
+            layouts are both still live, and carried from there.
     """
 
     count: Expr
@@ -446,6 +457,10 @@ class LoopSpec:
     # symbol name -> (max_value, granularity); same shape as
     # OpSpec.symbolic_dim_bounds so the two can be read by common code.
     count_symbol_bounds: dict[str, tuple[int, int]] = dataclasses.field(
+        default_factory=dict
+    )
+    # symbol name -> (arg_index, dim_index) the runtime reads its value from.
+    count_symbol_sources: dict[str, tuple[int, int]] = dataclasses.field(
         default_factory=dict
     )
 
