@@ -189,22 +189,21 @@ def generate_bundle(
             loop_dim_ssa,
             loop_dim_bounds,
         )
-        # One piece downstream of this file does not exist yet, and it fails
-        # AFTER a successful emission, so say it here rather than let a pod run
-        # end in a confusing launch error: dispatch does not bind a value for
-        # these parameters (#4964), so the launch argument list is one short per
-        # dimension.
+        # We emit `to <dim> step <G>` and never an authored divide, because
+        # arith.ceildivsi is on the backend reject list (dxp.cpp) while a
+        # runtime-valued scf.for bound is accepted (LoopUnroll.cpp). The device
+        # derives the trip count as (ub - lb) / step itself.
         #
-        # The bound itself is fine. We emit `to <dim> step <G>` and never an
-        # authored divide, because arith.ceildivsi is on the backend reject list
-        # (dxp.cpp) while a runtime-valued scf.for bound is accepted
-        # (LoopUnroll.cpp). Emitting the artifact is the point: it is what we
-        # review and hand over.
-        logger.warning(
-            "[symbolic-loop] EMITTING A BUNDLE WITH %d RUNTIME DIMENSION "
-            "PARAMETER(S) %s. No value is bound for them at dispatch yet "
-            "(#4964), so expect this kernel to emit correctly and then fail to "
-            "launch. That is the known phase-zero boundary, not a regression.",
+        # This used to warn that dispatch binds no value for these parameters
+        # so the launch would fail. That is no longer true: SymbolKind
+        # .loop_dimension carries (arg_index, dim_index), job_plan.cpp's
+        # kDimension branch reads tensor.size(dim_index) at launch, and a
+        # bundle built this way runs correctly on device. Kept at INFO because
+        # it is still the line that tells you a kernel is size-independent.
+        logger.info(
+            "[symbolic-loop] bundle takes %d runtime dimension parameter(s) %s. "
+            "One binary serves every size in the declared range; the value is "
+            "read from the launch tensors at dispatch",
             len(loop_dim_bounds),
             sorted(loop_dim_ssa.values()),
         )

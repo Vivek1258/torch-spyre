@@ -2103,8 +2103,9 @@ def _audit_symbolic_ranges(operations: list[Operation]) -> None:
     ``ranges`` fails much later as a bare "Cannot convert symbols to int" with
     no op name attached. Say it here instead, before anything consumes it.
     """
-    if not logger.isEnabledFor(logging.INFO):
-        return
+    # No log-level gate. This used to return early unless INFO was enabled,
+    # which meant the one check that catches a broken invariant was silent in
+    # exactly the runs where nobody had turned logging up. The loop is cheap.
     total = 0
     for op in operations:
         data = getattr(op, "data", None)
@@ -2143,16 +2144,52 @@ def _audit_symbolic_ranges(operations: list[Operation]) -> None:
             name = op.get_name()
         except Exception:  # noqa: BLE001  # some ops have no name yet
             name = repr(op)
+        # Name the op's provenance too. Knowing that "buf43 has range[0]=s21"
+        # does not say WHICH tensor it is or what produced it, and on the
+        # attention scenario that cost a round trip: the message blamed a
+        # symbolic stick dim when the real defect was a whole-operand op
+        # sitting inside the loop. origins and origin_node are what identify
+        # it, and the op kind says whether it is a real compute or something a
+        # pass inserted (a restickify, a padding copy).
+        origin_node = getattr(data, "origin_node", None)
+        try:
+            origins = sorted(
+                str(getattr(o, "name", o)) for o in (getattr(data, "origins", None) or ())
+            )[:6]
+        except Exception:  # noqa: BLE001
+            origins = []
         logger.info(
-            "[symbolic-loop][audit] op=%s in_loop=%s loop_count=%s ranges=%s "
-            "reduction_ranges=%s SYMBOLIC=%s",
+            "[symbolic-loop][audit] op=%s kind=%s in_loop=%s loop_count=%s "
+            "ranges=%s reduction_ranges=%s SYMBOLIC=%s origin_node=%s origins=%s",
             name,
+            type(data).__name__,
             loop_info is not None,
             getattr(loop_info, "loop_count", None),
             [str(r) for r in ranges],
             [str(r) for r in reduction_ranges],
             symbolic,
+            getattr(origin_node, "name", origin_node),
+            origins,
         )
+        if loop_info is not None and any(s.startswith("range") for s in symbolic):
+            # The one combination that is always wrong, called out separately
+            # because the failure it causes surfaces far away. Inside a loop
+            # body every range must be the TILE, so a symbol here means an
+            # operand was never sliced or an inserted op covers the whole
+            # tensor. Hoisting it out of the loop or tiling it is the fix;
+            # relaxing a downstream guard is not.
+            logger.warning(
+                "[symbolic-loop][audit] INVARIANT BROKEN: op=%s is INSIDE a loop "
+                "(count=%s) yet its iteration range carries a symbol (%s). Inside "
+                "a loop body every range must be the concrete tile. Expect the "
+                "failure to surface downstream as a stick-dim or int(r) error "
+                "that blames the wrong thing. origin_node=%s origins=%s",
+                name,
+                getattr(loop_info, "loop_count", None),
+                [s for s in symbolic if s.startswith("range")],
+                getattr(origin_node, "name", origin_node),
+                origins,
+            )
     logger.info(
         "[symbolic-loop][audit] %d op(s) carry a symbol in their iteration space "
         "or layout. A `range`/`reduction` entry with in_loop=True breaks the "

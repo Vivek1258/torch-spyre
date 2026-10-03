@@ -736,24 +736,83 @@ JobPlanBuilder::ValidationResult JobPlanBuilder::validate(
   // - Verify shape count matches number of input tensors
 
   // P2-14: JobPlan step ordering validation
-  // After the HostCompute+H2D merge, the required sequence when the first step
-  // is a HostCompute is:  HostCompute(owns H2D) → Compute.
-  // The old HostCallback→H2D→Compute pattern is no longer expected in
-  // production SpyreCode; the translator collapses them.
+  // After the HostCompute+H2D merge, a plan whose first step is a HostCompute
+  // must reach a Compute afterwards. This used to demand Compute at exactly
+  // index 1, which assumed the only possible shape was the two-step
+  // [HostCompute(owns H2D), Compute] that a simple pointwise kernel produces.
+  // A split-K matmul is the counter-example: it fails that check at launch
+  // with "Step ordering violation at step 1" while being perfectly well
+  // ordered, because the collapse loop in translateJobExecPlan consumes
+  // exactly ONE following H2D and anything that stages a second buffer leaves
+  // an H2D sitting at index 1.
+  //
+  // The invariant that actually matters is that the host-produced blob is on
+  // the device before the Compute that reads it, and that holds for any
+  // ordering where the Compute comes later: every step carries
+  // pipeline_barrier=true, so each stream is FIFO. Index 1 was never the
+  // requirement, only the common case.
+  //
+  // NOT YET VERIFIED for this shape: with SPYRE_HAZARD_TRACKER on, the launch
+  // router splits HostCompute/H2D across S_prep and S_dev and flex inserts the
+  // cross-stream H2D->Compute edge. Whether that edge is still placed
+  // correctly when another H2D sits between them is untested, so a
+  // non-canonical plan is logged rather than passed silently.
   if (!job_plan.steps.empty()) {
     bool first_is_host_compute = dynamic_cast<const JobPlanStepHostCompute*>(
                                      job_plan.steps[0].get()) != nullptr;
 
     if (first_is_host_compute) {
-      // Step 0 is HostCompute (which owns the H2D); step 1 must be Compute.
+      auto step_kind = [](const JobPlanStep* step) -> const char* {
+        if (dynamic_cast<const JobPlanStepHostCompute*>(step)) {
+          return "HostCompute";
+        }
+        if (dynamic_cast<const JobPlanStepCompute*>(step)) {
+          return "Compute";
+        }
+        if (dynamic_cast<const JobPlanStepH2D*>(step)) {
+          return "H2D";
+        }
+        if (dynamic_cast<const JobPlanStepD2H*>(step)) {
+          return "D2H";
+        }
+        return "Unknown";
+      };
+      std::string sequence;
+      size_t first_compute = job_plan.steps.size();
+      for (size_t i = 0; i < job_plan.steps.size(); ++i) {
+        if (i > 0) {
+          sequence += " -> ";
+        }
+        sequence += step_kind(job_plan.steps[i].get());
+        if (first_compute == job_plan.steps.size() &&
+            dynamic_cast<const JobPlanStepCompute*>(job_plan.steps[i].get())) {
+          first_compute = i;
+        }
+      }
+
+      // Every error below names the sequence it actually saw. The old message
+      // said only "violation at step 1", which told you nothing about what
+      // was there instead and cost a pod round trip to find out.
       TORCH_CHECK(job_plan.steps.size() >= 2,
                   "Incomplete step sequence: HostCompute must be followed "
-                  "by Compute");
-      bool is_compute = dynamic_cast<const JobPlanStepCompute*>(
-                            job_plan.steps[1].get()) != nullptr;
-      TORCH_CHECK(is_compute,
-                  "Step ordering violation at step 1: "
-                  "HostCompute (with H2D) must be followed by Compute");
+                  "by a Compute. Got: ",
+                  sequence);
+      TORCH_CHECK(first_compute != job_plan.steps.size(),
+                  "Step ordering violation: a HostCompute-first plan never "
+                  "reaches a Compute. Got: ",
+                  sequence);
+      if (first_compute != 1) {
+        TORCH_WARN(
+            "JobPlan is HostCompute-first with Compute at step ",
+            first_compute,
+            " rather than step 1, so the translator left ",
+            first_compute - 1,
+            " step(s) between them (it collapses only one H2D into the "
+            "HostCompute). Ordering is still correct because each stream is "
+            "FIFO, but the SPYRE_HAZARD_TRACKER cross-stream edge is "
+            "unverified for this shape. Sequence: ",
+            sequence);
+      }
     }
   }
 

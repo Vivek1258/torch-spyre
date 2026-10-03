@@ -1281,21 +1281,35 @@ def _create_sdsc_tensors(
                     # agree or the SDSC describes a different tensor than the
                     # one HBM holds. Logged so a mismatch is a stated number
                     # rather than a confusing failure further down.
-                    declared_bytes = (
-                        math.prod(int(d) for d in arg.device_size) * arg_elem_bytes
+                    #
+                    # BOTH SIDES ARE ELEMENT COUNTS. tile_size is elements
+                    # despite being built from arg_elem_bytes: the branch at
+                    # the `dim is stick_dim` site below feeds it to the same
+                    # dev_dim_size slot that the else-branch fills from
+                    # arg.device_size, which is elements, so the two must
+                    # agree. An earlier version of this line called tile_size
+                    # bytes and compared it against prod(device_size) *
+                    # elem_bytes, which read as a 2x shortfall on fp16 for a
+                    # kernel that was in fact exact.
+                    declared_elems = (
+                        math.prod(int(d) for d in arg.device_size)
                         if all(not getattr(d, "free_symbols", None) for d in arg.device_size)
                         else None
                     )
+                    implied_elems = tile_size * trip_count
                     logger.info(
-                        "[symbolic-loop][sdsc] dim %s: tile_size=%d bytes x "
-                        "trip_count=%d implies extent=%d bytes; declared "
-                        "device_size=%s (%s bytes)",
+                        "[symbolic-loop][sdsc] dim %s: tile_size=%d elems x "
+                        "trip_count=%d implies extent=%d elems; declared "
+                        "device_size=%s (%s elems)%s",
                         sym,
                         tile_size,
                         trip_count,
-                        tile_size * trip_count,
+                        implied_elems,
                         list(arg.device_size),
-                        declared_bytes,
+                        declared_elems,
+                        ""
+                        if declared_elems is None or implied_elems == declared_elems
+                        else f"  MISMATCH: implied/declared = {implied_elems / declared_elems:.4g}",
                     )
                     element_advance = int(coeff)
                     candidates = [

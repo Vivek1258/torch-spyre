@@ -40,9 +40,11 @@ registered and safe.
 """
 
 import argparse
+import faulthandler
 import json
 import logging
 import os
+import signal
 import sys
 import time
 import traceback
@@ -632,8 +634,26 @@ def main() -> int:
     ap.add_argument("--out", default=RESULTS_PATH)
     args = ap.parse_args()
 
+    # A bare relative default lands in whatever directory the run started
+    # from, which is how the last run's output went missing. Anchor it next to
+    # this script and print it up front.
+    if not os.path.isabs(args.out):
+        args.out = os.path.join(os.path.dirname(os.path.abspath(__file__)), args.out)
+
+    # A device-level abort kills the process without unwinding python, so the
+    # only way to learn where it died is to have the fault handler installed.
+    faulthandler.enable()
+    for signame in ("SIGTERM", "SIGABRT"):
+        sig = getattr(signal, signame, None)
+        if sig is not None:
+            try:
+                faulthandler.register(sig, chain=True)
+            except (RuntimeError, ValueError, OSError):
+                pass
+
     print(f"python  : {sys.version.split()[0]}")
     print(f"torch   : {torch.__version__}")
+    print(f"results : {args.out}  (rewritten after every scenario)")
 
     # tests/ is not a package on sys.path when run as a script.
     here = os.path.dirname(os.path.abspath(__file__))
@@ -668,8 +688,24 @@ def main() -> int:
         "schema": 1,
         "torch": torch.__version__,
         "started": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "planned": [s.id for s in scenarios],
         "scenarios": [],
     }
+
+    def flush_results():
+        """Write what we have so far.
+
+        The whole run used to be written once, after the loop. A scenario that
+        took the process down hard -- a device abort, an OOM kill, a Ctrl-C --
+        is not an `Exception`, so it skipped the write and eleven scenarios'
+        worth of results went with it. Writing after every scenario costs
+        nothing and means a crash loses one row, not all of them.
+        """
+        tmp = args.out + ".part"
+        with open(tmp, "w") as f:
+            json.dump(out, f, indent=2)
+        os.replace(tmp, args.out)
+
     for sc in scenarios:
         try:
             out["scenarios"].append(run_scenario(sc, DEVICE_NAME, collector))
@@ -680,9 +716,24 @@ def main() -> int:
                 {"id": sc.id, "verdict": "harness_error",
                  "error": traceback.format_exc()[-1500:]}
             )
+        except BaseException as exc:
+            # Ctrl-C and SystemExit land here. Save, then let it through.
+            print(f"\n  SCENARIO {sc.id} INTERRUPTED BY {type(exc).__name__}")
+            out["scenarios"].append(
+                {"id": sc.id, "verdict": "interrupted",
+                 "error": type(exc).__name__}
+            )
+            out["interrupted_at"] = sc.id
+            flush_results()
+            print(f"  partial results saved to {args.out}")
+            raise
+        flush_results()
+        # tee plus a scrolled-off terminal means the log file is the record,
+        # so make sure the record is on disk before the next scenario starts.
+        sys.stdout.flush()
 
-    with open(args.out, "w") as f:
-        json.dump(out, f, indent=2)
+    out["finished"] = time.strftime("%Y-%m-%dT%H:%M:%S")
+    flush_results()
 
     print(f"\n{BANNER}\nMATRIX SUMMARY\n{BANNER}")
     for rec in out["scenarios"]:
