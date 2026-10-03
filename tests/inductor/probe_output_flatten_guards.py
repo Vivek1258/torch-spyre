@@ -96,6 +96,60 @@ case("C view(n*G, W)", lambda ys, n: ys.view(n * G, WIDTH))
 case("D as_strided((n*G, W), (W, 1))  -- sizes taken verbatim",
      lambda ys, n: ys.as_strided((n * G, WIDTH), (WIDTH, 1)))
 
+# Did the as_strided branch in _stacked_to_full even FIRE? It is gated on the
+# leading axes being PROVABLY contiguous, and if that is not provable we fall
+# back to flatten and nothing changed. Measured, not assumed.
+print("\n" + "=" * 78)
+print("CASE E  is the contiguity predicate provable, i.e. did the fix fire?")
+shape_env, mode, s, x = fresh()
+with mode:
+    count = s // G
+    ys = torch.empty(count, G, WIDTH)
+    pred = ys.stride(0) == ys.size(1) * ys.stride(1)
+    print(f"  ys shape  = {list(ys.shape)}")
+    print(f"  ys stride = {list(ys.stride())}")
+    print(f"  stride(0)={ys.stride(0)}  size(1)*stride(1)={ys.size(1) * ys.stride(1)}")
+    print(f"  raw predicate = {pred!r} (type {type(pred).__name__})")
+    try:
+        from torch.fx.experimental.symbolic_shapes import statically_known_true
+
+        provable = bool(statically_known_true(pred))
+    except Exception as exc:  # noqa: BLE001
+        provable = f"raised {exc!r}"
+    print(f"  statically_known_true -> {provable}")
+RESULTS.append(("E contiguity provable (did the fix fire)", "-", 0 if provable is True else -1,
+                [] if provable is True else [f"NOT provable: {provable}"]))
+
+# The OTHER side. _xs_leaf trims then splits [G*n, W] into [n, G, W], which also
+# walks the dims and may install the same Ne(count, 1). If it does, fixing only
+# the output fold cannot remove the one-tile recompile, which is what we saw.
+def xs_case(name, split):
+    print("\n" + "=" * 78)
+    print(f"CASE {name}")
+    shape_env, mode, s, x = fresh()
+    try:
+        with mode:
+            count = s // G
+            trimmed = x.narrow(0, 0, count * G)
+            before = set(guard_strs(shape_env))
+            out = split(trimmed, count)
+            new = [g for g in guard_strs(shape_env) if g not in before]
+        print(f"  result shape = {list(out.shape)}")
+        print(f"  new guards ({len(new)}):")
+        for g in new:
+            print(f"    {g}")
+        suspicious = [g for g in new if "!= 1" in g or "Ne" in g]
+        RESULTS.append((name, list(out.shape), len(new), suspicious))
+    except Exception as exc:  # noqa: BLE001
+        print(f"  RAISED {type(exc).__name__}: {exc}")
+        RESULTS.append((name, "RAISED", -1, [str(exc)]))
+
+
+xs_case("X1 narrow + unflatten(0, (n, G))  (today)",
+        lambda tr, n: torch.unflatten(tr, 0, (n, G)))
+xs_case("X2 narrow + as_strided((n, G, W), (G*W, W, 1))",
+        lambda tr, n: tr.as_strided((n, G, WIDTH), (G * WIDTH, WIDTH, 1)))
+
 print("\n" + "=" * 78)
 print("SUMMARY  (want: correct shape, and NO '!= 1' guard)")
 for name, shape, n_new, suspicious in RESULTS:

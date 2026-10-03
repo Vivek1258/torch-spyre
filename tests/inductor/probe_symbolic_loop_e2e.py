@@ -357,6 +357,54 @@ def stage_5_one_binary_many_sizes(compiled):
     )
 
 
+def stage_6_non_multiple_is_refused(compiled):
+    """Invariant 4: a non-multiple of G must be REFUSED, never silently short.
+
+    The contract calls this the worst failure mode in the system. The backend's
+    division is a floor, so floor equals ceiling only when G divides S. A
+    non-multiple does not crash: it runs one tile short and returns a correctly
+    SHAPED tensor with a stale tail. Right shape with wrong content is the
+    hardest class of bug to notice, and it would pass any shape-only check.
+
+    We do NOT pad. The consumer already pads and only the consumer knows whether
+    a padded row means anything. So the only acceptable behaviour here is a loud
+    refusal, and this measures which one we actually get.
+    """
+    stage(6, "a non-multiple of the granularity must be REFUSED")
+    if compiled is None:
+        print("  no compiled callable from stage 2, nothing to try")
+        return
+    from torch_spyre.constants import DEVICE_NAME
+
+    for rows in (100, 511):
+        a = torch.randn(rows, COLS, dtype=torch.float16)
+        ref = a.float().abs()
+        print(f"\n  {rows} rows ({rows / GRANULARITY:.2f} tiles, NOT a multiple of "
+              f"{GRANULARITY})")
+        try:
+            try:
+                a_dev = a.to(DEVICE_NAME, max=MAX_ROWS)
+            except (TypeError, ValueError):
+                a_dev = a.to(DEVICE_NAME)
+            torch._dynamo.mark_dynamic(a_dev, 0)
+            out = compiled(a_dev, GRANULARITY)
+        except Exception as exc:  # noqa: BLE001
+            print(f"    [yes] REFUSED: {type(exc).__name__}: {str(exc)[:160]}")
+            continue
+        err = (out.cpu().float() - ref).abs().max().item()
+        shape_ok = tuple(out.shape) == tuple(ref.shape)
+        if err < 0.01 and shape_ok:
+            print(f"    [?  ] RAN AND WAS CORRECT (err={err:.4f}). Unexpected, "
+                  f"means something handled the remainder. Worth understanding.")
+        else:
+            print(
+                f"    [NO ] SILENTLY WRONG. shape={tuple(out.shape)} "
+                f"(expected {tuple(ref.shape)}), err={err:.4f}.\n"
+                f"           This is the stale-tail failure the contract warns "
+                f"about: it would pass a shape-only check."
+            )
+
+
 def stage_4_find_bundles():
     """Locate and print any bundle.mlir this run produced."""
     stage(4, "emitted bundle.mlir")
@@ -431,12 +479,13 @@ def main() -> int:
         except Exception:
             print(f"\n  STAGE FUNCTION {fn.__name__} RAISED, continuing anyway:")
             traceback.print_exc()
-    # Last, because it reuses the artifact stage 2 built and stage 4 printed.
-    try:
-        stage_5_one_binary_many_sizes(compiled)
-    except Exception:
-        print("\n  STAGE FUNCTION stage_5_one_binary_many_sizes RAISED:")
-        traceback.print_exc()
+    # Last, because they reuse the artifact stage 2 built and stage 4 printed.
+    for fn in (stage_5_one_binary_many_sizes, stage_6_non_multiple_is_refused):
+        try:
+            fn(compiled)
+        except Exception:
+            print(f"\n  STAGE FUNCTION {fn.__name__} RAISED:")
+            traceback.print_exc()
     print(f"\n{BANNER}\nProbe finished. Send this entire output back.\n{BANNER}")
     return 0
 
