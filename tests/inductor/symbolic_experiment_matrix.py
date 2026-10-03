@@ -553,7 +553,12 @@ def build_matrix():
             fixture=fx.split_k_caller_init_fn,
             build=build_mm_split_k,
             marks=((0, 1), (1, 0)),
-            sizes=(320,),
+            # Was (320,). One size is useless here and 320 was the WORST
+            # possible choice, because it is the hint, so a kernel whose
+            # geometry is hint-sized passes it by construction. 448 and 512
+            # are the sizes that can expose an advance past the declared
+            # extent.
+            sizes=SIZES_G64,
             tol=5e-2,
         ),
         Scenario(

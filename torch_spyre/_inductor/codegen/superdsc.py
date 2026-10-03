@@ -1282,35 +1282,67 @@ def _create_sdsc_tensors(
                     # one HBM holds. Logged so a mismatch is a stated number
                     # rather than a confusing failure further down.
                     #
-                    # BOTH SIDES ARE ELEMENT COUNTS. tile_size is elements
-                    # despite being built from arg_elem_bytes: the branch at
-                    # the `dim is stick_dim` site below feeds it to the same
-                    # dev_dim_size slot that the else-branch fills from
-                    # arg.device_size, which is elements, so the two must
-                    # agree. An earlier version of this line called tile_size
-                    # bytes and compared it against prod(device_size) *
-                    # elem_bytes, which read as a 2x shortfall on fp16 for a
-                    # kernel that was in fact exact.
+                    # The check is a BOUND, not an equality, and that is the
+                    # whole point. `coeff` is the per-iteration advance in
+                    # elements. How far it reaches depends on which axes of the
+                    # device layout it spans, and that is decided by
+                    # layoutDimOrder and the stick split (SuperDSC doc, the
+                    # "2D tensor with out=512, mb=4" example: a dim is split
+                    # into a stick part and a layout part, so one advance need
+                    # not cover the whole tensor). So an advance that covers
+                    # less than the declared size is perfectly normal and says
+                    # nothing is wrong.
+                    #
+                    # What is NEVER legal is the last iteration's advance
+                    # reaching PAST the declared tensor. That is a DMA out of
+                    # bounds no matter how the axes are ordered. So compare
+                    # advance * trip_count against prod(device_size) and warn
+                    # only when it is greater.
+                    #
+                    # Two earlier versions of this line were wrong and both
+                    # failures came from asserting an equality the layout does
+                    # not promise. The first multiplied one side by elem_bytes
+                    # and read as a 2x shortfall on an exact kernel. The second
+                    # kept elem_bytes inside tile_size and then flagged
+                    # MISMATCH on split-K, which is correct at the hint size.
+                    # Do not turn this back into an equality.
+                    advance_elems = int(coeff)
                     declared_elems = (
                         math.prod(int(d) for d in arg.device_size)
                         if all(not getattr(d, "free_symbols", None) for d in arg.device_size)
                         else None
                     )
-                    implied_elems = tile_size * trip_count
+                    reach = advance_elems * trip_count
                     logger.info(
-                        "[symbolic-loop][sdsc] dim %s: tile_size=%d elems x "
-                        "trip_count=%d implies extent=%d elems; declared "
-                        "device_size=%s (%s elems)%s",
+                        "[symbolic-loop][sdsc] dim %s: advance=%d elems x "
+                        "trip_count=%d reaches %d elems; declared device_size=%s "
+                        "(%s elems)",
                         sym,
-                        tile_size,
+                        advance_elems,
                         trip_count,
-                        implied_elems,
+                        reach,
                         list(arg.device_size),
                         declared_elems,
-                        ""
-                        if declared_elems is None or implied_elems == declared_elems
-                        else f"  MISMATCH: implied/declared = {implied_elems / declared_elems:.4g}",
                     )
+                    if declared_elems is not None and reach > declared_elems:
+                        logger.warning(
+                            "[symbolic-loop][sdsc] OUT OF BOUNDS: dim %s advances "
+                            "%d elems per iteration for up to %d iterations, "
+                            "reaching %d elems, but the arg declares only %d "
+                            "(device_size=%s). The trip count is the ShapeEnv MAX "
+                            "while some axis of device_size is still HINT-sized, so "
+                            "this kernel is correct at the hint size and walks off "
+                            "the end above it. A single-size test CANNOT catch this. "
+                            "See pass_utils.concretize_expr: every axis a symbolic "
+                            "loop advances along must be sized from the max, not the "
+                            "hint",
+                            sym,
+                            advance_elems,
+                            trip_count,
+                            reach,
+                            declared_elems,
+                            list(arg.device_size),
+                        )
                     element_advance = int(coeff)
                     candidates = [
                         axis
