@@ -2093,7 +2093,7 @@ def _apply_input_layout_overrides(
     ]
 
 
-def _audit_symbolic_ranges(operations: list[Operation]) -> None:
+def _audit_symbolic_ranges(operations: list[Operation], graph=None) -> None:
     """Report every op whose iteration space is not concrete, once, by name.
 
     The invariant the symbolic-loop path relies on is that inside a loop body
@@ -2107,6 +2107,61 @@ def _audit_symbolic_ranges(operations: list[Operation]) -> None:
     # which meant the one check that catches a broken invariant was silent in
     # exactly the runs where nobody had turned logging up. The loop is cheap.
     total = 0
+
+    # GRAPH INPUTS FIRST. This audit used to walk only graph.operations, and
+    # that blind spot cost a round trip on split-K: it reported "0 op(s) carry
+    # a symbol" while the emitted load was `i0 * s50`, because the symbol was
+    # in an INPUT's stride, not in any op's ranges or layout.
+    #
+    # Why a symbolic stride matters more than a symbolic size. If the dynamic
+    # dim is the OUTERMOST one, every stride stays a literal and only the
+    # extent varies, which is exactly the case the max-strided HBM reservation
+    # handles: pad the dim, the stride map is unchanged, one binary serves
+    # every size. If the dynamic dim is an INNER one, the strides of every dim
+    # outside it become multiples of the symbol, the device geometry is
+    # size-dependent, and no amount of padding makes one binary valid. So a
+    # symbol in `stride` is a different and worse finding than a symbol in
+    # `size`, and the log says which.
+    for name, inp in (getattr(graph, "graph_inputs", None) or {}).items():
+        try:
+            layout = inp.get_layout()
+        except Exception:  # noqa: BLE001
+            layout = getattr(inp, "layout", None)
+        if layout is None:
+            continue
+        sym_sizes = [
+            f"size[{i}]={v}"
+            for i, v in enumerate(getattr(layout, "size", None) or [])
+            if getattr(v, "free_symbols", None)
+        ]
+        sym_strides = [
+            f"stride[{i}]={v}"
+            for i, v in enumerate(getattr(layout, "stride", None) or [])
+            if getattr(v, "free_symbols", None)
+        ]
+        if not sym_sizes and not sym_strides:
+            continue
+        total += 1
+        logger.info(
+            "[symbolic-loop][audit] input=%s SYMBOLIC %s",
+            name,
+            sym_sizes + sym_strides,
+        )
+        if sym_strides:
+            logger.warning(
+                "[symbolic-loop][audit] SYMBOLIC STRIDE on input %s: %s. The "
+                "dynamic dim is an INNER dim, so the strides outside it scale "
+                "with the symbol and the device geometry is size-dependent. "
+                "Expect a NEW BINARY AT EVERY SIZE, which defeats the whole "
+                "point, and expect device_size to carry a hint-sized axis. A "
+                "symbolic dim that is the OUTERMOST dim keeps every stride "
+                "literal and does reuse one binary (compare split_m with "
+                "split_k). Either lay the tensor out with the dynamic axis "
+                "outermost, or this kernel cannot be size-independent as "
+                "written",
+                name,
+                sym_strides,
+            )
     for op in operations:
         data = getattr(op, "data", None)
         ranges = list(getattr(data, "ranges", None) or [])
@@ -2203,7 +2258,7 @@ def _audit_symbolic_ranges(operations: list[Operation]) -> None:
 def span_reduction(graph: GraphLowering) -> None:
     """Pass 1: compute minimum per-op splits required by MAX_SPAN_BYTES."""
     operations = graph.operations
-    _audit_symbolic_ranges(operations)
+    _audit_symbolic_ranges(operations, graph)
     max_cores = _validate_max_cores()
     for op in _iter_computed_buffers(operations):
         rw = op_read_writes(op)

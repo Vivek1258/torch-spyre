@@ -48,7 +48,7 @@ import signal
 import sys
 import time
 import traceback
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Callable
 
 import torch
@@ -420,6 +420,35 @@ def build_mm_split_k(size):
     return (x, y, acc0), acc0.float() + x.float() @ y.float()
 
 
+def split_k_outer_fn(XT, Y, acc0):
+    """split-K with X pre-transposed so the symbolic K is the OUTERMOST dim.
+
+    Defined here rather than in for_each_tile_fixtures.py on purpose: that file
+    is imported by the device e2e suite and this is an exploration probe, not a
+    fixture anyone else should depend on yet.
+
+    The ONLY difference from fx.split_k_caller_init_fn is the layout of the
+    first operand, and that is the whole point. There X is [M, K] tiled on
+    dims=(-1, 0), so K is an inner dim of X and stride(0) is the symbol. Here
+    XT is [K, M] tiled on dims=(0, 0), so K is outermost in BOTH operands and
+    every stride is a literal. Same arithmetic, same tile size, same carry.
+    """
+    from torch_spyre._inductor.wsr import for_each_tile  # noqa: PLC0415
+
+    def body(acc, ops):
+        xt_tile, y_tile = ops
+        return acc + xt_tile.transpose(-1, -2) @ y_tile, None
+
+    final, _ = for_each_tile(body, (XT, Y), dims=(0, 0), tile_size=64, init=acc0)
+    return final
+
+
+def build_mm_split_k_outer(size):
+    xt, y = _rand(size, MM_K), _rand(size, MM_N)
+    acc0 = torch.zeros(MM_K, MM_N, dtype=FP)
+    return (xt, y, acc0), acc0.float() + xt.float().t() @ y.float()
+
+
 def build_nested_m_then_k(size):
     x, y = _rand(size, MM_K), _rand(MM_K, MM_N)
     return (x, y), x.float() @ y.float()
@@ -578,6 +607,29 @@ def build_matrix():
             tol=5e-2,
         ),
         Scenario(
+            id="matmul_split_k_outer",
+            title="same reduction, but X transposed so the symbolic K is OUTERMOST",
+            question="Is reduction mode the problem, or is it that split_k marks "
+            "an INNER dim? split_k tiles X on dims=(-1, 0), so stride(0) of X is "
+            "the symbol and it emits a binary per size. This marks dim 0 of both "
+            "operands, so every stride is a literal.",
+            predict="ONE BINARY across the sweep, which would prove the rule is "
+            "about which dim carries the symbol and not about reduction mode. "
+            "CONFOUND to watch: the body now transposes a tile, and a transpose "
+            "needs a restickify, which is what attention trips over. If this "
+            "fails on a restickify rather than on geometry, the row is "
+            "inconclusive about the stride rule and instead links to F025.",
+            mode="reduction",
+            fixture=split_k_outer_fn,
+            build=build_mm_split_k_outer,
+            marks=((0, 0), (1, 0)),
+            equalities=(((0, 0), (1, 0)),),
+            sizes=SIZES_G64,
+            tol=5e-2,
+            notes="The control for matmul_split_k. Read the two together or "
+            "neither means anything.",
+        ),
+        Scenario(
             id="nested_m_then_k",
             title="NESTED, outer M map with a symbolic count, inner K reduction",
             question="Two loop levels where only the OUTER count varies. Does "
@@ -637,6 +689,12 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("only", nargs="*", help="scenario ids to run (default: all)")
     ap.add_argument("--out", default=RESULTS_PATH)
+    # One failing size can poison the sizes after it: a mid-sweep InductorError
+    # appears to make Dynamo re-trace every later size, which then looks like
+    # the scenario itself cannot share a binary. Being able to drop one size
+    # separates "this shape recompiles" from "the previous size broke it".
+    ap.add_argument("--skip-size", type=int, action="append", default=[],
+                    help="drop this size from every scenario (repeatable)")
     args = ap.parse_args()
 
     # A bare relative default lands in whatever directory the run started
@@ -680,6 +738,18 @@ def main() -> int:
     spyre_log.setLevel(logging.INFO)
 
     scenarios = build_matrix()
+    if args.skip_size:
+        drop = set(args.skip_size)
+        kept = []
+        for sc in scenarios:
+            sizes = tuple(z for z in sc.sizes if z not in drop)
+            warm = sc.warm if sc.warm not in drop else (sizes[0] if sizes else None)
+            if not sizes or warm is None:
+                print(f"  {sc.id}: every size skipped, dropping the scenario")
+                continue
+            kept.append(replace(sc, sizes=sizes, warm=warm))
+        scenarios = kept
+        print(f"skipping sizes {sorted(drop)}")
     if args.only:
         wanted = set(args.only)
         unknown = wanted - {s.id for s in scenarios}
