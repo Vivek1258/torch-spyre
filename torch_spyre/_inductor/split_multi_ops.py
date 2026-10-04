@@ -694,6 +694,28 @@ def _patch_original_buf(
     V.graph.name_to_buffer[new_op.get_name()] = new_op
 
 
+# Control-flow HOPs own the parent-graph node that a subgraph buffer also lists
+# as an origin. Their name says nothing about what the buffer computes, so a
+# name-keyed decision must look past them. See _get_op_name.
+_CONTROL_FLOW_ORIGINS = frozenset(
+    {"while_loop", "invoke_subgraph", "scan", "cond", "associative_scan"}
+)
+
+
+def _origin_op_name(origin_node) -> str:
+    """The op name a single origin node stands for, '' if it has none."""
+    target = getattr(origin_node, "target", None)
+    if target and hasattr(target, "name"):
+        full_name = target.name()
+        if "::" in full_name:
+            # Extract just the operation name (e.g., "add" from "aten::add.Tensor")
+            return full_name.split("::")[1].split(".")[0]
+        return full_name
+
+    # If we got here, just return the target as string
+    return str(target) if target else str(origin_node)
+
+
 def _get_op_name(op) -> str:
     """Extract the operation name from a node for validation."""
     if not hasattr(op.data, "origins") or not op.data.origins:
@@ -711,17 +733,30 @@ def _get_op_name(op) -> str:
     if origin_node is None:
         origin_node = next(iter(op.data.origins))
 
-    # Try to get the target and its name
-    target = getattr(origin_node, "target", None)
-    if target and hasattr(target, "name"):
-        full_name = target.name()
-        if "::" in full_name:
-            # Extract just the operation name (e.g., "add" from "aten::add.Tensor")
-            return full_name.split("::")[1].split(".")[0]
-        return full_name
+    return _origin_op_name(origin_node)
 
-    # If we got here, just return the target as string
-    return str(target) if target else str(origin_node)
+
+def _origin_op_names(op) -> "frozenset[str]":
+    """Every op name among a buffer's origins, control-flow HOPs excluded.
+
+    A buffer lowered inside a control-flow HOP inherits origins spanning BOTH
+    the parent graph (the HOP call) and the subgraph's own compute nodes, and
+    ``origin_in_graph`` resolves to the parent while this pass walks the parent
+    graph.  So ``_get_op_name`` reports "while_loop" for everything inside a
+    tiled body, which silently defeats any name-keyed rule -- notably the
+    layernormnorm / layernormscale EXX2 skip in ``validate_ops``, whose whole
+    purpose is to let layernorm through.
+
+    Returning the SET rather than one name is deliberate: ``origins`` is an
+    unordered set, so picking "the first non-HOP origin" would make a compile
+    decision depend on iteration order.  Membership questions are order-free.
+    """
+    if not hasattr(op.data, "origins") or not op.data.origins:
+        return frozenset()
+    return frozenset(
+        n for n in (_origin_op_name(o) for o in op.data.origins)
+        if n and n not in _CONTROL_FLOW_ORIGINS
+    )
 
 
 def validate_ops(graph: GraphLowering) -> None:
@@ -766,7 +801,29 @@ def validate_ops(graph: GraphLowering) -> None:
         # Skip ops with special ElementArrangement e.g. layernormnorm/scale with ElementArrangement.EXX2
         skip_ops = {"layernormnorm", "layernormscale"}
         skip_eas = {ElementArrangement.EXX2}
-        if op_name in skip_ops and any(ea in skip_eas for ea in stl_eas):
+
+        # Ask the whole origin set, not just the one name origin_in_graph picked.
+        # Inside a tiled body that one name is always the enclosing while_loop,
+        # which made this skip unreachable for exactly the ops it exists to
+        # permit.  See _origin_op_names.
+        origin_names = _origin_op_names(op)
+        has_skip_ea = any(ea in skip_eas for ea in stl_eas)
+
+        # Diagnostic: say what the name resolved to, what the origins offered,
+        # and the EA set, whenever a special EA is in play or the name came from
+        # a control-flow HOP. Loud enough to tell "the skip fired" from "the
+        # skip was never reachable", which is the whole bug.
+        if has_skip_ea or op_name in _CONTROL_FLOW_ORIGINS:
+            logger.info(
+                "[ea-validate] buffer=%s op_name=%r origins=%s eas=%s skip=%s",
+                op.get_name(),
+                op_name,
+                sorted(origin_names),
+                [str(ea) for ea in stl_eas],
+                bool(skip_ops & origin_names),
+            )
+
+        if has_skip_ea and (op_name in skip_ops or (skip_ops & origin_names)):
             continue
 
         # Valid EA patterns (see is_ea_compatible):
@@ -777,11 +834,18 @@ def validate_ops(graph: GraphLowering) -> None:
             args_str = ", ".join(
                 f'"{name}": {ea}' for name, ea in zip(input_names, stl_eas)
             )
+            # Name the real ops too. "op: while_loop" on its own says only that
+            # the buffer is inside a tiled body, which is never the reason.
+            inside = (
+                f" (inside {op_name}, computing {sorted(origin_names)})"
+                if op_name in _CONTROL_FLOW_ORIGINS
+                else ""
+            )
             raise Unsupported(
                 f"Incompatible ElementArrangement in multi-arg op. "
                 f"Valid patterns: all inputs share one EA, or one non-STANDARD EA "
                 f"broadcast against STANDARD inputs. "
-                f"op: {op_name}, args: {args_str}"
+                f"op: {op_name}{inside}, args: {args_str}"
             )
 
 

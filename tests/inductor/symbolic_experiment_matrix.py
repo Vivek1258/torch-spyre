@@ -278,7 +278,7 @@ def run_one_size(sc, compiled, size, device_name, collector, first):
             "size": size,
             "ok": False,
             "stage": "launch" if at_launch else "compile",
-            "error": f"{type(exc).__name__}: {str(exc)[:300]}",
+            "error": f"{type(exc).__name__}: {str(exc)[:4000]}",
             "where": _blame(tb),
             "bundles_added": len(find_bundles() - before),
             "logs": collector.take(),
