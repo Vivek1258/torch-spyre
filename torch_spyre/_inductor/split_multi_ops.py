@@ -14,6 +14,7 @@
 
 import collections
 import dataclasses
+import os
 import sympy
 import torch
 import torch.fx as fx
@@ -701,6 +702,10 @@ _CONTROL_FLOW_ORIGINS = frozenset(
     {"while_loop", "invoke_subgraph", "scan", "cond", "associative_scan"}
 )
 
+# SPYRE_EA_DEBUG=1 dumps every multi-arg op validate_ops inspects, at WARNING.
+# Read at import so it costs nothing per op.
+_EA_DEBUG = os.environ.get("SPYRE_EA_DEBUG") == "1"
+
 
 def _origin_op_name(origin_node) -> str:
     """The op name a single origin node stands for, '' if it has none."""
@@ -809,11 +814,26 @@ def validate_ops(graph: GraphLowering) -> None:
         origin_names = _origin_op_names(op)
         has_skip_ea = any(ea in skip_eas for ea in stl_eas)
 
-        # Diagnostic: say what the name resolved to, what the origins offered,
-        # and the EA set, whenever a special EA is in play or the name came from
-        # a control-flow HOP. Loud enough to tell "the skip fired" from "the
-        # skip was never reachable", which is the whole bug.
-        if has_skip_ea or op_name in _CONTROL_FLOW_ORIGINS:
+        # Diagnostic, at WARNING and over EVERY inspected op, because a
+        # conditional INFO version stayed silent on a run where the EA check
+        # demonstrably changed behaviour, and the silence of a diagnostic is
+        # not evidence about the thing it was meant to measure. Gated on an env
+        # var so the regression suite stays quiet. Spyre loggers default to
+        # WARNING, so this cannot be lost to a level.
+        if _EA_DEBUG:
+            logger.warning(
+                "[ea-validate] buffer=%s op_name=%r origins=%s eas=%s "
+                "skip_ea=%s skip_by_name=%s skip_by_origin=%s compatible=%s",
+                op.get_name(),
+                op_name,
+                sorted(origin_names),
+                [str(ea) for ea in stl_eas],
+                has_skip_ea,
+                op_name in skip_ops,
+                bool(skip_ops & origin_names),
+                is_ea_compatible(stl_eas),
+            )
+        elif has_skip_ea or op_name in _CONTROL_FLOW_ORIGINS:
             logger.info(
                 "[ea-validate] buffer=%s op_name=%r origins=%s eas=%s skip=%s",
                 op.get_name(),
