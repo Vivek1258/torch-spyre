@@ -186,35 +186,72 @@ class TestSymbolSide(unittest.TestCase):
 class TestWhyTheRegistryExists(unittest.TestCase):
     """The measurement that justifies the module, pinned as a test."""
 
-    def test_granularity_is_not_recoverable_from_facts(self):
-        """Several divisibility facts are true at once, so G cannot be inferred.
-
-        With min=128 and G=64 declared, the ShapeEnv ends up holding
-        Mod(s,64), Mod(s,2) and Mod(s, s//2). All three are true. A reader
-        wanting "the" granularity has to choose, and choosing is a heuristic
-        rather than a declaration. That is the whole argument for declaring it.
-        """
-        from torch.fx.experimental.symbolic_shapes import ShapeEnv
+    def _declared_env(self, minimum: int, granularity: int):
+        """A ShapeEnv with one symbol and a contract asserted on it."""
         from torch._dynamo.source import LocalSource
+        from torch.fx.experimental.symbolic_shapes import ShapeEnv
 
         shape_env = ShapeEnv()
         src = LocalSource("x")
         sym = shape_env.create_symbol(320, src)
         s = shape_env.create_symintnode(sym, hint=320, source=src)
+        torch._check(s >= minimum)
+        torch._check(s <= MAX)
+        torch._check(s % granularity == 0)
+        return shape_env, sym
 
-        torch._check(s >= 128)
-        torch._check(s % 64 == 0)
+    def test_the_lower_bound_is_not_the_granularity(self):
+        """Reading G off the symbol's lower bound gives the wrong answer.
 
-        facts = {str(f) for f in shape_env.divisible}
-        self.assertIn("Mod(s0, 64)", facts, f"declared fact missing: {facts}")
-        # More than one true fact means a reader cannot pick unambiguously.
-        self.assertGreater(
-            len(facts),
-            1,
-            "if only one fact were ever present the registry would be "
-            "unnecessary, so this test is the thing to re-check first if the "
-            "design is ever questioned",
+        This is the actual defect the registry exists to fix, and it is the
+        one to re-check first if the design is ever questioned. The granularity
+        used to be read from the symbol's derived lower bound. Declare
+        min=128 with G=64 and the two differ immediately, so a reader of the
+        lower bound gets 128 for a loop that steps 64. That is how a bundle
+        shipped declaring granularity 128 while its own loop stepped 64.
+
+        An earlier version of this test asserted that the divisibility set is
+        ambiguous instead. That is true in some traces and not in a clean
+        synthetic one, so it was the wrong thing to pin. The lower bound
+        disagreeing with the declared granularity is unconditional.
+        """
+        shape_env, sym = self._declared_env(minimum=128, granularity=G)
+
+        rng = shape_env.var_to_range[sym]
+        self.assertEqual(int(rng.lower), 128, "the declared min")
+        self.assertNotEqual(
+            int(rng.lower),
+            G,
+            "min and granularity are separate fields precisely so they can "
+            "differ, so the lower bound cannot stand in for the granularity",
         )
+
+    def test_the_declared_fact_is_present_but_not_alone_in_general(self):
+        """The divisibility fact lands, which is necessary but not sufficient.
+
+        It is present, so a reader *could* find it here. What makes it unsafe
+        as a channel is that a real trace installs other true divisibility
+        facts alongside it, from guards unrelated to our contract, and then
+        picking one is a heuristic. This test pins only the part that holds in
+        every case: ours is in there.
+        """
+        shape_env, sym = self._declared_env(minimum=128, granularity=G)
+        facts = {str(f) for f in shape_env.divisible}
+        self.assertTrue(
+            any(f"Mod({sym}, {G})" == f for f in facts),
+            f"the declared divisibility fact is missing from {facts}",
+        )
+
+    def test_a_declared_contract_gives_a_finite_upper_bound(self):
+        """Without this, codegen cannot describe the tiled dimension at all.
+
+        Measured: with nothing declared the upper bound is int_oo, and
+        max_trip_count refuses. Declaring the range is what makes it finite.
+        """
+        shape_env, sym = self._declared_env(minimum=128, granularity=G)
+        upper = shape_env.var_to_range[sym].upper
+        self.assertNotIn("oo", str(upper), "upper bound must be finite")
+        self.assertEqual(int(upper), MAX)
 
 
 if __name__ == "__main__":

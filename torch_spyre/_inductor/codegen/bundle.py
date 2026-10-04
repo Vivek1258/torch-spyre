@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import dataclasses
 import json
 import logging
 import os
@@ -19,6 +20,7 @@ from collections.abc import Sequence
 from typing import Any
 
 import sympy
+from torch.utils._sympy.functions import FloorDiv
 
 from torch_spyre._inductor import config as _spyre_config
 from torch_spyre._inductor.codegen.compute_ops import SymbolKind
@@ -600,6 +602,8 @@ def _collect_affine_maps(
     loop_var_depth: list,
     affine_map_index: dict,
     loop_var_indices_out: list,
+    loop_counts: "list[sympy.Expr] | None" = None,
+    scale_stack: "list[int] | None" = None,
 ) -> None:
     """Walk the spec tree and register unique affine stride keys.
 
@@ -614,7 +618,15 @@ def _collect_affine_maps(
     level (outermost first).  We iterate over levels explicitly and use
     ``loop_var_depth[level_idx]`` to find the correct loop variable for each
     level's strides — no counting from the end.
+
+    ``scale_stack`` carries each enclosing level's stride scale, so the stride
+    KEY registered here matches the stride the emitter will actually write. A
+    symbolic level's strides are divided by its tile size (see
+    ``_scaled_strides``); registering the unscaled value would allocate a map
+    that nothing uses and miss a share with an identical scaled key.
     """
+    if scale_stack is None:
+        scale_stack = []
     for entry in specs:
         if isinstance(entry, LoopSpec):
             _collect_affine_maps(
@@ -623,6 +635,8 @@ def _collect_affine_maps(
                 loop_var_depth + [len(loop_var_depth)],
                 affine_map_index,
                 loop_var_indices_out,
+                loop_counts,
+                scale_stack + [_count_scale(entry.count)],
             )
         elif isinstance(entry, OpSpec):
             _, _, affine_strides, _, _ = next(compiled_iter)
@@ -632,18 +646,16 @@ def _collect_affine_maps(
                 # Build stride_key and lv_indices by iterating levels explicitly.
                 stride_vals: list[int] = []
                 lv_idxs: list[int] = []
-                for level_idx, level_strides in enumerate(per_level_strides):
-                    if not level_strides:
-                        continue
+                for level_idx, stride in _scaled_strides(
+                    per_level_strides, scale_stack
+                ):
                     assert level_idx < len(loop_var_depth), (
                         f"affine_strides has {len(per_level_strides)} levels but "
                         f"only {len(loop_var_depth)} enclosing loop(s); "
                         "create_op_spec built more tiled_syms levels than LoopSpec ancestors"
                     )
-                    lv = loop_var_depth[level_idx]
-                    for stride in level_strides.values():
-                        stride_vals.append(stride)
-                        lv_idxs.append(lv)
+                    stride_vals.append(stride)
+                    lv_idxs.append(loop_var_depth[level_idx])
                 if not stride_vals:
                     per_tensor_lv_indices.append([])
                     continue
@@ -659,13 +671,157 @@ def _collect_affine_maps(
 # ---------------------------------------------------------------------------
 
 
-def _mlir_count_value(count: sympy.Expr) -> str:
-    """Return an MLIR value expression for a loop trip count."""
+@dataclasses.dataclass(frozen=True)
+class LoopLevel:
+    """How one ``scf.for`` level is emitted, and what that does to its strides.
+
+    ``stride_scale`` is the divisor every affine stride multiplying this
+    level's loop variable must be divided by. It is exact by construction: a
+    level's stride is its per-element step times the tile size, so dividing by
+    the tile size leaves the per-element step.
+    """
+
+    setup: "tuple[str, ...]"
+    bound: str
+    step: str
+    stride_scale: int
+
+
+def _decompose_symbolic_count(count: sympy.Expr) -> "tuple[str, int] | None":
+    """Split a trip count into (symbol name, tile size), or None.
+
+    Two shapes are recognised, and they are the only two the loop production
+    can produce: ``FloorDiv(s, G)`` for a tiled dimension, and a bare symbol
+    for a tile size of 1.
+    """
+    if isinstance(count, sympy.Symbol):
+        return str(count), 1
+    if isinstance(count, FloorDiv):
+        num, den = count.args
+        if isinstance(num, sympy.Symbol) and isinstance(den, sympy.Integer):
+            return str(num), int(den)
+    return None
+
+
+def _count_scale(count: sympy.Expr) -> int:
+    """The stride divisor a level with this trip count imposes.
+
+    1 for a concrete count or a tile size of 1, because the loop variable
+    counts single steps either way. Otherwise the tile size, because the loop
+    variable counts elements and steps by a whole tile each trip.
+
+    Kept separate from ``_loop_level`` because the affine-map collection pass
+    runs before any SSA names exist and only needs the scale.
+    """
     if isinstance(count, (sympy.Integer, int)):
-        return f"arith.constant {int(count)} : index"
-    raise NotImplementedError(
-        f"Symbolic loop counts are not yet supported in bundle.mlir generation: {count}"
+        return 1
+    decomposed = _decompose_symbolic_count(count)
+    return decomposed[1] if decomposed else 1
+
+
+def _loop_level(
+    count: sympy.Expr,
+    lb_idx: int,
+    loop_dim_ssa: "dict[str, str]",
+) -> LoopLevel:
+    """Pick the ``scf.for`` form for one loop level.
+
+    A concrete count keeps the form this emitter has always produced: a
+    constant upper bound with step 1, loop variable counting TILES.
+
+    A symbolic count becomes ``to <dim> step <G>``, so the loop variable counts
+    ELEMENTS along the varying dimension and the device works the trip count
+    out itself as ``(ub - lb) / step``. We deliberately do not author the
+    division. The instruction that builds the device loop counter switches on
+    the bound's defining op, and only a constant, a query-map result or a
+    symbol-creation result becomes a true symbolic loop count, so an authored
+    divide would land on a generic dynamic-loop path instead. Keeping the
+    dimension itself as the bound is also what lets one dimension parameter
+    drive two loops with different tile sizes, since each derives its own
+    count.
+
+    Floor versus ceiling does not arise: G divides the size exactly, which the
+    declared contract guarantees and the host checks before dispatch.
+
+    Args:
+        count: This level's trip count, concrete or symbolic.
+        lb_idx: Index used to name this level's SSA values.
+        loop_dim_ssa: Symbol name to the SSA value its ``input_arg`` extracted
+            to, so a symbolic bound can be wired to its parameter.
+
+    Returns:
+        The level's setup lines, bound, step and stride scale.
+
+    Raises:
+        NotImplementedError: The count is symbolic but not a shape this
+            emitter recognises, or it names a symbol with no ``input_arg``.
+    """
+    if isinstance(count, (sympy.Integer, int)):
+        return LoopLevel(
+            setup=(f"%loop_bound_{lb_idx} = arith.constant {int(count)} : index",),
+            bound=f"%loop_bound_{lb_idx}",
+            step="%c1",
+            stride_scale=1,
+        )
+
+    decomposed = _decompose_symbolic_count(count)
+    if decomposed is None:
+        raise NotImplementedError(
+            f"symbolic loop count {count!r} (type {type(count).__name__}, "
+            f"free_symbols="
+            f"{sorted(map(str, getattr(count, 'free_symbols', [])))}) is not a "
+            "recognized trip-count shape. Expected FloorDiv(symbol, integer) "
+            "or a bare symbol. Extend _decompose_symbolic_count if this shape "
+            "is legitimate."
+        )
+
+    sym_name, tile = decomposed
+    if sym_name not in loop_dim_ssa:
+        raise NotImplementedError(
+            f"symbolic loop count {count} references {sym_name}, which has no "
+            f"input_arg parameter. Known dimension params: "
+            f"{sorted(loop_dim_ssa)}. That means LoopSpec.count_symbol_bounds "
+            "did not carry bounds for this symbol, so the scheduler is where "
+            "to look."
+        )
+
+    dim_ssa = loop_dim_ssa[sym_name]
+    if tile == 1:
+        # The loop variable already counts single elements, so the dimension is
+        # the bound as it stands and no stride needs rescaling.
+        return LoopLevel(setup=(), bound=dim_ssa, step="%c1", stride_scale=1)
+    return LoopLevel(
+        setup=(f"%step_{lb_idx} = arith.constant {tile} : index",),
+        bound=dim_ssa,
+        step=f"%step_{lb_idx}",
+        stride_scale=tile,
     )
+
+
+def _scaled_strides(per_level_strides: list, scale_stack: list):
+    """Yield (level_idx, stride) with each level's stride scale applied.
+
+    A symbolic level's loop variable steps by its tile size rather than by 1,
+    so every stride multiplying it shrinks by that same factor. Writing the
+    per-tile stride against an element-stepping loop would advance the address
+    a whole tile too far on every trip, so the two always move together.
+    """
+    for level_idx, level_strides in enumerate(per_level_strides):
+        if not level_strides:
+            continue
+        scale = scale_stack[level_idx] if level_idx < len(scale_stack) else 1
+        for stride in level_strides.values():
+            if scale != 1:
+                if stride % scale:
+                    raise AssertionError(
+                        f"affine stride {stride} is not divisible by the loop "
+                        f"step {scale} at level {level_idx}. A symbolic level "
+                        f"steps by its tile size, so its strides must be a "
+                        f"multiple of it, or the loop variable and the stride "
+                        f"disagree about what one step means."
+                    )
+                stride = stride // scale
+            yield level_idx, stride
 
 
 def _dim_input_arg_type(dim_sk: SymbolKind) -> str:
