@@ -1330,18 +1330,22 @@ def splice_while_loop(
         placeholder_name = body_graph_input_names[i]
         real_input = operands[i]
 
-        # A SymInt operand, which is how the varying dimension arrives, is a
-        # shape expression and not a buffer, so there is nothing for the read
-        # redirection to point at. Skipped by asking whether a buffer backs it,
-        # rather than with hasattr(real_input, "get_name") -- see
-        # _storage_name's docstring for why that test looks right and is not.
+        # A SymInt operand, which is how a varying dimension arrives, is a shape
+        # expression and not a buffer, so there is nothing for the read
+        # redirection to point at and it is skipped.
         #
-        # The name itself still comes from get_name(), because _storage_name
-        # unwraps views and would answer with the underlying buffer instead.
-        if _storage_name(real_input) is None:
+        # Keyed on the name lookup itself raising, which is precisely the
+        # condition: ShapeAsConstantBuffer/NoneAsConstantBuffer subclass IRNode
+        # rather than Buffer and inherit a get_name() that raises (see
+        # _storage_name). Not hasattr, which answers True for an attribute that
+        # raises only when called, and not _storage_name as a predicate, which
+        # is stricter than "has a name" and skipped operands this pass needs.
+        try:
+            real_name = real_input.get_name()
+        except NotImplementedError:
             continue
 
-        name_map[placeholder_name] = real_input.get_name()
+        name_map[placeholder_name] = real_name
         ref_map[placeholder_name] = real_input
 
     if name_map:
