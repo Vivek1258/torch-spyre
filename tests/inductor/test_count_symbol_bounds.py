@@ -41,7 +41,10 @@ from torch_spyre._inductor.kernel_provenance import (
     _validate_finalized_schema,
 )
 from torch_spyre._inductor.op_spec import LoopSpec
-from torch_spyre._inductor.pass_utils import symbolic_count_bounds
+from torch_spyre._inductor.pass_utils import (
+    decompose_tiled_count,
+    symbolic_count_bounds,
+)
 from torch_spyre._inductor.spyre_kernel import (
     _codegen_op_spec_list,
     _sympy_literal,
@@ -151,12 +154,13 @@ class TestItSurvivesTheRealSerializer(unittest.TestCase):
         self.assertIn("count_symbol_bounds", source)
         self.assertEqual(reloaded.count_symbol_bounds, {SYM: (MAX, TILE)})
 
-    def test_the_count_itself_comes_back_in_the_other_spelling(self):
+    def test_the_count_changes_class_and_spelling_but_not_meaning(self):
         """Which is why the bounds are plain ints keyed by name.
 
-        The count is written as ``sympify('(s0//64)')`` and re-parses into a
-        different class with an assumption-free symbol. The bounds are not an
-        expression, so they do not take part in that.
+        The count is written as ``sympify('(s0//64)')`` and comes back as a
+        different class whose ``str`` is also different. What survives is the
+        decomposition, which is why that is the one interpretation point. The
+        bounds are not an expression, so they do not take part in any of this.
         """
         spec = LoopSpec(
             count=FloorDiv(_sym(), TILE),
@@ -167,7 +171,15 @@ class TestItSurvivesTheRealSerializer(unittest.TestCase):
         (reloaded,), _source = self._round_trip(spec)
 
         self.assertNotIsInstance(reloaded.count, FloorDiv)
-        self.assertEqual(str(reloaded.count), str(FloorDiv(_sym(), TILE)))
+        self.assertNotEqual(
+            str(reloaded.count),
+            str(FloorDiv(_sym(), TILE)),
+            "the round trip is string-stable on this sympy build, so the cache "
+            "key normalisation below is no longer needed. Check before removing",
+        )
+
+        symbol, tile = decompose_tiled_count(reloaded.count)
+        self.assertEqual((str(symbol), tile), (SYM, TILE))
         self.assertEqual(reloaded.count_symbol_bounds, {SYM: (MAX, TILE)})
 
     def test_a_concrete_loop_emits_no_bounds_line(self):
@@ -226,6 +238,29 @@ class TestTheCacheKeySeparatesThem(unittest.TestCase):
 
     def test_identical_bounds_do_share_one(self):
         self.assertEqual(self._key({SYM: (MAX, TILE)}), self._key({SYM: (MAX, TILE)}))
+
+    def test_the_key_survives_the_reload_spelling(self):
+        """A reloaded kernel must find its own cache entry.
+
+        The count is hashed as a string and the reload changes that string, so
+        without normalisation a reloaded kernel computes a different key from
+        the one that produced it and recompiles -- in the one feature whose
+        whole purpose is not recompiling.
+        """
+        from torch_spyre.execution.kernel_cache import compute_specs_hash
+
+        before = FloorDiv(_sym(), TILE)
+        after = sympy.sympify(str(before))
+        self.assertNotEqual(str(before), str(after), "fixture is not exercising it")
+
+        keys = [
+            compute_specs_hash(
+                [LoopSpec(count=count, body=[], count_symbol_bounds={SYM: (MAX, TILE)})]
+            )
+            for count in (before, after)
+        ]
+
+        self.assertEqual(keys[0], keys[1])
 
 
 if __name__ == "__main__":

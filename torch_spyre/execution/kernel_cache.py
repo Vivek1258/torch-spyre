@@ -21,6 +21,7 @@ from collections.abc import Sequence
 from functools import lru_cache
 from typing import Optional
 
+import sympy
 import torch
 from torch._inductor.codecache import code_hash
 from torch._inductor.runtime.runtime_utils import cache_dir
@@ -233,6 +234,21 @@ def _strip_debug_handles(obj):
     return obj
 
 
+def _normalized_expr_str(expr) -> str:
+    """``str(expr)`` in the spelling the reload path will produce.
+
+    Hashing a raw ``str`` makes the cache key depend on which side of a reload
+    the expression was last on. Normalising means both sides agree. Falls back
+    to the raw string if the expression does not survive a parse, which keeps a
+    key computable rather than failing the compile over a hash input.
+    """
+    raw = str(expr)
+    try:
+        return str(sympy.sympify(raw))
+    except Exception:  # noqa: BLE001 - a key we cannot normalise is still a key
+        return raw
+
+
 def compute_specs_hash(
     specs: Sequence, kernel_name: str = "", pool_size: int = 0
 ) -> str:
@@ -278,7 +294,17 @@ def compute_specs_hash(
                 # Include the trip count so loops with different iteration
                 # counts never collide, even when their body OpSpecs produce
                 # identical SDSC JSON.
-                loop_count_str = str(entry.count)
+                # Normalised through one sympify, because str() is NOT stable
+                # across the reload. The serializer writes sympify('<str>') and
+                # str(FloorDiv(s, 64)) is "(s0//64)", which re-parses as
+                # floor(s0/64) and prints as "floor(s0/64)". So hashing the raw
+                # string gives a reloaded kernel a different key from the one
+                # that produced it, and it misses its own cache entry and
+                # recompiles -- in the one feature whose point is not
+                # recompiling. One round trip is idempotent: both spellings
+                # normalise to the same string, and a concrete count is
+                # unaffected.
+                loop_count_str = _normalized_expr_str(entry.count)
                 content_parts.append(f"loop_count:{loop_count_str}".encode())
                 _debug_loop_counts.append(loop_count_str)
                 logger.debug("  [hash] LoopSpec  count=%s", loop_count_str)
