@@ -30,10 +30,14 @@ import unittest
 
 import sympy
 import torch
-from torch._dynamo.source import LocalSource
-from torch._subclasses.fake_tensor import FakeTensorMode
-from torch.fx.experimental.symbolic_shapes import DimDynamic, ShapeEnv
 
+from symbolic_shape_fixtures import (  # noqa: E402
+    TILE,
+    WIDTH,
+    fake_symbolic_rows,
+    is_symbolic,
+    shape_env_attr,
+)
 from torch_spyre._inductor.wsr.for_each_tile import (
     Kind,
     TileSpec,
@@ -41,55 +45,6 @@ from torch_spyre._inductor.wsr.for_each_tile import (
     _tile_size_vector,
     _xs_leaf,
 )
-
-S_HINT = 320
-WIDTH = 128
-TILE = 64
-
-
-def _fake_symbolic_rows(rows_hint=S_HINT, width=WIDTH):
-    """A fake `[s, width]` whose dim 0 is a backed dynamic symbol.
-
-    Two construction routes, because which one works has moved between torch
-    versions and this file has to keep running on both. The first is the direct
-    one; `from_tensor` is the fallback.
-    """
-    errors = []
-
-    try:
-        shape_env = ShapeEnv()
-        mode = FakeTensorMode(shape_env=shape_env)
-        src = LocalSource("x")
-        with mode:
-            sym = shape_env.create_symbol(rows_hint, src, DimDynamic.DYNAMIC)
-            rows = shape_env.create_symintnode(sym, hint=rows_hint, source=src)
-            x = torch.empty(rows, width)
-        return shape_env, mode, x
-    except Exception as exc:  # noqa: BLE001
-        errors.append(f"create_symbol: {type(exc).__name__}: {exc}")
-
-    try:
-        from torch.fx.experimental.symbolic_shapes import StatelessSymbolicContext
-
-        shape_env = ShapeEnv()
-        mode = FakeTensorMode(shape_env=shape_env)
-        real = torch.empty(rows_hint, width)
-        kwargs = {"dynamic_sizes": [DimDynamic.DYNAMIC, DimDynamic.STATIC]}
-        try:
-            ctx = StatelessSymbolicContext(**kwargs)
-        except TypeError:
-            kwargs["dynamic_strides"] = [DimDynamic.INFER_STRIDE] * 2
-            ctx = StatelessSymbolicContext(**kwargs)
-        with mode:
-            x = mode.from_tensor(real, source=LocalSource("x"), symbolic_context=ctx)
-        return shape_env, mode, x
-    except Exception as exc:  # noqa: BLE001
-        errors.append(f"from_tensor: {type(exc).__name__}: {exc}")
-
-    raise unittest.SkipTest(
-        "could not build a fake tensor with a symbolic dim on this torch build: "
-        + " | ".join(errors)
-    )
 
 
 def _slice_spec(shape, dim, extent, num_tiles):
@@ -99,27 +54,6 @@ def _slice_spec(shape, dim, extent, num_tiles):
         _tile_size_vector(shape, dim, extent),
         num_tiles,
     )
-
-
-def _is_symbolic(value):
-    return bool(getattr(value, "free_symbols", None)) or hasattr(value, "node")
-
-
-def _shape_env_attr(shape_env, name):
-    """Read a `ShapeEnv` internal, failing with a sentence if it has moved.
-
-    These tests assert on `ShapeEnv` internals because that is where the claim
-    lives. If torch renames one, a bare AttributeError says nothing useful, so
-    name it here instead.
-    """
-    value = getattr(shape_env, name, None)
-    if value is None:
-        raise AssertionError(
-            f"ShapeEnv has no '{name}' on this torch build, so this test cannot "
-            f"check what it claims to check. Find the new name before deleting "
-            f"the test, because the behaviour it pins is load-bearing."
-        )
-    return value
 
 
 class TestConcreteBehaviourUnchanged(unittest.TestCase):
@@ -187,9 +121,9 @@ class TestSymbolicTileExtent(unittest.TestCase):
     """Trimming first is what keeps the tile extent a literal."""
 
     def test_the_extent_stays_literal(self):
-        shape_env, mode, x = _fake_symbolic_rows()
+        shape_env, mode, x = fake_symbolic_rows()
         rows = x.shape[0]
-        self.assertTrue(_is_symbolic(rows), "fixture did not produce a symbolic dim")
+        self.assertTrue(is_symbolic(rows), "fixture did not produce a symbolic dim")
         spec = _slice_spec(x.shape, 0, TILE, rows // TILE)
 
         with mode:
@@ -197,7 +131,7 @@ class TestSymbolicTileExtent(unittest.TestCase):
 
         extent = leaf.shape[1]
         self.assertFalse(
-            _is_symbolic(extent),
+            is_symbolic(extent),
             f"tile extent came out symbolic as {extent}, so the trim did not hold",
         )
         self.assertEqual(int(extent), TILE)
@@ -208,7 +142,7 @@ class TestSymbolicTileExtent(unittest.TestCase):
         Splitting the untrimmed operand is what the helper used to do, and it
         re-derives the extent as `s // (s // G)` rather than keeping `G`.
         """
-        shape_env, mode, x = _fake_symbolic_rows()
+        shape_env, mode, x = fake_symbolic_rows()
         rows = x.shape[0]
 
         with mode:
@@ -216,13 +150,13 @@ class TestSymbolicTileExtent(unittest.TestCase):
 
         extent = untrimmed.shape[1]
         self.assertTrue(
-            _is_symbolic(extent),
+            is_symbolic(extent),
             "the untrimmed spelling kept the extent literal, so this control no "
             "longer proves anything and the test above is not measuring the trim",
         )
 
     def test_the_leaf_still_covers_every_whole_tile(self):
-        shape_env, mode, x = _fake_symbolic_rows()
+        shape_env, mode, x = fake_symbolic_rows()
         rows = x.shape[0]
         spec = _slice_spec(x.shape, 0, TILE, rows // TILE)
 
@@ -245,15 +179,15 @@ class TestOutputFoldInstallsNoGuards(unittest.TestCase):
             return torch.empty(tiles, TILE, WIDTH)
 
     def test_as_strided_path_adds_no_guards(self):
-        shape_env, mode, x = _fake_symbolic_rows()
+        shape_env, mode, x = fake_symbolic_rows()
         tiles = x.shape[0] // TILE
         ys = self._stacked_ys(mode, shape_env, tiles)
-        before = len(_shape_env_attr(shape_env, "guards"))
+        before = len(shape_env_attr(shape_env, "guards"))
 
         with mode:
             _stacked_to_full(ys, 0)
 
-        added = [str(g) for g in _shape_env_attr(shape_env, "guards")[before:]]
+        added = [str(g) for g in shape_env_attr(shape_env, "guards")[before:]]
         self.assertEqual(
             added,
             [],
@@ -263,16 +197,16 @@ class TestOutputFoldInstallsNoGuards(unittest.TestCase):
 
     def test_control_flatten_adds_at_least_one(self):
         """The control for the test above. `flatten` is the spelling we rejected."""
-        shape_env, mode, x = _fake_symbolic_rows()
+        shape_env, mode, x = fake_symbolic_rows()
         tiles = x.shape[0] // TILE
         ys = self._stacked_ys(mode, shape_env, tiles)
-        before = len(_shape_env_attr(shape_env, "guards"))
+        before = len(shape_env_attr(shape_env, "guards"))
 
         with mode:
             ys.flatten(0, 1)
 
         self.assertGreater(
-            len(_shape_env_attr(shape_env, "guards")) - before,
+            len(shape_env_attr(shape_env, "guards")) - before,
             0,
             "flatten installed no guard either, so the as_strided test above is "
             "not measuring anything",
@@ -292,11 +226,11 @@ class TestDivisibilityIsStated(unittest.TestCase):
     def test_the_fact_reaches_the_shape_env(self):
         from torch_spyre._inductor.wsr.for_each_tile import _normalize_in_specs
 
-        shape_env, mode, x = _fake_symbolic_rows()
+        shape_env, mode, x = fake_symbolic_rows()
         with mode:
             _normalize_in_specs((x,), (0,), TILE)
 
-        divisible = {str(expr) for expr in _shape_env_attr(shape_env, "divisible")}
+        divisible = {str(expr) for expr in shape_env_attr(shape_env, "divisible")}
         self.assertTrue(
             any(str(TILE) in d for d in divisible),
             f"Mod(s, {TILE}) is not in the divisibility set, so the simplifier "
