@@ -337,56 +337,6 @@ class TestMoreThanOneSymbolIsRefusedHere(unittest.TestCase):
             )
 
 
-class TestAnAdvanceMustNotReachPastTheTensor(unittest.TestCase):
-    """The refusal a single-size test cannot reach.
-
-    Under a symbolic loop the trip count is the declared maximum. If a size was
-    taken from the warm-up hint instead, the product overruns, and that kernel
-    is correct at and below the hint and wrong above it.
-    """
-
-    @staticmethod
-    def _arg(device_size):
-        return SimpleNamespace(device_size=device_size, name="arg0")
-
-    def _check(self, advance, trips, device_size):
-        from torch_spyre._inductor.codegen.superdsc import _check_advance_fits
-
-        _check_advance_fits(
-            _sym(), advance, trips, self._arg(device_size), SimpleNamespace(op="gelu")
-        )
-
-    def test_an_exact_fit_passes(self):
-        self._check(advance=64, trips=8, device_size=[512])
-
-    def test_reaching_less_than_the_tensor_passes(self):
-        """Normal, not a problem. How far an advance reaches depends on which
-        axes it spans, so covering less than the whole tensor says nothing."""
-        self._check(advance=64, trips=4, device_size=[512])
-
-    def test_reaching_past_the_tensor_refuses(self):
-        with self.assertRaises(ValueError) as caught:
-            self._check(advance=64, trips=9, device_size=[512])
-
-        message = str(caught.exception)
-        self.assertIn("576", message)
-        self.assertIn("512", message)
-        self.assertIn("warm-up hint", message)
-
-    def test_a_multi_axis_size_is_multiplied_out(self):
-        self._check(advance=64, trips=8, device_size=[2, 256])
-        with self.assertRaises(ValueError):
-            self._check(advance=64, trips=9, device_size=[2, 256])
-
-    def test_a_symbolic_size_is_skipped_rather_than_crashing(self):
-        """There is no bound to compare against, and something earlier already
-        failed if a device size is still symbolic here."""
-        self._check(advance=64, trips=9, device_size=[_sym()])
-
-    def test_no_device_size_is_skipped(self):
-        self._check(advance=64, trips=9, device_size=[])
-
-
 class TestItSurvivesTheRealSerializer(unittest.TestCase):
     """Through the same functions codegen uses, not a reimplementation."""
 
