@@ -86,10 +86,13 @@ pieces: a host patch of the program image, a transfer of the patched tensor to t
 device scatter program with its dummy. Only symbols already constant at the call site are lifted out
 at compile time.
 
-So keeping addresses static is not a convenience that avoids an occasional patch. It removes an
-unconditional per-dispatch cost, and an **empty** symbol list is the design goal rather than a nice
-outcome. Section 16.3 has the three pieces and the measured figure, with the caveat that the figure
-is a slow-path number.
+So keeping addresses static is not a convenience that avoids an occasional patch, it removes an
+unconditional per-dispatch cost. Section 16.3 has the three pieces and the measured figure, with the
+caveat that the figure is a slow-path number.
+
+**Be precise about what "static" means here, because the obvious test is the wrong one.** It does
+**not** mean the bundle carries no symbols. Section 7.5 has the correct statement and it is worth
+reading before using any of this as a review criterion.
 
 One scope note while we are here. The trip count travels on a different channel from the addresses,
 so "no correction" is a claim about addresses and says nothing about the count.
@@ -257,7 +260,7 @@ Core division is not on that list. Work division operates on the loop body, whic
 
 | # | Invariant | What breaks if violated |
 |---|---|---|
-| 1 | No address or stride is computed from the varying dimension | address correction already runs on every dispatch, in three pieces. A symbol list that is empty removes it entirely, and one entry derived from the varying size makes it unavoidable. Sections 3 and 16.3 |
+| 1 | No address or stride is **computed from** the varying dimension | an address derived from the size has to be recomputed on every call, which is what creates a per-dispatch program correction. Note the invariant is about derivation, not about whether the bundle carries symbols: base addresses are symbolic on every bundle and that is free. Section 7.5 |
 | 2 | **The SDSC describes one tile and is fully static** | the tile is the loop body, so its geometry is the tile size. The maximum belongs in the bundle argument and in the HBM layout, not in the SDSC |
 | 3 | The runtime size is within range and a multiple of the granularity | the tile count floor silently drops the tail and the answer is quietly wrong |
 | 4 | One symbolic count per kernel per nesting level | two independently marked operands give two symbols and two counts, which cannot be launched |
@@ -443,6 +446,37 @@ func.func @sdsc_bundle(
 ```
 
 The three address parameters are on every bundle today and `symbol_ids` carries them as it always has. The fourth parameter is the only thing this feature adds, and it is recognisable because it is the only one with `granularity` and `max_value` on it.
+
+#### A non-empty `symbol_ids` is not a violation, and not a cost signal
+
+This needs saying plainly, because an earlier version of this document used "an empty symbol list"
+as shorthand for "addresses are static", and that shorthand is wrong in a way that leads a reader to
+the opposite of the right conclusion. By that test every bundle ever emitted violates the design,
+since none of them has an empty list.
+
+Two different things are both called symbols in this area.
+
+**Base addresses are symbolic by construction, on every kernel, static or dynamic.** The runtime has
+to supply the base address at launch rather than have it baked into the program image.
+`isStartAddrSymbolic_: 1` on the SDSC side is what marks that, a negative symbol id under
+`dimToSymbolMapping_` is how the slot is named, and `symbol_ids` on `sdsc_execute` is how it is
+passed. That is the ordinary symbolic-address route and it costs nothing extra. A kernel with
+several such entries is completely normal.
+
+**An address or stride derived from the varying dimension is the thing invariant 1 forbids.** The
+difference is derivation, not presence. A value that is merely passed in is free. A value that has to
+be **recomputed from the runtime size** cannot be resolved at the call site, and that is what pulls
+in the per-dispatch correction of Section 16.3.
+
+So when reviewing a bundle or an SDSC, the question is never "is the symbol list empty". It is
+whether any address or stride is a function of the varying dimension. Reading a populated
+`symbol_ids` or an `isStartAddrSymbolic_: 1` as evidence of a violation is a mistake this document
+has now made once and it should not be made again.
+
+One thing left open deliberately. The exact conditions under which the backend materialises a
+program correction, as opposed to resolving a symbol at the call site, are theirs and we have not
+verified them end to end. So "no correction" is a claim we make about **our** addresses being
+independent of the varying size, and it should not be restated as a claim about symbol counts.
 
 Three details in that listing are load-bearing, and all three are easy to get wrong.
 
@@ -1519,9 +1553,9 @@ So the capability this design depends on is present and working across their com
 
 #### One hard constraint that changes our dependency list
 
-The current correction pipeline **refuses** to build a correction for a program that is called from inside a loop, and fails the pass rather than degrading. An older implementation did support it. We never encounter this because our addresses are static and therefore our `symbol_ids` is empty and no correction is created at all.
+The current correction pipeline **refuses** to build a correction for a program that is called from inside a loop, and fails the pass rather than degrading. An older implementation did support it. We expect not to encounter it because none of our addresses is **derived from** the varying dimension, so nothing inside the loop needs recomputing per dispatch. Note that this is not the same as our bundles carrying no symbols: they carry base addresses like every other kernel. Section 7.5.
 
-That turns max-strided reservation from an optimisation into a **hard prerequisite with no fallback**. If anything ever makes an address symbolic inside our loop, the compile fails outright. The reservation work is therefore load-bearing in the strict sense, and we should guard it on our side: fail loudly if a bundle we emit carries a non-empty symbol list on a program inside a symbolic loop, rather than letting it surface as a backend pass failure about latch programs. Which of the two correction implementations the reference bundle targets is a question to settle with them.
+That turns max-strided reservation from an optimisation into a **hard prerequisite with no fallback**. If anything ever makes an address symbolic inside our loop, the compile fails outright. The reservation work is therefore load-bearing in the strict sense, and we should guard it on our side: fail loudly if a bundle we emit puts an address or stride **derived from the varying dimension** on a program inside a symbolic loop, rather than letting it surface as a backend pass failure about latch programs. The check is on derivation, not on the symbol count, which would flag every kernel. Which of the two correction implementations the reference bundle targets is a question to settle with them.
 
 Loop support is tracked on the deeptools side as two options, by repeating programs ([#1520](https://github.com/torch-spyre/torch-spyre/issues/1520)) and by program looping with a symbolic bound ([#1522](https://github.com/torch-spyre/torch-spyre/issues/1522)). The second is the one this design needs. Our ask [#4397](https://github.com/torch-spyre/torch-spyre/issues/4397) describes the same capability plus a request for an example bundle and SDSC pair, so it likely folds into #1522, ref [#4380](https://github.com/torch-spyre/torch-spyre/issues/4380).
 
@@ -1529,11 +1563,11 @@ Loop support is tracked on the deeptools side as two options, by repeating progr
 
 The per-dispatch cost claim needs restating, and the honest version is **stronger** than the one this document used to make.
 
-There is no per-allocation patching cache. The correction is a host-compute command inside the job plan, so when it exists it runs on **every dispatch of that job**, in three parts: a host patch that evaluates every symbol and rewrites every location, a transfer of the patched tensor to the device, and a device scatter program with its companion. Only symbols already constant at the call site are lifted out, at compile time. So keeping addresses static does not avoid an occasional patch; it removes an unconditional per-dispatch cost in its entirety. An empty symbol list is the design goal, not a footnote.
+There is no per-allocation patching cache. The correction is a host-compute command inside the job plan, so when it exists it runs on **every dispatch of that job**, in three parts: a host patch that evaluates every symbol and rewrites every location, a transfer of the patched tensor to the device, and a device scatter program with its companion. Only symbols already constant at the call site are lifted out, at compile time. So keeping addresses independent of the varying size does not avoid an occasional patch, it removes an unconditional per-dispatch cost in its entirety. The design goal is that no address is a function of the varying dimension, which is not the same as a bundle carrying no symbols. Section 7.5.
 
 One caveat to keep visible: the trip count travels on a **different** channel from the addresses, so "no correction" is a claim about addresses and not about the count. The count still reaches the device, just not through the correction machinery.
 
-Finally, a caveat on the measured number that motivates this project. The roughly 795 microseconds per dispatch was measured with the correction host path in its default configuration, and a considerably faster path exists in their tree but is **off by default**. So that figure is a slow-path number and should be quoted with that qualification. The argument survives either way, because the fast path only addresses the first of the three parts above while an empty symbol list removes all three, and that is the version to rely on because it does not depend on a number that may move.
+Finally, a caveat on the measured number that motivates this project. The roughly 795 microseconds per dispatch was measured with the correction host path in its default configuration, and a considerably faster path exists in their tree but is **off by default**. So that figure is a slow-path number and should be quoted with that qualification. The argument survives either way, because the fast path only addresses the first of the three parts above while having no size-derived address removes all three, and that is the version to rely on because it does not depend on a number that may move.
 
 ## 17. Alternatives considered and rejected
 
