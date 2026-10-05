@@ -64,6 +64,7 @@ from .scratchpad.lx_relayout import (
 from .pass_utils import (
     concretize_expr,
     compute_symbolic_bounds,
+    max_trip_count,
     symbolic_count_bounds,
     finite_upper_or_none,
     iteration_space,
@@ -1001,7 +1002,10 @@ class SpyreKernel(Kernel[CSEVariable]):
                     level_syms.append(self._get_or_mint_level_symbol(lvl, op_name))
                 tiled_syms_per_level_outermost.append(level_syms)
                 if lvl < len(loop_count):
-                    trip_count = int(loop_count[lvl])
+                    # Not int(): a symbolic count has no single value, and int()
+                    # on one raises. What the SDSC needs here is the dimension's
+                    # largest extent. See max_trip_count.
+                    trip_count = max_trip_count(loop_count[lvl])
                     for sym in level_syms:
                         tiled_symbol_trip_counts[sym] = trip_count
             # Reverse so index 0 = innermost level.

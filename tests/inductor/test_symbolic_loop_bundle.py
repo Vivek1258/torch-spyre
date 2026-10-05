@@ -107,6 +107,8 @@ class _BundleHarness(InductorTestCase):
 
     @staticmethod
     def _symbolic_loop(tile=TILE, bounds=None, sources=None, body=None):
+        """A symbolic loop. `body` must be non-empty: op_spec_validation
+        refuses an empty one, and one compiled entry is consumed per OpSpec."""
         return LoopSpec(
             count=FloorDiv(_sym(), tile),
             body=body if body is not None else [_op_spec()],
@@ -246,12 +248,17 @@ class TestItRefusesRatherThanGuesses(_BundleHarness):
         Stricter than strictly necessary, and deliberately so until the
         granularity chooser guarantees every tile size divides the declared one.
         """
-        outer = self._symbolic_loop(tile=64, bounds={SYM: (MAX, 64)})
-        inner = self._symbolic_loop(tile=128, bounds={SYM: (MAX, 128)}, body=[])
-        outer.body = [_op_spec(), inner]
+        # Every LoopSpec needs a body: op_spec_validation refuses an empty one
+        # before generate_bundle gets as far as merging the maps.
+        inner = self._symbolic_loop(
+            tile=128, bounds={SYM: (MAX, 128)}, body=[_op_spec()]
+        )
+        outer = self._symbolic_loop(
+            tile=64, bounds={SYM: (MAX, 64)}, body=[_op_spec(), inner]
+        )
 
         with self.assertRaises(NotImplementedError) as caught:
-            self._run([outer], [self._entry(TILE_STRIDE)])
+            self._run([outer], [self._entry(TILE_STRIDE)] * 2)
 
         self.assertIn(SYM, str(caught.exception))
         self.assertIn("disagree", str(caught.exception))
@@ -260,10 +267,10 @@ class TestItRefusesRatherThanGuesses(_BundleHarness):
 class TestOneParameterServesEveryLoopOnThatDimension(_BundleHarness):
     def test_two_loops_sharing_a_dimension_share_one_parameter(self):
         """The same shape variable reaches every loop that tiles on it."""
-        second = self._symbolic_loop(body=[])
-        first = self._symbolic_loop(body=[_op_spec(), second])
+        inner = self._symbolic_loop(body=[_op_spec()])
+        outer = self._symbolic_loop(body=[_op_spec(), inner])
 
-        bundle, kinds = self._run([first], [self._entry(TILE_STRIDE)])
+        bundle, kinds = self._run([outer], [self._entry(TILE_STRIDE)] * 2)
 
         self.assertEqual(bundle.count(f"%dim_{SYM}_base:"), 1)
         self.assertEqual(len([k for k in kinds if k.is_loop_dimension]), 1)
