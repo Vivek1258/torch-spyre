@@ -1696,6 +1696,10 @@ def _resolve_sdsc_size(expr: Expr, symbolic_dim_bounds: dict) -> int:
     codegen time from ShapeEnv, serialized as plain ints into the generated
     file) so this works during the reload phase when ShapeEnv is gone.
     Falls back to _concretize_for_sdsc for concrete expressions.
+
+    Only the SDSC route reaches the symbolic branch. On the explicit-loop route
+    no dimension symbol enters an SDSC at all, so every size here is already
+    concrete and this takes the fallback.
     """
     # ``symbolic_dim_bounds`` is keyed by a single symbol name, so it can only
     # answer for a single-symbol expression; a multi-symbol one falls through to

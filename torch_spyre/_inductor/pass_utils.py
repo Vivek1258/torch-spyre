@@ -343,7 +343,15 @@ def finite_upper_or_none(expr: Expr) -> Optional[int]:
 
 
 def compute_granularity(expr: Expr, max_size: int) -> int:
-    """Return the granularity for a symbolic dimension.
+    """Return the granularity for a symbolic dimension, SDSC route only.
+
+    Serves the route where the symbol stays inside one op's iteration space and
+    reaches the SDSC's symbol table. The explicit-loop route does not call this:
+    there the region is built with ``for_each_tile(tile_size=G)``, so G is already
+    in the trip count and the emitter reads it back exactly. Do not retarget this
+    function at that route -- deriving G and the loop's own step from the same
+    expression is what makes them unable to disagree, and a bundle has already
+    shipped declaring one granularity while its loop stepped another.
 
     Admissible runtime values are ``{G, 2G, ..., max_size}``. If the
     user passed ``mark_dynamic(min=...)`` we honour it after validation;
