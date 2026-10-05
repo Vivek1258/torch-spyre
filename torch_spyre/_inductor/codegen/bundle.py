@@ -252,6 +252,31 @@ def generate_bundle(
         for sym_idx in dimension_sym_indices
     }
 
+    # Loop-bound dimensions, collected separately from the SDSC dimension
+    # symbols above. They are a different kind for a reason: these never enter
+    # an SDSC, so they carry no dim origin to name themselves after and they
+    # must not be mixed into dimension_sym_indices. See
+    # SymbolKind.loop_dimension.
+    #
+    # Deduplicated by pytorch_sym because the same shape variable reaches every
+    # kernel that tiles on it, and one bundle parameter has to serve them all.
+    loop_dim_sym_indices: list[int] = []
+    seen_loop_dim: dict[str, int] = {}
+    for i, kind_i in enumerate(symbol_kinds):
+        if kind_i.is_loop_dimension and kind_i.pytorch_sym not in seen_loop_dim:
+            seen_loop_dim[kind_i.pytorch_sym] = i
+            loop_dim_sym_indices.append(i)
+    loop_dim_param_names: dict[int, str] = {
+        sym_idx: f"%dim_{symbol_kinds[sym_idx].pytorch_sym}"
+        for sym_idx in loop_dim_sym_indices
+    }
+    # Symbol name to the SSA value its input_arg extracts to, which is what a
+    # symbolic loop bound is wired to.
+    loop_dim_ssa: dict[str, str] = {
+        symbol_kinds[sym_idx].pytorch_sym: loop_dim_param_names[sym_idx]
+        for sym_idx in loop_dim_sym_indices
+    }
+
     with open(os.path.join(output_dir, "bundle.mlir"), "w") as f:
         logger.info(f"Generating {f.name}")
 
@@ -280,7 +305,12 @@ def generate_bundle(
         # Built in lock-step with the params list so the two can never diverge.
         # Order: pool (when frontend_pool_allocation), kernel addresses, dimensions.
         param_symbol_kinds: list[SymbolKind] = []
-        if emit_pool_param or kernel_arg_sym_indices or dimension_sym_indices:
+        if (
+            emit_pool_param
+            or kernel_arg_sym_indices
+            or dimension_sym_indices
+            or loop_dim_sym_indices
+        ):
             params = []
             if emit_pool_param:
                 params.append("%pool_base_addr: !sdscbundle.input_arg<index>")
@@ -293,6 +323,15 @@ def generate_bundle(
                 dim_sk = symbol_kinds[sym_idx]
                 params.append(
                     f"{dim_param_names[sym_idx]}_base: {_dim_input_arg_type(dim_sk)}"
+                )
+                param_symbol_kinds.append(symbol_kinds[sym_idx])
+            # Last, so adding a loop dimension never shifts an existing
+            # parameter's position: the runtime fills these slots by order.
+            for sym_idx in loop_dim_sym_indices:
+                dim_sk = symbol_kinds[sym_idx]
+                params.append(
+                    f"{loop_dim_param_names[sym_idx]}_base: "
+                    f"{_dim_input_arg_type(dim_sk)}"
                 )
                 param_symbol_kinds.append(symbol_kinds[sym_idx])
             f.write(f"\tfunc.func @sdsc_bundle({', '.join(params)}) {{\n")
@@ -328,13 +367,38 @@ def generate_bundle(
                 f"\t\t{name} = sdscbundle.input_arg_extract value from"
                 f" {name}_base : {_dim_input_arg_type(dim_sk)} -> index\n"
             )
+        # Before the loop constants on purpose: a symbolic bound IS one of
+        # these SSA values, so it has to be in scope by the time the loop
+        # setup below refers to it.
+        for sym_idx in loop_dim_sym_indices:
+            dim_sk = symbol_kinds[sym_idx]
+            name = loop_dim_param_names[sym_idx]
+            f.write(
+                f"\t\t{name} = sdscbundle.input_arg_extract value from"
+                f" {name}_base : {_dim_input_arg_type(dim_sk)} -> index\n"
+            )
+
+        # One LoopLevel per loop, in _collect_loop_bounds order. A concrete
+        # count keeps the constant-bound, step-1 form this emitter has always
+        # produced; a symbolic one becomes "to <dim> step <G>". See _loop_level.
+        loop_levels = [
+            _loop_level(lb, lb_idx, loop_dim_ssa)
+            for lb_idx, lb in enumerate(loop_bounds)
+        ]
 
         # Standard loop constants (only emitted when there are loops).
         if loop_bounds:
             f.write("\t\t%c0 = arith.constant 0 : index\n")
             f.write("\t\t%c1 = arith.constant 1 : index\n")
-            for lb_idx, lb in enumerate(loop_bounds):
-                f.write(f"\t\t%loop_bound_{lb_idx} = {_mlir_count_value(lb)}\n")
+            for level in loop_levels:
+                for line in level.setup:
+                    f.write(f"\t\t{line}\n")
+                logger.info(
+                    "[symbolic-loop] loop level bound=%s step=%s stride_scale=%d",
+                    level.bound,
+                    level.step,
+                    level.stride_scale,
+                )
 
         # Emit one declaration per symbol:
         #   - "kernel"          → skipped; already a function param + extract op above
@@ -469,6 +533,7 @@ def generate_bundle(
             indent=2,
             kernel_sym_to_arg_idx=kernel_sym_to_arg_idx,
             sym_canonical=sym_canonical,
+            loop_levels=loop_levels,
         )
 
         f.write("\t\treturn\n")
@@ -849,8 +914,14 @@ def _emit_specs(
     indent: int,
     kernel_sym_to_arg_idx: dict | None = None,
     sym_canonical: dict | None = None,
+    loop_levels: "list[LoopLevel] | None" = None,
 ) -> None:
-    """Recursively emit MLIR ops for specs into file f."""
+    """Recursively emit MLIR ops for specs into file f.
+
+    ``loop_levels`` carries each loop's emitted form, indexed the same way as
+    ``loop_bounds``. Absent, every level falls back to the constant-bound,
+    step-1 form, which is what a tree of concrete counts produces anyway.
+    """
     if kernel_sym_to_arg_idx is None:
         kernel_sym_to_arg_idx = {}
     if sym_canonical is None:
@@ -878,9 +949,14 @@ def _emit_specs(
             lb_idx = loop_bound_idx[0]
             loop_bound_idx[0] += 1
             loop_var = f"%i_{lb_idx}"
-            f.write(
-                f"{tab}scf.for {loop_var} = %c0 to %loop_bound_{lb_idx} step %c1 {{\n"
+            level = (
+                loop_levels[lb_idx]
+                if loop_levels is not None and lb_idx < len(loop_levels)
+                else None
             )
+            bound = level.bound if level is not None else f"%loop_bound_{lb_idx}"
+            step = level.step if level is not None else "%c1"
+            f.write(f"{tab}scf.for {loop_var} = %c0 to {bound} step {step} {{\n")
             _emit_specs(
                 entry.body,
                 compiled_iter,
@@ -894,6 +970,7 @@ def _emit_specs(
                 indent + 1,
                 kernel_sym_to_arg_idx=kernel_sym_to_arg_idx,
                 sym_canonical=sym_canonical,
+                loop_levels=loop_levels,
             )
             f.write(f"{tab}}}\n")
 
