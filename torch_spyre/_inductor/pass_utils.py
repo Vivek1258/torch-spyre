@@ -352,6 +352,14 @@ def decompose_tiled_count(count) -> "tuple[sympy.Symbol, int] | None":
     ``FloorDiv`` as ``(s//G)``, which sympy re-parses into ``floor(s/G)`` -- a
     different type. So the reload path hands back the same count wearing a
     different class, and anything that type-checks it has to know both.
+
+    One thing the returned symbol does NOT survive: that same round trip builds
+    a fresh ``Symbol`` with no assumptions, and sympy counts assumptions as part
+    of a symbol's identity, so the reloaded symbol is unequal to the one the
+    scheduler saw even though it prints the same. **A map that has to outlive
+    the reload is keyed by ``str(symbol)``, never by the symbol itself.** The
+    symbol is returned because the scheduler needs it to query the ShapeEnv,
+    which only happens before the reload.
     """
     if isinstance(count, sympy.Symbol):
         return count, 1

@@ -73,7 +73,35 @@ class TestDecompose(unittest.TestCase):
             "the round trip preserved FloorDiv on this sympy build, so this "
             "test is no longer exercising the second spelling",
         )
-        self.assertEqual(decompose_tiled_count(reloaded), (_sym(), G))
+
+        symbol, tile = decompose_tiled_count(reloaded)
+        # By name, because the round trip does not preserve symbol identity.
+        # See test_the_round_trip_also_drops_the_symbol_assumptions.
+        self.assertEqual((str(symbol), tile), (SYM, G))
+
+    def test_the_round_trip_also_drops_the_symbol_assumptions(self):
+        """Why nothing that outlives the reload may be keyed by the symbol.
+
+        ``sympify`` builds a fresh ``Symbol`` with no assumptions, and sympy
+        counts assumptions as part of a symbol's identity. So the reloaded
+        symbol is unequal to the one the scheduler saw while printing the same,
+        and a dict keyed by the object would miss every lookup after a reload
+        in a way that looks like the entry was never written.
+        """
+        original = _sym()
+
+        reloaded, _tile = decompose_tiled_count(
+            sympy.sympify(str(FloorDiv(original, G)))
+        )
+
+        self.assertEqual(str(reloaded), str(original))
+        self.assertNotEqual(
+            reloaded,
+            original,
+            "the round trip preserved the symbol's assumptions on this sympy "
+            "build, so the name-keyed maps could be keyed by the object "
+            "instead. Verify that before relying on it",
+        )
 
     def test_unrecognised_shapes_return_none(self):
         s = _sym()
