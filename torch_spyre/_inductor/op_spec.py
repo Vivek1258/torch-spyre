@@ -445,6 +445,19 @@ class LoopSpec:
     )
 
 
+def walk_loop_specs(specs):
+    """Every LoopSpec in a spec tree, outer before inner.
+
+    Lives here rather than in either consumer because the scheduler and bundle
+    generation both walk the same tree for the same reason, and a second copy
+    is a second thing to keep in step.
+    """
+    for spec in specs:
+        if isinstance(spec, LoopSpec):
+            yield spec
+            yield from walk_loop_specs(spec.body)
+
+
 def spyre_constant_tensor(const_val, device, dtype=torch.float16):
     """Create or retrieve a cached constant tensor for Spyre device.
 

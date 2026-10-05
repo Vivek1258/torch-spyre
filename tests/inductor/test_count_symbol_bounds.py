@@ -49,8 +49,8 @@ from torch_spyre._inductor.spyre_kernel import (
     _codegen_op_spec_list,
     _place_symbol,
     _sympy_literal,
-    _walk_loop_specs,
 )
+from torch_spyre._inductor.op_spec import walk_loop_specs
 
 SYM = "s0"
 TILE = 64
@@ -188,10 +188,10 @@ class TestWalkingTheSpecTree(unittest.TestCase):
         inner = LoopSpec(count=sympy.Integer(2), body=[])
         outer = LoopSpec(count=FloorDiv(_sym(), TILE), body=[inner])
 
-        self.assertEqual(list(_walk_loop_specs([outer])), [outer, inner])
+        self.assertEqual(list(walk_loop_specs([outer])), [outer, inner])
 
     def test_a_tree_with_no_loops_is_empty(self):
-        self.assertEqual(list(_walk_loop_specs([])), [])
+        self.assertEqual(list(walk_loop_specs([])), [])
 
 
 class TestItSurvivesTheRealSerializer(unittest.TestCase):

@@ -80,6 +80,7 @@ from .op_spec import (
     IndirectAccess,
     LX_RELAYOUT_INFO_KEY,
     LoopSpec,
+    walk_loop_specs,
     OpSpec,
     TensorArg,
     TensorWorkDivision,
@@ -1438,7 +1439,7 @@ class SpyreKernel(Kernel[CSEVariable]):
         """
         loops = [
             loop
-            for loop in _walk_loop_specs(self.op_specs)
+            for loop in walk_loop_specs(self.op_specs)
             if loop.count_symbol_bounds
         ]
         if not loops:
@@ -1653,14 +1654,6 @@ def uses_hbm_pool(specs) -> bool:
         for arg in op.args
         if isinstance(arg, TensorArg)
     )
-
-
-def _walk_loop_specs(specs):
-    """Every LoopSpec in a spec tree, outer before inner."""
-    for spec in specs:
-        if isinstance(spec, LoopSpec):
-            yield spec
-            yield from _walk_loop_specs(spec.body)
 
 
 def _place_symbol(sym_name: str, actuals: list[str], sizes: dict) -> "tuple | None":
