@@ -21,6 +21,7 @@ from typing import Any, Callable, NamedTuple, Optional, Sequence, TypeVar, Union
 import regex
 import torch
 import sympy
+from torch.utils._sympy.functions import FloorDiv
 from sympy import Expr, Symbol
 from torch._inductor.ir import (
     Buffer,
@@ -328,6 +329,45 @@ def _user_min_or_none(expr: Expr) -> Optional[int]:
     # min=2 collides with PyTorch's default lower bound and is treated
     # as "unset" here
     return None if lower == _SHAPE_ENV_DEFAULT_LOWER else lower
+
+
+def decompose_tiled_count(count) -> "tuple[sympy.Symbol, int] | None":
+    """Split a loop's trip count into the symbol it tiles and its tile size.
+
+    Returns ``(symbol, tile_size)``, or None when the count is not a shape the
+    loop production can produce. Two shapes are, and only two: a tiled
+    dimension gives ``shape[dim] // tile_size``, and a tile size of 1 gives the
+    bare symbol.
+
+    This is how the granularity is recovered, and it is recovered rather than
+    inferred: ``for_each_tile(tile_size=G)`` puts G into the count itself, so
+    reading it back here means the value the bundle declares and the step its
+    loop takes come from one expression and cannot disagree. Note this is NOT
+    ``compute_granularity``, which picks a divisor for the SDSC dimension route
+    and has shipped a wrong value twice.
+
+    Both spellings of the division are accepted on purpose, at this one point.
+    A trip count reaches codegen as ``FloorDiv(s, G)``, but the kernel
+    serializer writes expressions as ``sympify('<str>')`` and ``str`` prints
+    ``FloorDiv`` as ``(s//G)``, which sympy re-parses into ``floor(s/G)`` -- a
+    different type. So the reload path hands back the same count wearing a
+    different class, and anything that type-checks it has to know both.
+    """
+    if isinstance(count, sympy.Symbol):
+        return count, 1
+
+    if isinstance(count, FloorDiv):
+        numerator, denominator = count.args
+    elif isinstance(count, sympy.floor):
+        numerator, denominator = count.args[0].as_numer_denom()
+    else:
+        return None
+
+    if isinstance(numerator, sympy.Symbol) and denominator.is_Integer:
+        tile_size = int(denominator)
+        if tile_size > 0:
+            return numerator, tile_size
+    return None
 
 
 def finite_upper_or_none(expr: Expr) -> Optional[int]:

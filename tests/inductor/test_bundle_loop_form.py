@@ -32,10 +32,10 @@ from torch.utils._sympy.functions import FloorDiv
 from torch_spyre._inductor.codegen.bundle import (
     LoopLevel,
     _count_scale,
-    _decompose_symbolic_count,
     _loop_level,
     _scaled_strides,
 )
+from torch_spyre._inductor.pass_utils import decompose_tiled_count
 from torch_spyre._inductor.codegen.compute_ops import SymbolKind
 
 G = 64
@@ -52,10 +52,28 @@ class TestDecompose(unittest.TestCase):
     """Which trip-count shapes the emitter recognises."""
 
     def test_floordiv_of_symbol_by_tile(self):
-        self.assertEqual(_decompose_symbolic_count(FloorDiv(_sym(), G)), (SYM, G))
+        self.assertEqual(decompose_tiled_count(FloorDiv(_sym(), G)), (_sym(), G))
 
     def test_bare_symbol_is_tile_size_one(self):
-        self.assertEqual(_decompose_symbolic_count(_sym()), (SYM, 1))
+        self.assertEqual(decompose_tiled_count(_sym()), (_sym(), 1))
+
+    def test_the_reload_spelling_of_the_same_division(self):
+        """What the kernel serializer hands back, which is a different type.
+
+        Expressions are written as ``sympify('<str>')`` and ``str(FloorDiv(s,
+        G))`` prints ``(s//G)``, which sympy re-parses as ``floor(s/G)``. Same
+        count, different class, so the reload path would refuse a loop it had
+        just emitted if only one spelling were accepted.
+        """
+        reloaded = sympy.sympify(str(FloorDiv(_sym(), G)))
+
+        self.assertNotIsInstance(
+            reloaded,
+            FloorDiv,
+            "the round trip preserved FloorDiv on this sympy build, so this "
+            "test is no longer exercising the second spelling",
+        )
+        self.assertEqual(decompose_tiled_count(reloaded), (_sym(), G))
 
     def test_unrecognised_shapes_return_none(self):
         s = _sym()
@@ -66,7 +84,7 @@ class TestDecompose(unittest.TestCase):
             FloorDiv(s, s),  # not an integer divisor
         ):
             self.assertIsNone(
-                _decompose_symbolic_count(expr),
+                decompose_tiled_count(expr),
                 f"{expr} should not be treated as a trip count",
             )
 
@@ -117,7 +135,7 @@ class TestLoopLevel(unittest.TestCase):
             _loop_level(_sym() * 2, 0, DIM_SSA)
         msg = str(cm.exception)
         self.assertIn(SYM, msg, "the message must name the symbol")
-        self.assertIn("_decompose_symbolic_count", msg, "and where to extend")
+        self.assertIn("decompose_tiled_count", msg, "and where to extend")
 
     def test_symbol_with_no_input_arg_raises_naming_it(self):
         with self.assertRaises(NotImplementedError) as cm:

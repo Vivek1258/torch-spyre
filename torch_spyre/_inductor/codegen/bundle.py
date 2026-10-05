@@ -20,12 +20,12 @@ from collections.abc import Sequence
 from typing import Any
 
 import sympy
-from torch.utils._sympy.functions import FloorDiv
 
 from torch_spyre._inductor import config as _spyre_config
 from torch_spyre._inductor.codegen.compute_ops import SymbolKind
 from torch_spyre._inductor.codegen.superdsc import compile_op_spec
 from torch_spyre._inductor.constants import MAX_POOL_SIZE_BYTES
+from torch_spyre._inductor.pass_utils import decompose_tiled_count
 from torch_spyre._inductor.logging_utils import get_inductor_logger
 from torch_spyre._inductor.op_spec import LoopSpec, OpSpec, format_op_spec_list
 from torch_spyre._inductor.op_spec_validation import validate_op_specs
@@ -752,22 +752,6 @@ class LoopLevel:
     stride_scale: int
 
 
-def _decompose_symbolic_count(count: sympy.Expr) -> "tuple[str, int] | None":
-    """Split a trip count into (symbol name, tile size), or None.
-
-    Two shapes are recognised, and they are the only two the loop production
-    can produce: ``FloorDiv(s, G)`` for a tiled dimension, and a bare symbol
-    for a tile size of 1.
-    """
-    if isinstance(count, sympy.Symbol):
-        return str(count), 1
-    if isinstance(count, FloorDiv):
-        num, den = count.args
-        if isinstance(num, sympy.Symbol) and isinstance(den, sympy.Integer):
-            return str(num), int(den)
-    return None
-
-
 def _count_scale(count: sympy.Expr) -> int:
     """The stride divisor a level with this trip count imposes.
 
@@ -780,7 +764,7 @@ def _count_scale(count: sympy.Expr) -> int:
     """
     if isinstance(count, (sympy.Integer, int)):
         return 1
-    decomposed = _decompose_symbolic_count(count)
+    decomposed = decompose_tiled_count(count)
     return decomposed[1] if decomposed else 1
 
 
@@ -829,18 +813,19 @@ def _loop_level(
             stride_scale=1,
         )
 
-    decomposed = _decompose_symbolic_count(count)
+    decomposed = decompose_tiled_count(count)
     if decomposed is None:
         raise NotImplementedError(
             f"symbolic loop count {count!r} (type {type(count).__name__}, "
             f"free_symbols="
             f"{sorted(map(str, getattr(count, 'free_symbols', [])))}) is not a "
-            "recognized trip-count shape. Expected FloorDiv(symbol, integer) "
-            "or a bare symbol. Extend _decompose_symbolic_count if this shape "
-            "is legitimate."
+            "recognized trip-count shape. Expected a symbol divided by an "
+            "integer, or a bare symbol. Extend "
+            "pass_utils.decompose_tiled_count if this shape is legitimate."
         )
 
-    sym_name, tile = decomposed
+    sym, tile = decomposed
+    sym_name = str(sym)
     if sym_name not in loop_dim_ssa:
         raise NotImplementedError(
             f"symbolic loop count {count} references {sym_name}, which has no "
