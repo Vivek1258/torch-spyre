@@ -204,6 +204,36 @@ class TestTheProvenanceSchemaAgrees(unittest.TestCase):
     def test_the_new_field_is_in_the_schema(self):
         self.assertIn("count_symbol_bounds", _EXPECTED_LOOP_SPEC_SCHEMA)
 
+    def test_a_concrete_loop_keeps_its_bundle_key(self):
+        """Adding this field must not rename every existing kernel's events.
+
+        The bundle key names every profiler event, so a symbolic feature that
+        changed it for non-symbolic kernels would be churn with no information
+        in it. The payload entry is therefore present only when there are
+        bounds, and `test_pins_rich_canonical_bundle_key` in
+        test_kernel_provenance.py is the golden value that holds us to it.
+        """
+        from torch_spyre._inductor.kernel_provenance import _canonical_spec
+
+        payload = _canonical_spec(LoopSpec(count=sympy.Integer(4), body=[]))
+
+        self.assertNotIn("count_symbol_bounds", payload)
+
+    def test_a_symbolic_loop_does_change_its_bundle_key(self):
+        """The other half: when there are bounds, they are in the identity."""
+        from torch_spyre._inductor.kernel_provenance import _canonical_spec
+
+        without = _canonical_spec(LoopSpec(count=FloorDiv(_sym(), TILE), body=[]))
+        with_bounds = _canonical_spec(
+            LoopSpec(
+                count=FloorDiv(_sym(), TILE),
+                body=[],
+                count_symbol_bounds={SYM: (MAX, TILE)},
+            )
+        )
+
+        self.assertNotEqual(without, with_bounds)
+
 
 class TestTheCacheKeySeparatesThem(unittest.TestCase):
     """The requirement this area has lost twice before."""
