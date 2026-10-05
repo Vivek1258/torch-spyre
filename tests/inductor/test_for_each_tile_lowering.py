@@ -66,6 +66,7 @@ from for_each_tile_fixtures import (
     split_m_fn,
     two_loops_shared_init_fn,
 )
+from torch_spyre._inductor.patches import _resolve_scan_shapes_by_expression
 from torch_spyre._inductor.wsr.for_each_tile_lowering import (
     try_prove_for_each_tile,
 )
@@ -2075,6 +2076,55 @@ class TestTryProveForEachTile(unittest.TestCase):
 
         self.assertTrue(result.accepted, result.reason)
         self.assertIsNotNone(result.trip_count)
+
+
+class TestSymbolicTripCount(unittest.TestCase):
+    """A for_each_tile over a marked-dynamic dim keeps its trip count symbolic.
+
+    These capture for CPU, like every fixture here, which means
+    ``enable_spyre_context`` does not run and the scan-shape patch that
+    normally lives inside it has to be entered explicitly. That is not a test
+    artefact worth hiding: the control below is what proves the patch is
+    load-bearing rather than defensive.
+    """
+
+    def test_a_symbolic_trip_count_is_recovered(self):
+        (X, Y), _ref = matmul_inputs()
+        torch._dynamo.mark_dynamic(X, 0)
+
+        with _resolve_scan_shapes_by_expression():
+            while_op = _find_while_loop_ir_op(split_m_fn, (X, Y))
+
+        result = try_prove_for_each_tile(while_op)
+
+        self.assertTrue(result.accepted, result.reason)
+        self.assertTrue(
+            getattr(result.trip_count, "free_symbols", None),
+            f"the trip count came out concrete as {result.trip_count!r}, so "
+            f"dim 0 was specialised somewhere and this test is not measuring a "
+            f"symbolic loop at all",
+        )
+
+    def test_control_the_scan_decomposition_needs_the_shape_patch(self):
+        """Without the patch the capture fails before the prover is reached.
+
+        This is the control for the test above, and it is also the only place
+        the patch's end-to-end claim is asserted. If it stops raising, upstream
+        has fixed the expression-key gap and the patch can be deleted.
+        """
+        (X, Y), _ref = matmul_inputs()
+        torch._dynamo.mark_dynamic(X, 0)
+
+        with self.assertRaises(Exception) as caught:
+            _find_while_loop_ir_op(split_m_fn, (X, Y))
+
+        self.assertIn(
+            "KeyError",
+            str(caught.exception),
+            "the capture failed for some reason other than the expression-key "
+            "gap, so this control is no longer measuring what it claims. Check "
+            "whether upstream moved the failure or fixed it",
+        )
 
 
 class TestPassPipelineRegistration(unittest.TestCase):
