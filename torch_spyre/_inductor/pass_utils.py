@@ -462,12 +462,31 @@ def symbolic_count_bounds(count) -> "dict[str, tuple[int, int]]":
     fresh symbol without its assumptions. See decompose_tiled_count.
 
     Empty when there is nothing to carry, and the caller does not have to
-    distinguish the reasons: a concrete count, a shape the loop production
-    cannot produce, or a symbol with no declared ceiling all give ``{}``. The
-    refusal belongs at emission, where the message can name the symbol and
-    point back here, rather than here where a loop may legitimately be
-    concrete.
+    distinguish those reasons: a concrete count, a shape the loop production
+    cannot produce, or a symbol with no declared ceiling all give ``{}``. Each
+    of those leaves a kernel that specialises, which is a worse binary rather
+    than a wrong one, so the refusal belongs at emission where the message can
+    name the symbol.
+
+    One case does raise here, because no kernel can come of it: a count over
+    more than one symbol. The backend asserts exactly one symbol per symbolic
+    loop, so that is a check failure there and not a degraded case, and the fix
+    is on the caller's side rather than anywhere downstream.
+
+    Raises:
+        Unsupported: the count involves more than one symbol.
     """
+    free_symbols = getattr(count, "free_symbols", None) or set()
+    if len(free_symbols) > 1:
+        raise Unsupported(
+            f"symbolic loop count {count} involves {len(free_symbols)} symbols, "
+            f"{sorted(map(str, free_symbols))}. A symbolic loop takes exactly "
+            f"one, which the backend asserts, so two is a check failure there "
+            f"rather than a slower kernel here. If these dimensions are meant "
+            f"to be equal, tie them with torch._check before the region so they "
+            f"become one symbol."
+        )
+
     decomposed = decompose_tiled_count(count)
     if decomposed is None:
         return {}

@@ -1275,6 +1275,9 @@ def _create_sdsc_tensors(
                     sdsc_sym = symbol_mapping[sym]
                     sdsc_dim_advance[sdsc_sym] = (tile_size, trip_count)
                     element_advance = int(coeff)
+                    _check_advance_fits(
+                        sym, element_advance, trip_count, arg, op_spec
+                    )
                     candidates = [
                         axis
                         for axis, coordinate in enumerate(arg.device_coordinates[:-1])
@@ -1687,6 +1690,56 @@ def _concretize_for_sdsc(expr: Expr) -> int:
         # ones, rather than silently emitting a fallback (e.g. sys.maxsize) size.
         return V.graph.sizevars.guarding_hint_or_throw(expr)
     return int(expr)
+
+
+def _check_advance_fits(sym, element_advance, trip_count, arg, op_spec) -> None:
+    """Refuse an advance whose last trip reaches past the declared tensor.
+
+    This is a BOUND and not an equality, which is the whole point. How far an
+    advance reaches depends on which axes of the device layout it spans, decided
+    by the layout order and the stick split, so an advance covering less than
+    the declared size is perfectly normal and says nothing is wrong. What is
+    never legal is the last trip reaching PAST the tensor: that is a DMA out of
+    bounds however the axes are ordered.
+
+    Two earlier versions of this check asserted an equality the layout does not
+    promise. One read as a 2x shortfall on an exact kernel, the other flagged
+    split-K, which is correct at the hint size. **Do not turn this back into an
+    equality.**
+
+    It earns its place because of what it catches that nothing else can. Under a
+    symbolic loop the trip count is the declared MAXIMUM while a size that was
+    sized from the warm-up hint is smaller, so the product overruns. That kernel
+    is correct at and below the hint and wrong above it, which means a
+    single-size test passes and says nothing. See pass_utils.concretize_expr.
+
+    Skipped when the declared size is not concrete, since there is no bound to
+    compare against; something earlier has already failed in that case.
+    """
+    device_size = getattr(arg, "device_size", None) or ()
+    if any(getattr(extent, "free_symbols", None) for extent in device_size):
+        return
+    if not device_size:
+        return
+
+    declared = math.prod(int(extent) for extent in device_size)
+    reach = element_advance * trip_count
+    if reach <= declared:
+        return
+
+    # ValueError, matching this file: an advance past the tensor is an internal
+    # invariant violation rather than an unsupported user request.
+    raise ValueError(
+        f"dim {sym} of {getattr(arg, 'name', '<unnamed>')} advances "
+        f"{element_advance} elements per iteration for up to {trip_count} "
+        f"iterations, reaching {reach}, but the tensor declares only {declared} "
+        f"(device_size={list(device_size)}). The last trip would read past the "
+        f"end. The usual cause is a trip count taken from the declared maximum "
+        f"against a size taken from the warm-up hint, in which case this kernel "
+        f"is correct at the hint size and wrong above it, so a single-size test "
+        f"cannot catch it. Every axis a symbolic loop advances along has to be "
+        f"sized from the maximum. op={getattr(op_spec, 'op', '?')}"
+    )
 
 
 def _resolve_sdsc_size(expr: Expr, symbolic_dim_bounds: dict) -> int:

@@ -296,6 +296,97 @@ class TestWalkingTheSpecTree(unittest.TestCase):
         self.assertEqual(list(walk_loop_specs([])), [])
 
 
+class TestMoreThanOneSymbolIsRefusedHere(unittest.TestCase):
+    """The one case that raises rather than returning an empty map.
+
+    Everything else that yields `{}` leaves a kernel that specialises, which is
+    a worse binary and not a wrong one. Two symbols on one loop is a check
+    failure on the backend side, so no kernel can come of it and the refusal
+    belongs where the message can tell the caller what to do.
+    """
+
+    def test_two_symbols_refuse_and_name_both(self):
+        other = sympy.Symbol("s1", integer=True, positive=True)
+        count = FloorDiv(_sym() + other, TILE)
+
+        with V.set_graph_handler(_graph_with_bounds({})):
+            with self.assertRaises(Unsupported) as caught:
+                symbolic_count_bounds(count)
+
+        message = str(caught.exception)
+        self.assertIn(SYM, message)
+        self.assertIn("s1", message)
+
+    def test_the_message_says_how_to_fix_it(self):
+        """A refusal a caller cannot act on is only half a refusal."""
+        other = sympy.Symbol("s1", integer=True, positive=True)
+
+        with V.set_graph_handler(_graph_with_bounds({})):
+            with self.assertRaises(Unsupported) as caught:
+                symbolic_count_bounds(_sym() * other)
+
+        self.assertIn("torch._check", str(caught.exception))
+
+    def test_one_symbol_is_still_fine(self):
+        """The control: the refusal must not catch the supported case."""
+        graph = _graph_with_bounds({SYM: sympy.Integer(MAX)})
+
+        with V.set_graph_handler(graph):
+            self.assertEqual(
+                symbolic_count_bounds(FloorDiv(_sym(), TILE)), {SYM: (MAX, TILE)}
+            )
+
+
+class TestAnAdvanceMustNotReachPastTheTensor(unittest.TestCase):
+    """The refusal a single-size test cannot reach.
+
+    Under a symbolic loop the trip count is the declared maximum. If a size was
+    taken from the warm-up hint instead, the product overruns, and that kernel
+    is correct at and below the hint and wrong above it.
+    """
+
+    @staticmethod
+    def _arg(device_size):
+        return SimpleNamespace(device_size=device_size, name="arg0")
+
+    def _check(self, advance, trips, device_size):
+        from torch_spyre._inductor.codegen.superdsc import _check_advance_fits
+
+        _check_advance_fits(
+            _sym(), advance, trips, self._arg(device_size), SimpleNamespace(op="gelu")
+        )
+
+    def test_an_exact_fit_passes(self):
+        self._check(advance=64, trips=8, device_size=[512])
+
+    def test_reaching_less_than_the_tensor_passes(self):
+        """Normal, not a problem. How far an advance reaches depends on which
+        axes it spans, so covering less than the whole tensor says nothing."""
+        self._check(advance=64, trips=4, device_size=[512])
+
+    def test_reaching_past_the_tensor_refuses(self):
+        with self.assertRaises(ValueError) as caught:
+            self._check(advance=64, trips=9, device_size=[512])
+
+        message = str(caught.exception)
+        self.assertIn("576", message)
+        self.assertIn("512", message)
+        self.assertIn("warm-up hint", message)
+
+    def test_a_multi_axis_size_is_multiplied_out(self):
+        self._check(advance=64, trips=8, device_size=[2, 256])
+        with self.assertRaises(ValueError):
+            self._check(advance=64, trips=9, device_size=[2, 256])
+
+    def test_a_symbolic_size_is_skipped_rather_than_crashing(self):
+        """There is no bound to compare against, and something earlier already
+        failed if a device size is still symbolic here."""
+        self._check(advance=64, trips=9, device_size=[_sym()])
+
+    def test_no_device_size_is_skipped(self):
+        self._check(advance=64, trips=9, device_size=[])
+
+
 class TestItSurvivesTheRealSerializer(unittest.TestCase):
     """Through the same functions codegen uses, not a reimplementation."""
 
