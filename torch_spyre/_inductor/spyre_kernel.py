@@ -64,6 +64,7 @@ from .scratchpad.lx_relayout import (
 from .pass_utils import (
     concretize_expr,
     compute_symbolic_bounds,
+    symbolic_count_bounds,
     finite_upper_or_none,
     iteration_space,
     iteration_space_with_splits,
@@ -1370,9 +1371,19 @@ class SpyreKernel(Kernel[CSEVariable]):
             self.op_specs.append(self.create_op_spec(value.op, True, args, op_info))
 
     def wrap_op_specs_in_loop(self, count: sympy.Expr) -> None:
-        """Replace the current op_specs list with a single LoopSpec of the given count."""
+        """Replace the current op_specs list with a single LoopSpec of the given count.
+
+        The count's per-symbol bounds are resolved here rather than at codegen
+        because this is the last point the ShapeEnv is available.
+        """
         body = self.op_specs
-        self.op_specs = [LoopSpec(count=count, body=body)]
+        self.op_specs = [
+            LoopSpec(
+                count=count,
+                body=body,
+                count_symbol_bounds=symbolic_count_bounds(count),
+            )
+        ]
 
     def check_op_specs(self) -> None:
         """Validate and log the finished operation sequence after loop wrapping."""
@@ -1392,12 +1403,7 @@ class SpyreKernel(Kernel[CSEVariable]):
         afterwards is bound here.
         """
 
-        def sympy_str(x: sympy.Expr) -> str:
-            if isinstance(x, IndirectAccess):
-                name_sym = x.args[0]
-                return f"IndirectAccess('{name_sym}')"
-            return "sympify('" + str(x) + "')"
-
+        sympy_str = _sympy_literal
         self.remove_kernel_local_buffers()
         # Compute live, deduped call-arg list from names in spyre_kernel_args.
         # python_argdefs() includes all registered names from load()/store(),
@@ -1569,6 +1575,21 @@ def uses_hbm_pool(specs) -> bool:
     )
 
 
+def _sympy_literal(x: sympy.Expr) -> str:
+    """One expression as a line of the generated kernel source.
+
+    Module level, not a closure, so a round-trip test can serialize through the
+    same function the real codegen uses. Note what this costs on the way back:
+    ``sympify`` re-parses ``//`` into ``floor`` and drops the symbol's
+    assumptions, so anything reading these back accepts both spellings and keys
+    by name. See pass_utils.decompose_tiled_count.
+    """
+    if isinstance(x, IndirectAccess):
+        name_sym = x.args[0]
+        return f"IndirectAccess('{name_sym}')"
+    return "sympify('" + str(x) + "')"
+
+
 def _codegen_op_spec_list(specs, buf: IndentedBuffer, sympy_str) -> None:
     """Emit Python source for a list of OpSpec / UnimplementedOp / LoopSpec entries."""
     for op_spec in specs:
@@ -1578,6 +1599,13 @@ def _codegen_op_spec_list(specs, buf: IndentedBuffer, sympy_str) -> None:
             buf.writeline("LoopSpec(")
             with buf.indent():
                 buf.writeline(f"count={sympy_str(op_spec.count)},")
+                # Plain ints keyed by name, so this survives the round trip
+                # that the count expression itself does not.
+                if op_spec.count_symbol_bounds:
+                    buf.writeline(
+                        "count_symbol_bounds="
+                        f"{_serialize_value(op_spec.count_symbol_bounds)},"
+                    )
                 buf.writeline("body=[")
                 with buf.indent():
                     _codegen_op_spec_list(op_spec.body, buf, sympy_str)

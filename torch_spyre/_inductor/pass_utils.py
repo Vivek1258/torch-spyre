@@ -378,6 +378,58 @@ def decompose_tiled_count(count) -> "tuple[sympy.Symbol, int] | None":
     return None
 
 
+def symbolic_count_bounds(count) -> "dict[str, tuple[int, int]]":
+    """``{symbol name: (max_value, tile_size)}`` for one loop's trip count.
+
+    Resolved here, while the ShapeEnv still exists, and then carried on
+    ``LoopSpec.count_symbol_bounds`` because codegen also runs in a reload
+    phase where it is gone. The bundle turns each entry into one
+    ``!sdscbundle.input_arg<index, granularity=G, max_value=M>`` parameter and
+    takes the loop bound from it.
+
+    Keyed by NAME, not by the symbol, because the reload round trip builds a
+    fresh symbol without its assumptions. See decompose_tiled_count.
+
+    Empty when there is nothing to carry, and the caller does not have to
+    distinguish the reasons: a concrete count, a shape the loop production
+    cannot produce, or a symbol with no declared ceiling all give ``{}``. The
+    refusal belongs at emission, where the message can name the symbol and
+    point back here, rather than here where a loop may legitimately be
+    concrete.
+    """
+    decomposed = decompose_tiled_count(count)
+    if decomposed is None:
+        return {}
+
+    symbol, tile_size = decomposed
+    shape_env = V.graph.sizevars.shape_env
+    if shape_env is None:
+        return {}
+
+    upper = finite_upper_or_none(symbol)
+    if upper is None:
+        # The one case worth saying out loud. Without a ceiling the geometry
+        # has nothing to be built against, so the kernel will specialise, and
+        # that looks identical to never having asked for a symbolic loop.
+        logger.warning(
+            "[symbolic-loop] trip count %s has no finite upper bound for %s, so "
+            "no bundle parameter can be emitted for it and this kernel will be "
+            "size-specific. Declare the range in the traced region",
+            count,
+            symbol,
+        )
+        return {}
+
+    logger.info(
+        "[symbolic-loop] %s: symbol %s max=%d tile_size=%d",
+        count,
+        symbol,
+        upper,
+        tile_size,
+    )
+    return {str(symbol): (upper, tile_size)}
+
+
 def finite_upper_or_none(expr: Expr) -> Optional[int]:
     """Return the ShapeEnv finite upper bound for ``expr``, or ``None``.
     A bound is usable iff it is a positive concrete

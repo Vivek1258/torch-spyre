@@ -282,6 +282,22 @@ def compute_specs_hash(
                 content_parts.append(f"loop_count:{loop_count_str}".encode())
                 _debug_loop_counts.append(loop_count_str)
                 logger.debug("  [hash] LoopSpec  count=%s", loop_count_str)
+                # The per-symbol max and tile size are NOT recoverable from the
+                # count string: two kernels can share "FloorDiv(s0, 64)" while
+                # declaring different maxima, and the max reaches the bundle's
+                # input_arg rather than the SDSC JSON hashed below. So without
+                # this they collide and the second one is served a binary built
+                # for the first one's range.
+                if entry.count_symbol_bounds:
+                    bounds = json.dumps(
+                        {
+                            name: list(bound)
+                            for name, bound in entry.count_symbol_bounds.items()
+                        },
+                        sort_keys=True,
+                    )
+                    content_parts.append(f"loop_count_bounds:{bounds}".encode())
+                    logger.debug("  [hash] LoopSpec  bounds=%s", bounds)
                 _collect(entry.body)
             elif isinstance(entry, OpSpec):
                 sdsc_json, local_sym_values, affine_strides, local_symbol_kinds = (

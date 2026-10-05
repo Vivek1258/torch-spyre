@@ -94,6 +94,7 @@ _EXPECTED_TENSOR_WORK_DIVISION_SCHEMA = {
 _EXPECTED_LOOP_SPEC_SCHEMA = {
     "count": "Expr",
     "body": "list[Any]",
+    "count_symbol_bounds": "dict[str, tuple[int, int]]",
 }
 
 
@@ -288,6 +289,7 @@ def _canonical_spec(spec: object) -> object:
         return {
             "kind": "loop",
             "count": _canonical_value(spec.count),
+            "count_symbol_bounds": _canonical_value(spec.count_symbol_bounds),
             "body": [_canonical_spec(child) for child in spec.body],
         }
     raise TypeError(f"Unsupported finalized kernel spec: {type(spec).__qualname__}")
