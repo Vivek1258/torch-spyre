@@ -1294,28 +1294,37 @@ def splice_while_loop(
         name_map[placeholder_name] = read_target.get_name()
         ref_map[placeholder_name] = read_target
 
-    # ``while_op.inputs`` is NOT positionally aligned with the body's
-    # placeholders. WhileLoop.__init__ splits ``[*carried, *additional]`` by
-    # symbol type and passes only the tensors as ``inputs``, so a SymInt operand
-    # lands in ``constant_args`` and drops out of ``inputs`` while the body graph
-    # still lists its placeholder. With no symbolic operand the two happen to
-    # line up, which is why indexing ``inputs`` only breaks under dynamic shapes,
-    # and breaks as a bare IndexError that names nothing.
+    # ``.inputs`` is normally the right list and is what the rest of this pass
+    # patches, so it stays the default. It is NOT always positionally aligned
+    # with the body's placeholders though: ``ExternKernel.__init__`` repacks
+    # ``[*carried, *additional]`` through ``_split_by_sym_type`` into a
+    # tensor-only ``.inputs``, so a SymInt operand -- which is how a varying
+    # dimension arrives -- drops out of it while the body graph still lists its
+    # placeholder. Indexing ``.inputs`` then reads the wrong operand, or runs
+    # off the end as a bare IndexError that names nothing.
     #
-    # _trace_while_loop traced the body as fn(*carried, *additional), so that
-    # concatenation IS the placeholder order.
-    operands = [
-        *(while_op.carried_inputs or ()),
-        *(while_op.additional_inputs or ()),
-    ]
+    # Only fall back when the lengths say an operand went missing, because
+    # ``.carried_inputs``/``.additional_inputs`` are separate list attributes
+    # holding different objects (see the note on the fourth read shape above),
+    # so swapping unconditionally changes which buffer a concrete operand
+    # resolves to. _trace_while_loop traced the body as
+    # fn(*carried, *additional), so that concatenation is the placeholder order.
+    operands = while_op.inputs
     if len(operands) < len(body_graph_input_names):
-        raise AssertionError(
-            f"while_loop body has {len(body_graph_input_names)} placeholders but "
-            f"only {len(operands)} operands "
-            f"(carried={len(while_op.carried_inputs or ())}, "
-            f"additional={len(while_op.additional_inputs or ())}). The body graph "
-            f"and the operand list disagree, which this pass cannot reconcile."
-        )
+        operands = [
+            *(while_op.carried_inputs or ()),
+            *(while_op.additional_inputs or ()),
+        ]
+        if len(operands) < len(body_graph_input_names):
+            raise AssertionError(
+                f"while_loop body has {len(body_graph_input_names)} placeholders "
+                f"but only {len(operands)} operands "
+                f"(inputs={len(while_op.inputs)}, "
+                f"carried={len(while_op.carried_inputs or ())}, "
+                f"additional={len(while_op.additional_inputs or ())}). The body "
+                f"graph and the operand list disagree, which this pass cannot "
+                f"reconcile."
+            )
 
     for i in range(len(carries), len(body_graph_input_names)):
         placeholder_name = body_graph_input_names[i]
