@@ -95,6 +95,7 @@ _EXPECTED_LOOP_SPEC_SCHEMA = {
     "count": "Expr",
     "body": "list[Any]",
     "count_symbol_bounds": "dict[str, tuple[int, int]]",
+    "count_symbol_sources": "dict[str, tuple[int, int]]",
 }
 
 
@@ -300,6 +301,8 @@ def _canonical_spec(spec: object) -> object:
         # discriminating power is the same.
         if spec.count_symbol_bounds:
             result["count_symbol_bounds"] = _canonical_value(spec.count_symbol_bounds)
+        if spec.count_symbol_sources:
+            result["count_symbol_sources"] = _canonical_value(spec.count_symbol_sources)
         return result
     raise TypeError(f"Unsupported finalized kernel spec: {type(spec).__qualname__}")
 

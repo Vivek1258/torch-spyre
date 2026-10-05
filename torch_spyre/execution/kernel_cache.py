@@ -324,6 +324,20 @@ def compute_specs_hash(
                     )
                     content_parts.append(f"loop_count_bounds:{bounds}".encode())
                     logger.debug("  [hash] LoopSpec  bounds=%s", bounds)
+                # Which argument and dim the runtime reads each symbol from is
+                # baked into the bundle's parameter list, so two otherwise
+                # identical kernels reading the same dimension off different
+                # arguments are different binaries.
+                if entry.count_symbol_sources:
+                    sources = json.dumps(
+                        {
+                            name: list(source)
+                            for name, source in entry.count_symbol_sources.items()
+                        },
+                        sort_keys=True,
+                    )
+                    content_parts.append(f"loop_count_sources:{sources}".encode())
+                    logger.debug("  [hash] LoopSpec  sources=%s", sources)
                 _collect(entry.body)
             elif isinstance(entry, OpSpec):
                 sdsc_json, local_sym_values, affine_strides, local_symbol_kinds = (

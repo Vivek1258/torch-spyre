@@ -47,7 +47,9 @@ from torch_spyre._inductor.pass_utils import (
 )
 from torch_spyre._inductor.spyre_kernel import (
     _codegen_op_spec_list,
+    _place_symbol,
     _sympy_literal,
+    _walk_loop_specs,
 )
 
 SYM = "s0"
@@ -131,6 +133,67 @@ class TestTheProducer(unittest.TestCase):
         self.assertIn("no finite upper bound", warned.call_args[0][0])
 
 
+class TestPlacingASymbolOnALaunchArgument(unittest.TestCase):
+    """Which argument and dim the runtime reads the dimension from."""
+
+    def test_the_first_match_wins_in_argument_order(self):
+        actuals = ["arg0", "arg1"]
+        sizes = {"arg0": [8, 16], "arg1": [_sym(), 4]}
+
+        self.assertEqual(_place_symbol(SYM, actuals, sizes), (1, 0))
+
+    def test_the_dim_index_is_the_position_within_that_argument(self):
+        actuals = ["arg0"]
+        sizes = {"arg0": [4, 8, _sym()]}
+
+        self.assertEqual(_place_symbol(SYM, actuals, sizes), (0, 2))
+
+    def test_argument_order_decides_not_dict_order(self):
+        """``arg_index`` means a position in ``actuals``, so that is iterated.
+
+        The sizes dict is keyed by name and its order is an implementation
+        detail. Iterating it instead would make the placement depend on
+        insertion order, which is the kind of thing that only shows up as a
+        different binary on someone else's machine.
+        """
+        actuals = ["arg0", "arg1"]
+        sizes = {"arg1": [_sym()], "arg0": [_sym()]}
+
+        self.assertEqual(_place_symbol(SYM, actuals, sizes), (0, 0))
+
+    def test_an_unplaceable_symbol_is_none_rather_than_a_guess(self):
+        actuals = ["arg0"]
+        sizes = {"arg0": [8, 16]}
+
+        self.assertIsNone(_place_symbol(SYM, actuals, sizes))
+
+    def test_a_missing_or_empty_size_is_skipped_not_an_error(self):
+        actuals = ["arg0", "arg1", "arg2"]
+        sizes = {"arg0": None, "arg1": [], "arg2": [_sym()]}
+
+        self.assertEqual(_place_symbol(SYM, actuals, sizes), (2, 0))
+
+    def test_matching_is_by_name_so_it_survives_the_reload(self):
+        """A reloaded symbol is a different object with the same name."""
+        actuals = ["arg0"]
+        assumption_free = sympy.sympify(SYM)
+        sizes = {"arg0": [assumption_free]}
+
+        self.assertNotEqual(assumption_free, _sym())
+        self.assertEqual(_place_symbol(SYM, actuals, sizes), (0, 0))
+
+
+class TestWalkingTheSpecTree(unittest.TestCase):
+    def test_nested_loops_come_outer_first(self):
+        inner = LoopSpec(count=sympy.Integer(2), body=[])
+        outer = LoopSpec(count=FloorDiv(_sym(), TILE), body=[inner])
+
+        self.assertEqual(list(_walk_loop_specs([outer])), [outer, inner])
+
+    def test_a_tree_with_no_loops_is_empty(self):
+        self.assertEqual(list(_walk_loop_specs([])), [])
+
+
 class TestItSurvivesTheRealSerializer(unittest.TestCase):
     """Through the same functions codegen uses, not a reimplementation."""
 
@@ -153,6 +216,19 @@ class TestItSurvivesTheRealSerializer(unittest.TestCase):
 
         self.assertIn("count_symbol_bounds", source)
         self.assertEqual(reloaded.count_symbol_bounds, {SYM: (MAX, TILE)})
+
+    def test_the_sources_come_back_intact(self):
+        spec = LoopSpec(
+            count=FloorDiv(_sym(), TILE),
+            body=[],
+            count_symbol_bounds={SYM: (MAX, TILE)},
+            count_symbol_sources={SYM: (0, 0)},
+        )
+
+        (reloaded,), source = self._round_trip(spec)
+
+        self.assertIn("count_symbol_sources", source)
+        self.assertEqual(reloaded.count_symbol_sources, {SYM: (0, 0)})
 
     def test_the_count_changes_class_and_spelling_but_not_meaning(self):
         """Which is why the bounds are plain ints keyed by name.
@@ -219,6 +295,13 @@ class TestTheProvenanceSchemaAgrees(unittest.TestCase):
 
         self.assertNotIn("count_symbol_bounds", payload)
 
+    def test_sources_are_also_conditional_in_the_payload(self):
+        from torch_spyre._inductor.kernel_provenance import _canonical_spec
+
+        payload = _canonical_spec(LoopSpec(count=sympy.Integer(4), body=[]))
+
+        self.assertNotIn("count_symbol_sources", payload)
+
     def test_a_symbolic_loop_does_change_its_bundle_key(self):
         """The other half: when there are bounds, they are in the identity."""
         from torch_spyre._inductor.kernel_provenance import _canonical_spec
@@ -265,6 +348,26 @@ class TestTheCacheKeySeparatesThem(unittest.TestCase):
 
     def test_two_tile_sizes_do_not_share_a_cache_entry(self):
         self.assertNotEqual(self._key({SYM: (MAX, 64)}), self._key({SYM: (MAX, 128)}))
+
+    def test_two_sources_do_not_share_a_cache_entry(self):
+        """Reading the same dimension off a different argument is a different
+        bundle, because the parameter list it declares differs."""
+        from torch_spyre.execution.kernel_cache import compute_specs_hash
+
+        def key(sources):
+            return compute_specs_hash(
+                [
+                    LoopSpec(
+                        count=FloorDiv(_sym(), TILE),
+                        body=[],
+                        count_symbol_bounds={SYM: (MAX, TILE)},
+                        count_symbol_sources=sources,
+                    )
+                ]
+            )
+
+        self.assertNotEqual(key({SYM: (0, 0)}), key({SYM: (1, 0)}))
+        self.assertNotEqual(key({SYM: (0, 0)}), key({SYM: (0, 1)}))
 
     def test_identical_bounds_do_share_one(self):
         self.assertEqual(self._key({SYM: (MAX, TILE)}), self._key({SYM: (MAX, TILE)}))

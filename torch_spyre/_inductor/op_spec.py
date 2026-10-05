@@ -420,6 +420,11 @@ class LoopSpec:
             scheduler while the ShapeEnv exists and carried from there, because
             codegen also runs in a reload phase where it is gone. Empty for a
             concrete count.
+        count_symbol_sources: For a symbolic ``count``, the ``(arg_index,
+            dim_index)`` each symbol's value is read from at launch, keyed by
+            name. Resolved during kernel codegen, where the launch argument
+            ordering is still live. A symbol that cannot be placed is left out,
+            and bundle generation then refuses to declare a parameter for it.
 
     Each OpSpec in the body carries its own ``tiled_symbols`` list identifying
     which of its iteration-space symbols are tiled by the loop that directly
@@ -433,6 +438,9 @@ class LoopSpec:
     # the two distinct UnimplementedOp types (op_spec vs spyre_kernel).
     body: list[Any]
     count_symbol_bounds: dict[str, tuple[int, int]] = dataclasses.field(
+        default_factory=dict
+    )
+    count_symbol_sources: dict[str, tuple[int, int]] = dataclasses.field(
         default_factory=dict
     )
 
