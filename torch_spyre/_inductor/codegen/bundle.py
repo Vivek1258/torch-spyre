@@ -965,13 +965,23 @@ def _emit_specs(
     kernel_sym_to_arg_idx: dict | None = None,
     sym_canonical: dict | None = None,
     loop_levels: "list[LoopLevel] | None" = None,
+    scale_stack: "list[int] | None" = None,
 ) -> None:
     """Recursively emit MLIR ops for specs into file f.
 
     ``loop_levels`` carries each loop's emitted form, indexed the same way as
     ``loop_bounds``. Absent, every level falls back to the constant-bound,
     step-1 form, which is what a tree of concrete counts produces anyway.
+
+    ``scale_stack`` carries each enclosing level's stride scale and must be
+    maintained exactly as ``_collect_affine_maps`` maintains its own. The two
+    are the write and read halves of one contract: that pass registers an
+    affine map under its SCALED stride key and this one looks the map up by the
+    same key, so scaling in one and not the other is a KeyError on every
+    symbolic kernel. It was exactly that until an end-to-end test found it.
     """
+    if scale_stack is None:
+        scale_stack = []
     if kernel_sym_to_arg_idx is None:
         kernel_sym_to_arg_idx = {}
     if sym_canonical is None:
@@ -1021,6 +1031,7 @@ def _emit_specs(
                 kernel_sym_to_arg_idx=kernel_sym_to_arg_idx,
                 sym_canonical=sym_canonical,
                 loop_levels=loop_levels,
+                scale_stack=scale_stack + [_count_scale(entry.count)],
             )
             f.write(f"{tab}}}\n")
 
@@ -1047,12 +1058,15 @@ def _emit_specs(
             # affine_strides[tensor_idx] is list[dict] (per level, outermost first).
             sym_id_to_operand: dict[int, str] = {}
             for tensor_idx, per_level_strides in enumerate(affine_strides):
-                # Flatten per-level strides to build the stride_key in the same
-                # outermost-first order used by _collect_affine_maps.
+                # Built through the same helper _collect_affine_maps used, so
+                # the key looked up here is the key that pass registered. A
+                # symbolic level's strides are divided by its step there, and
+                # flattening the raw values instead misses every one of them.
                 flat_strides: list[int] = [
                     stride
-                    for level_strides in per_level_strides
-                    for stride in level_strides.values()
+                    for _level_idx, stride in _scaled_strides(
+                        per_level_strides, scale_stack
+                    )
                 ]
                 if not flat_strides:
                     continue
