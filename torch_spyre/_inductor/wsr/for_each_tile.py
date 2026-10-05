@@ -32,6 +32,7 @@ if TYPE_CHECKING:
 import torch
 import torch._prims_common as utils
 from torch._higher_order_ops.scan import scan
+from torch.fx.experimental.symbolic_shapes import statically_known_true
 from torch.utils._pytree import tree_leaves
 
 __all__ = ["Gather", "for_each_tile"]
@@ -166,6 +167,13 @@ def _normalize_in_specs(operands, dims, tile_size: int) -> tuple[list[TileSpec],
                     f"which is not a multiple of tile_size={tile_size} (ragged tiles "
                     f"are not supported)"
                 )
+            # Also state it as a fact. The test above guards it, but recording
+            # Mod(length, tile_size) in the shape env is what lets the
+            # simplifier fold tile_size * (length // tile_size) back to length
+            # when the length is symbolic. No-op for a concrete length.
+            # Deliberately not guarded by isinstance(length, int): a SymInt
+            # passes that test, so the guard would skip the case that needs it.
+            torch._check(length % tile_size == 0)
             spec = TileSpec(
                 Kind.SLICE,
                 axis,
@@ -220,14 +228,23 @@ def _xs_leaf(operand: torch.Tensor, spec: TileSpec) -> torch.Tensor:
             raise AssertionError("GATHER spec without an index table")
         return spec.index
     moved = _movedim(operand, spec.dim, 0)
-    # Splitting dim 0 is always expressible in strides, so this is a view.
+    # Trim to a whole number of tiles, then split. Both are views, so nothing
+    # copies, and for a concrete length the trim drops nothing.
+    #
+    # The trim is what keeps the tile extent a literal when the length is
+    # symbolic. A view reconciles the sizes it is given against numel, and
+    # given S it cannot prove (S // G) * G == S, so it re-derives the extent as
+    # S // (S // G) -- which is not G, it is 100 at S=100. Given G * (S // G)
+    # the trailing factor cancels by gcd to the literal G.
     #
     # `torch.unflatten`, not `Tensor.unflatten`: the method has a Python body
     # (`return super().unflatten(...)`, torch/_tensor.py) that dynamo normally
     # never reaches. Under an active `torch.device` mode -- vLLM runs its model
     # inside one -- DeviceContext.__torch_function__ re-dispatches into that body
     # and dynamo cannot trace the `super()` call. The free function has no body.
-    return torch.unflatten(moved, 0, (moved.shape[0] // spec.extent, spec.extent))
+    tiles = spec.num_tiles
+    trimmed = moved.narrow(0, 0, tiles * spec.extent)
+    return torch.unflatten(trimmed, 0, (tiles, spec.extent))
 
 
 def _tile(operand: torch.Tensor, spec: TileSpec, sliced: torch.Tensor) -> torch.Tensor:
@@ -252,7 +269,18 @@ def _stacked_to_full(ys: torch.Tensor, dim: int) -> torch.Tensor:
     storage, since the flatten merges two contiguous leading axes. For dim != 0 the
     flatten crosses the moved axis, which strides cannot express, so it copies the whole
     output ((3, 8, 2) -> (8, 6)); Phase 7 removes that by writing tile i in place.
+
+    For dim == 0 this folds with `as_strided` rather than `flatten`. The two give
+    the identical tensor, but on a symbolic leading extent `flatten` (and
+    `reshape`, and `view`) walk the dims and add `Ne(count, 1)`, which makes the
+    compiled artifact invalid for a single-tile call. `as_strided` adds nothing.
     """
+    # as_strided takes the strides on trust, so only take it when the leading
+    # axes are PROVABLY contiguous. statically_known_true so the test itself
+    # installs no guard. Otherwise flatten: slower to specialise, never wrong.
+    if dim == 0 and statically_known_true(ys.stride(0) == ys.size(1) * ys.stride(1)):
+        folded = (ys.size(0) * ys.size(1), *ys.shape[2:])
+        return ys.as_strided(folded, ys.stride()[1:])
     return _movedim(ys, 0, dim).flatten(dim, dim + 1)
 
 
