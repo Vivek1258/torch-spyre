@@ -35,8 +35,34 @@ with PR #4326 and belongs in that test.
 The range is declared with ``torch._check`` inside the traced function. That is
 also temporary: once the contract reader lands the transfer call carries it and
 these three lines go away.
+
+VERIFIED EMITTED BUNDLE, 6 Oct 2026, for the region below at 64 columns fp16::
+
+    #map_0 = affine_map<(d0)[s0] -> (s0 + 128*d0)>
+    func.func @sdsc_bundle(
+        %arg_0_base_addr: !sdscbundle.input_arg<index>,
+        %arg_1_base_addr: !sdscbundle.input_arg<index>,
+        %dim_s77_base: !sdscbundle.input_arg<index, granularity=64, max_value=512>) {
+      %dim_s77 = sdscbundle.input_arg_extract value from %dim_s77_base : ... -> index
+      %c0 = arith.constant 0 : index
+      %step_0 = arith.constant 64 : index
+      scf.for %i_0 = %c0 to %dim_s77 step %step_0 {
+        %addr_0 = affine.apply #map_0(%i_0)[%arg_0]
+        sdscbundle.sdsc_execute (%addr_0) {sdsc_filename="sdsc_0.json", ...}
+      }
+    }
+
+Every load-bearing detail of the design's bundle section is in that listing.
+The dimension parameter is last and is the only one carrying granularity and
+max_value. Its extract precedes the loop constants. The bound is the dimension
+and the step is a constant 64, with a lower bound of zero, so the device's
+``(ub - lb) / step`` is free and no division is authored anywhere. And the
+affine stride is 128, the PER-ROW stride: 64 columns of fp16 is 128 bytes, the
+tile stride is 8192, and 8192 / 64 = 128 because the loop variable counts rows
+rather than tiles.
 """
 
+import re
 import unittest
 from functools import wraps
 
@@ -136,12 +162,26 @@ class TestSymbolicLoopOnDevice(unittest.TestCase):
 
     def test_the_declared_maximum_is_what_was_carried(self):
         """Not the warm-up size. This is the one that catches hint-sized
-        geometry, which is correct at the compiled size and wrong above it."""
+        geometry, which is correct at the compiled size and wrong above it.
+
+        Asserted as the whole carried pair rather than "512 appears somewhere",
+        because 512 and 64 are both common enough numbers to appear by accident
+        in a kernel of this shape.
+        """
         _out, _reference, code = self._compile_and_run()
         source = "\n".join(code)
 
-        self.assertIn(str(MAX_ROWS), source)
-        self.assertIn(f"{TILE})", source)
+        carried = re.search(
+            r"count_symbol_bounds=\{'(s\d+)': \((\d+), (\d+)\)\}", source
+        )
+        self.assertIsNotNone(
+            carried,
+            "no count_symbol_bounds reached the kernel, so nothing carries the "
+            f"range to the bundle. Source was:\n{source[:2000]}",
+        )
+        self.assertEqual(
+            (int(carried.group(2)), int(carried.group(3))), (MAX_ROWS, TILE)
+        )
 
 
 class TestItIsStillCorrectAtAnotherSize(unittest.TestCase):
