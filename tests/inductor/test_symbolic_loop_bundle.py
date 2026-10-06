@@ -112,9 +112,7 @@ class _BundleHarness(InductorTestCase):
         return LoopSpec(
             count=FloorDiv(_sym(), tile),
             body=body if body is not None else [_op_spec()],
-            count_symbol_bounds=(
-                {SYM: (MAX, tile)} if bounds is None else bounds
-            ),
+            count_symbol_bounds=({SYM: (MAX, tile)} if bounds is None else bounds),
             count_symbol_sources={SYM: (0, 0)} if sources is None else sources,
         )
 
@@ -123,9 +121,7 @@ class TestTheDimensionReachesTheBundle(_BundleHarness):
     """The claim the helper tests could not make."""
 
     def test_the_parameter_is_declared_with_its_contract(self):
-        bundle, _kinds = self._run(
-            [self._symbolic_loop()], [self._entry(TILE_STRIDE)]
-        )
+        bundle, _kinds = self._run([self._symbolic_loop()], [self._entry(TILE_STRIDE)])
 
         self.assertIn(
             f"%dim_{SYM}_base: !sdscbundle.input_arg"
@@ -141,9 +137,7 @@ class TestTheDimensionReachesTheBundle(_BundleHarness):
         back with no loop dimension in it at all and the runtime had nothing
         telling it to bind a size rather than an address.
         """
-        _bundle, kinds = self._run(
-            [self._symbolic_loop()], [self._entry(TILE_STRIDE)]
-        )
+        _bundle, kinds = self._run([self._symbolic_loop()], [self._entry(TILE_STRIDE)])
 
         loop_dims = [k for k in kinds if k.is_loop_dimension]
         self.assertEqual(len(loop_dims), 1, f"got {[k.kind for k in kinds]}")
@@ -154,9 +148,7 @@ class TestTheDimensionReachesTheBundle(_BundleHarness):
 
     def test_it_is_not_an_sdsc_dimension_symbol(self):
         """So the compile-boundary gate keeps refusing the old route only."""
-        _bundle, kinds = self._run(
-            [self._symbolic_loop()], [self._entry(TILE_STRIDE)]
-        )
+        _bundle, kinds = self._run([self._symbolic_loop()], [self._entry(TILE_STRIDE)])
 
         self.assertFalse(
             any(k.is_dimension for k in kinds),
@@ -170,18 +162,14 @@ class TestTheDimensionReachesTheBundle(_BundleHarness):
         The runtime fills these slots by order, so a loop dimension inserted
         before the address parameters would rebind every one of them.
         """
-        bundle, _kinds = self._run(
-            [self._symbolic_loop()], [self._entry(TILE_STRIDE)]
-        )
+        bundle, _kinds = self._run([self._symbolic_loop()], [self._entry(TILE_STRIDE)])
         signature = bundle.split("func.func @sdsc_bundle(")[1].split(")")[0]
 
         self.assertLess(signature.index("%arg_0"), signature.index(f"%dim_{SYM}"))
 
     def test_the_extract_precedes_the_loop_constants(self):
         """A symbolic bound IS that SSA value, so it must already be in scope."""
-        bundle, _kinds = self._run(
-            [self._symbolic_loop()], [self._entry(TILE_STRIDE)]
-        )
+        bundle, _kinds = self._run([self._symbolic_loop()], [self._entry(TILE_STRIDE)])
 
         self.assertLess(
             bundle.index(f"%dim_{SYM} = sdscbundle.input_arg_extract"),
@@ -191,18 +179,14 @@ class TestTheDimensionReachesTheBundle(_BundleHarness):
 
 class TestTheLoopForm(_BundleHarness):
     def test_the_bound_is_the_dimension_and_the_step_is_the_tile(self):
-        bundle, _kinds = self._run(
-            [self._symbolic_loop()], [self._entry(TILE_STRIDE)]
-        )
+        bundle, _kinds = self._run([self._symbolic_loop()], [self._entry(TILE_STRIDE)])
 
         self.assertIn(f"%step_0 = arith.constant {TILE} : index", bundle)
         self.assertIn(f"scf.for %i_0 = %c0 to %dim_{SYM} step %step_0", bundle)
 
     def test_no_division_is_authored(self):
         """The device derives (ub - lb) / step itself, and we never write one."""
-        bundle, _kinds = self._run(
-            [self._symbolic_loop()], [self._entry(TILE_STRIDE)]
-        )
+        bundle, _kinds = self._run([self._symbolic_loop()], [self._entry(TILE_STRIDE)])
 
         for forbidden in ("divsi", "divui", "ceildiv", "floordiv"):
             self.assertNotIn(forbidden, bundle, f"authored a {forbidden}")
@@ -213,9 +197,7 @@ class TestTheLoopForm(_BundleHarness):
         The tile stride against an element-stepping loop would advance a whole
         tile too far per trip, which is a wrong answer rather than a crash.
         """
-        bundle, _kinds = self._run(
-            [self._symbolic_loop()], [self._entry(TILE_STRIDE)]
-        )
+        bundle, _kinds = self._run([self._symbolic_loop()], [self._entry(TILE_STRIDE)])
 
         self.assertIn(f"{ROW_STRIDE}*d0", bundle)
         self.assertNotIn(f"{TILE_STRIDE}*d0", bundle)

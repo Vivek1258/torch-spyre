@@ -392,8 +392,7 @@ def generate_bundle(
                     dim_index=dim_index,
                 )
                 params.append(
-                    f"{loop_dim_ssa[sym_name]}_base: "
-                    f"{_dim_input_arg_type(dim_kind)}"
+                    f"{loop_dim_ssa[sym_name]}_base: {_dim_input_arg_type(dim_kind)}"
                 )
                 param_symbol_kinds.append(dim_kind)
             f.write(f"\tfunc.func @sdsc_bundle({', '.join(params)}) {{\n")

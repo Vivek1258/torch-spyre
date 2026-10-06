@@ -46,9 +46,7 @@ TILE = 64
 
 def _cond_graph(inner_fn, *, n_ops=1, n_outputs=1, dtype=torch.bool, sizes=()):
     """The parts of a cond graph `_extract_trip_count` actually reads."""
-    data = SimpleNamespace(
-        inner_fn=inner_fn, get_size=lambda: list(sizes), dtype=dtype
-    )
+    data = SimpleNamespace(inner_fn=inner_fn, get_size=lambda: list(sizes), dtype=dtype)
     return SimpleNamespace(
         graph_outputs=[object()] * n_outputs,
         operations=[SimpleNamespace(data=data)] * n_ops,

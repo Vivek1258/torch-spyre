@@ -369,6 +369,15 @@ PYBIND11_MODULE(_C, m) {
   m.def("spyre_empty_with_layout", &spyre::spyre_empty_with_layout,
         py::arg("size"), py::arg("stride"), py::arg("dtype"),
         py::arg("device_layout"), py::arg("device") = py::none());
+  m.def("spyre_empty_reserved", &spyre::spyre_empty_reserved, py::arg("size"),
+        py::arg("stride"), py::arg("dtype"), py::arg("dim"),
+        py::arg("min_size"), py::arg("max_size"), py::arg("granularity"),
+        "Allocate a Spyre tensor whose physical layout/storage are sized "
+        "for dim `dim` == `max_size`, while its logical (PyTorch-visible) "
+        "size/stride stay at `size`/`stride`. `min_size`/`granularity` are "
+        "stored on the tensor for the runtime resize_ guard to check. "
+        "Backs tensor.to(\"spyre\", dynamic={dim: {min, max, "
+        "granularity}}).");
   m.def("empty_with_layout", &spyre::py_empty_with_layout);
   m.def("as_strided_with_layout", &spyre::as_strided_with_layout);
   m.def("reinterpret_tensor", &spyre::reinterpret_tensor);
@@ -412,6 +421,10 @@ PYBIND11_MODULE(_C, m) {
   m.def("set_spyre_tensor_layout", &spyre::set_spyre_tensor_layout);
   m.def("get_spyre_tensor_sizes", &spyre::get_spyre_tensor_sizes);
   m.def("get_spyre_tensor_strides", &spyre::get_spyre_tensor_strides);
+  m.def("get_reserved_dims", &spyre::get_reserved_dims, py::arg("tensor"),
+        "Return {dim: {'min', 'max', 'granularity'}} for a tensor.to("
+        "\"spyre\", dynamic=...) reservation, or None. Never raises, even "
+        "for a non-Spyre tensor.");
   m.def("get_downcast_warning", &spyre::get_downcast_warn_enabled,
         "Return whether downcast warnings are enabled.");
   m.def("set_downcast_warning", &spyre::set_downcast_warn_enabled,

@@ -33,6 +33,13 @@ if TYPE_CHECKING:
 # this module's patch functions actually run).
 _UNSET = object()
 
+# Floor on a dynamic= reservation's `min`. The serving plugin's linear
+# wrapper branches on a row count below this, which would become a branch
+# on a symbol once that dim is dynamic. Real minima are far above it
+# today, so this holds by luck rather than by construction -- enforcing it
+# here means a future caller can't quietly drop below it.
+_MIN_RESERVED_DIM_SIZE = 8
+
 
 def _add_ea(src_tensor, res_tensor) -> None:
     """Update the EA tag after an eager transfer handled by ``orig_to``.
@@ -137,7 +144,153 @@ def _patch_tensor_for_spyre():
         else:
             return None
 
-    def spyre_to(self, *args, device_layout=None, **kwargs):
+    def spyre_to(self, *args, device_layout=None, dynamic=None, **kwargs):
+        if dynamic is not None:
+            # tensor.to("spyre", dynamic={0: {"min": 32, "max": 576,
+            # "granularity": 16}}): reserve the destination buffer at `max`
+            # along `dim` instead of the current (warmup) shape, so a later
+            # in-place resize up to `max` (done by the compiled graph via
+            # aten::resize_ / spyre_resize_) never reallocates and never
+            # changes the SpyreTensorLayout the recompile guard compares
+            # against, then internally call mark_dynamic(dim) so Dynamo
+            # treats `dim` as symbolic before torch.compile traces this
+            # tensor. This is what lets one compiled artifact serve any
+            # runtime size at `dim` without recompiling.
+            # Scope for now: exactly one dim (dim 0 comes first) -- multi-dim
+            # reservation is a later layer.
+            # `granularity` is optional; omitting it means "no step
+            # restriction" (equivalent to granularity=1). When given, it is
+            # stored on the destination tensor (SpyreTensorImpl.reserved_dims)
+            # so the runtime resize_ guard can check every later resize_
+            # against it -- see spyre_tensor_impl.h's ReservedDimInfo.
+            _device = kwargs.get("device", None)
+            if (
+                _device is None
+                and len(args) > 0
+                and isinstance(args[0], (str, torch.device))
+            ):
+                _device = args[0]
+            TORCH_CHECK_MSG = (
+                'dynamic= is only supported for CPU -> "spyre" transfers, e.g. '
+                'x.to("spyre", dynamic={0: {"min": 32, "max": 576, '
+                '"granularity": 16}})'
+            )
+            if _device is None or torch.device(_device).type != DEVICE_NAME:
+                raise ValueError(TORCH_CHECK_MSG)
+            if self.device.type != "cpu":
+                raise ValueError(TORCH_CHECK_MSG)
+            if not isinstance(dynamic, dict) or len(dynamic) != 1:
+                raise ValueError(
+                    "dynamic= currently supports exactly one dim, e.g. "
+                    'x.to("spyre", dynamic={0: {"min": 32, "max": 576, '
+                    '"granularity": 16}})'
+                )
+
+            ((dim, spec),) = dynamic.items()
+            size = self.size()
+            if dim < 0:
+                dim += len(size)
+            if "max" not in spec:
+                raise ValueError(f"dynamic={{{dim}: ...}} requires a 'max' entry")
+            if "min" not in spec:
+                raise ValueError(f"dynamic={{{dim}: ...}} requires a 'min' entry")
+            dim_max = spec["max"]
+            dim_min = spec["min"]
+            granularity = spec.get("granularity", 1)
+            if granularity is None:
+                granularity = 1
+
+            # Rules on the declaration itself: these must hold regardless of
+            # this call's concrete size, because the declaration is a
+            # contract the compiler and every later call will rely on, not
+            # just a fact about today's tensor.
+            for name, value in (
+                ("min", dim_min),
+                ("max", dim_max),
+                ("granularity", granularity),
+            ):
+                if not isinstance(value, int) or value <= 0:
+                    raise ValueError(
+                        f"dynamic={{{dim}: ...}}: {name}={value!r} must be a "
+                        "positive int"
+                    )
+            if dim_min > dim_max:
+                raise ValueError(
+                    f"dynamic={{{dim}: ...}}: min={dim_min} exceeds max={dim_max}"
+                )
+            if dim_max % granularity != 0:
+                raise ValueError(
+                    f"dynamic={{{dim}: ...}}: max={dim_max} is not a multiple "
+                    f"of granularity={granularity}"
+                )
+            if dim_min < _MIN_RESERVED_DIM_SIZE:
+                raise ValueError(
+                    f"dynamic={{{dim}: ...}}: min={dim_min} is below the "
+                    f"minimum supported reservation floor "
+                    f"({_MIN_RESERVED_DIM_SIZE})"
+                )
+            from torch_spyre._inductor import config as inductor_config
+
+            num_buckets = dim_max // granularity
+            if num_buckets > inductor_config.max_buckets:
+                raise ValueError(
+                    f"dynamic={{{dim}: ...}}: max={dim_max} / "
+                    f"granularity={granularity} = {num_buckets} buckets, "
+                    f"exceeding the cap of {inductor_config.max_buckets}"
+                )
+
+            if not (0 <= dim < len(size)):
+                raise ValueError(
+                    f"dynamic dim {dim} is out of range for tensor of shape "
+                    f"{tuple(size)}"
+                )
+            if not (dim_min <= size[dim] <= dim_max):
+                raise ValueError(
+                    f"dynamic={{{dim}: ...}}: current size {size[dim]} at dim "
+                    f"{dim} is not within [min={dim_min}, max={dim_max}]"
+                )
+            if size[dim] % granularity != 0:
+                raise ValueError(
+                    f"dynamic={{{dim}: ...}}: current size {size[dim]} at dim "
+                    f"{dim} is not a multiple of granularity={granularity}"
+                )
+
+            # This path calls spyre_empty_reserved directly via pybind11,
+            # bypassing the ATen dispatcher path that ordinarily self-inits
+            # the runtime (via the H2D stream pool inside spyre_copy_from ->
+            # getCurrentStream). On a fresh process this can be the very
+            # first device op, so the runtime must be brought up explicitly
+            # here first -- same idiom as manual_seed/CCL-backend/profiler
+            # init elsewhere in this package.
+            if not torch.spyre.is_initialized():
+                torch.spyre._impl._lazy_init()
+
+            from torch_spyre._C import copy_tensor, spyre_empty_reserved
+
+            dst = spyre_empty_reserved(
+                self.size(),
+                self.stride(),
+                self.dtype,
+                dim,
+                dim_min,
+                dim_max,
+                granularity,
+            )
+            copy_tensor(self, dst, non_blocking=False)
+
+            # mark_dynamic must be called eager, pre-compile, so Dynamo
+            # treats `dim` as symbolic from the very first trace.
+            #
+            # Deliberately bare: no min=/max= here. Passing them installs a
+            # StrictMinMaxConstraint, which promises every value in that
+            # range is valid. The granularity check the compiler adds later
+            # (size % granularity == 0) then looks like it's violating that
+            # promise for a non-multiple size, raising
+            # ConstraintViolationError instead of a normal guard miss. The
+            # range is still declared -- just via torch._check inside the
+            # traced function, not here.
+            torch._dynamo.mark_dynamic(dst, dim)
+            return dst
         if device_layout is None:
             # During Dynamo tracing this wrapper is an allow_in_graph leaf: keep
             # the operation device-local so Inductor sees and lowers the dtype

@@ -127,9 +127,7 @@ class TestLoopLevel(unittest.TestCase):
         self.assertEqual(level.bound, "%loop_bound_0")
         self.assertEqual(level.step, "%c1")
         self.assertEqual(level.stride_scale, 1)
-        self.assertEqual(
-            level.setup, ("%loop_bound_0 = arith.constant 8 : index",)
-        )
+        self.assertEqual(level.setup, ("%loop_bound_0 = arith.constant 8 : index",))
 
     def test_plain_int_count_is_accepted_too(self):
         level = _loop_level(4, 1, {})
@@ -202,17 +200,13 @@ class TestStrideScaling(unittest.TestCase):
 
     def test_unscaled_levels_pass_through(self):
         per_level = [{"a": 2048}, {"b": 64}]
-        self.assertEqual(
-            list(_scaled_strides(per_level, [1, 1])), [(0, 2048), (1, 64)]
-        )
+        self.assertEqual(list(_scaled_strides(per_level, [1, 1])), [(0, 2048), (1, 64)])
 
     def test_a_symbolic_level_divides_its_strides(self):
         # 131072 is the per-tile stride for 64 rows of 1024 fp16 elements.
         # With the loop stepping 64, the emitted stride must be the per-row
         # 2048, since 64 * 2048 recovers the tile stride.
-        self.assertEqual(
-            list(_scaled_strides([{"a": 131072}], [G])), [(0, 2048)]
-        )
+        self.assertEqual(list(_scaled_strides([{"a": 131072}], [G])), [(0, 2048)])
 
     def test_missing_scale_entries_default_to_one(self):
         self.assertEqual(list(_scaled_strides([{"a": 7}], [])), [(0, 7)])

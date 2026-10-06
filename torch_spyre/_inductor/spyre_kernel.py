@@ -1442,9 +1442,7 @@ class SpyreKernel(Kernel[CSEVariable]):
         pass_utils.decompose_tiled_count.
         """
         loops = [
-            loop
-            for loop in walk_loop_specs(self.op_specs)
-            if loop.count_symbol_bounds
+            loop for loop in walk_loop_specs(self.op_specs) if loop.count_symbol_bounds
         ]
         if not loops:
             return
@@ -1473,10 +1471,7 @@ class SpyreKernel(Kernel[CSEVariable]):
                 logger.info(
                     "[symbolic-loop] count=%s reads its dimension(s) from %s",
                     loop.count,
-                    {
-                        name: f"args[{a}].size({d})"
-                        for name, (a, d) in sources.items()
-                    },
+                    {name: f"args[{a}].size({d})" for name, (a, d) in sources.items()},
                 )
 
     def codegen_kernel(self):

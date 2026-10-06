@@ -21,6 +21,7 @@
 #include <util/sendefs/sendefs.h>
 
 #include <functional>
+#include <map>
 #include <optional>
 #include <string>
 #include <vector>
@@ -51,6 +52,18 @@ enum class ElementArrangement {
   FP32_TO_DL16 = 4,  // non-sequential order produced by fp32->dl16 on-device
                      // conversions
   QFP8WT = 5,        // 2D stick layout for FP8 weight tensors
+};
+
+/**
+ * Per-dim bounds for a reserved (max-strided) dimension: the runtime-legal
+ * range [min, max] and the step size (granularity) within it. Every legal
+ * runtime size at that dim is a multiple of granularity, min <= size <= max.
+ * granularity == 1 means "any size in [min, max]" (no step restriction).
+ */
+struct ReservedDimInfo {
+  int64_t min;
+  int64_t max;
+  int64_t granularity;
 };
 
 inline std::string elementArrangementToString(ElementArrangement ea) {
@@ -211,6 +224,22 @@ class SpyreTensorImpl : public at::TensorImpl {
   SpyreTensorLayout spyre_layout;
   std::vector<int64_t> dma_sizes;
   std::vector<int64_t> dma_strides;
+  
+  /**
+   * When set, maps each reserved dim to its [min, max, granularity]. This
+   * tensor's physical allocation (spyre_layout/storage) is sized for
+   * host_size[dim] == reserved_dims->at(dim).max for every key `dim` rather
+   * than the tensor's current logical size at that dim. Used to support
+   * `tensor.to("spyre", dynamic={dim: {min, max, granularity}})`: the buffer
+   * is allocated once for the declared ceiling so later in-place resizes to
+   * a smaller/larger (but still within [min, max] and a multiple of
+   * granularity) concrete shape never require reallocation or invalidate
+   * the compiled graph's layout guard. Scope today: at most one entry (dim
+   * 0); the map shape already supports more without changing this field.
+   * See spyre_empty_reserved() and spyre_resize_() in spyre_mem.cpp.
+   */
+  std::optional<std::map<int64_t, ReservedDimInfo>> reserved_dims;
+
 
   SpyreTensorImpl(c10::Storage&& storage, c10::DispatchKeySet key_set,
                   const caffe2::TypeMeta& dtype);
@@ -248,6 +277,20 @@ void set_spyre_tensor_layout(const at::Tensor& tensor,
                              const SpyreTensorLayout& stl);
 std::vector<int64_t> get_spyre_tensor_sizes(const at::Tensor& tensor);
 std::vector<int64_t> get_spyre_tensor_strides(const at::Tensor& tensor);
+
+/**
+ * Read back a tensor's reservation contract (see reserved_dims above), as
+ * plain Python-friendly types: {dim: {"min": ..., "max": ...,
+ * "granularity": ...}}, or nullopt if the tensor has no reservation.
+ *
+ * Unlike the accessors above, this never throws: it returns nullopt for a
+ * non-Spyre tensor instead of requiring the caller to check first. It is
+ * called from the compiler's lowering pass over every graph input of every
+ * compile, Spyre or not, so a throw here would turn an ordinary CPU input
+ * into a compile crash.
+ */
+std::optional<std::map<int64_t, std::map<std::string, int64_t>>>
+get_reserved_dims(const at::Tensor& tensor);
 
 }  // namespace spyre
 

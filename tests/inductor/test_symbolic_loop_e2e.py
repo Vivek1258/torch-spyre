@@ -32,9 +32,14 @@ the loop form the design specifies, and the numbers are right at the size it
 was compiled for. The multi-size no-recompile proof is the combined milestone
 with PR #4326 and belongs in that test.
 
-The range is declared with ``torch._check`` inside the traced function. That is
-also temporary: once the contract reader lands the transfer call carries it and
-these three lines go away.
+The range is declared with ``torch._check`` inside the traced function, and it
+stays there. The transfer call cannot carry it: passing ``min=``/``max=`` to
+``mark_dynamic`` installs a ``StrictMinMaxConstraint``, which promises every
+size in the range is valid, and the ``size % granularity == 0`` check the
+compiler adds later then reads as breaking that promise and raises
+``ConstraintViolationError`` instead of an ordinary guard miss. So PR #4326
+marks the dim bare and the range is declared from inside the region. What A.2's
+bridge changes is who writes these three lines, not where they go.
 
 VERIFIED EMITTED BUNDLE, 6 Oct 2026, for the region below at 64 columns fp16::
 
@@ -62,10 +67,10 @@ tile stride is 8192, and 8192 / 64 = 128 because the loop variable counts rows
 rather than tiles.
 """
 
-import re
 import unittest
 from functools import wraps
 
+import regex as re
 import torch
 
 import torch_spyre  # noqa: F401  registers the "spyre" device
@@ -109,9 +114,7 @@ def tiled_gelu(x):
         (tile,) = tiles
         return None, torch.nn.functional.gelu(tile)
 
-    _carry, out = for_each_tile(
-        body, (x,), dims=(0,), tile_size=TILE, out_dim=0
-    )
+    _carry, out = for_each_tile(body, (x,), dims=(0,), tile_size=TILE, out_dim=0)
     return out
 
 
@@ -137,9 +140,7 @@ class TestSymbolicLoopOnDevice(unittest.TestCase):
     def test_the_numbers_are_right(self):
         out, reference, _code = self._compile_and_run()
 
-        torch.testing.assert_close(
-            out.cpu().float(), reference, atol=ATOL, rtol=RTOL
-        )
+        torch.testing.assert_close(out.cpu().float(), reference, atol=ATOL, rtol=RTOL)
 
     def test_the_count_reaches_the_kernel_as_a_symbol(self):
         """Not specialised to 256 somewhere along the way.
@@ -203,19 +204,13 @@ class TestItIsStillCorrectAtAnotherSize(unittest.TestCase):
     def test_a_smaller_size(self):
         out, reference, _code = TestSymbolicLoopOnDevice._compile_and_run(rows=128)
 
-        torch.testing.assert_close(
-            out.cpu().float(), reference, atol=ATOL, rtol=RTOL
-        )
+        torch.testing.assert_close(out.cpu().float(), reference, atol=ATOL, rtol=RTOL)
 
     def test_the_minimum_size(self):
         """One tile exactly, which is the known rough edge."""
-        out, reference, _code = TestSymbolicLoopOnDevice._compile_and_run(
-            rows=MIN_ROWS
-        )
+        out, reference, _code = TestSymbolicLoopOnDevice._compile_and_run(rows=MIN_ROWS)
 
-        torch.testing.assert_close(
-            out.cpu().float(), reference, atol=ATOL, rtol=RTOL
-        )
+        torch.testing.assert_close(out.cpu().float(), reference, atol=ATOL, rtol=RTOL)
 
 
 if __name__ == "__main__":

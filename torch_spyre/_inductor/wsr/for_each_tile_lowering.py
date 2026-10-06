@@ -243,8 +243,7 @@ def _extract_trip_count(cond_graph) -> ProverResult:
     (loaded_name, loaded_index) = recorder.loads[0]
     if loaded_name != first_placeholder:
         return declined(
-            f"loads {loaded_name!r}, not the first placeholder "
-            f"{first_placeholder!r}"
+            f"loads {loaded_name!r}, not the first placeholder {first_placeholder!r}"
         )
     if loaded_index != 0:
         return declined(f"loads at index {loaded_index}, expected 0")
