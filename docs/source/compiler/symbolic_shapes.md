@@ -196,7 +196,7 @@ Technically deeper, and partly already done, so it is worth separating what is h
 
 **The real Phase 2 obstacle is allocation, not reduction.** The sequence sits under the batch dimension, so every stride above it is computed from its maximum and the tensor has to be stored sparsely at max stride. That is the nested allocation question, and it is the one thing the reservation layer does not do today: the reservation call takes a dimension to reserve and the wrapper passes 0, so a dynamic dimension anywhere else is simply not reserved and its device geometry tracks the runtime size. A dynamic sequence therefore needs that one parameter plumbed through before anything else in this phase can be judged. Section 9.3 has the same conclusion arrived at from the matmul side.
 
-**Still genuinely open.** The sequence sits on both axes of the score matrix, so one symbol has to tile through two axes of the same operand, and the encoder case is square and therefore harder than the decoder's two independent dimensions. The attention decomposition also computes block counts with plain integer arithmetic, which will silently specialise a symbolic length rather than fail, so every such site has to be found and made symbol-safe.
+**Still genuinely open.** The sequence sits on both axes of the score matrix, so one symbol has to tile through two axes of the same operand, and the encoder case is square and therefore harder than the decoder's two independent dimensions. The attention decomposition also computes block counts with plain integer arithmetic, which will silently specialise a symbolic length rather than fail, so every such site has to be found and made symbol-safe. One site is worse than that: the query tile selection calls an integer-only method on the length and raises outright, so it is reached before any of the silent ones.
 
 **Settled, and it is cheaper than this section used to claim.** Online softmax does **not** need a second pass over the data. The working implementation carries a running maximum, a running denominator and an accumulator through the loop, and then divides the accumulator by the denominator **once, after the loop**, on the output tile. That is one elementwise divide on a tile-sized buffer, not a second traversal of the KV data. So the normalisation cost is negligible and the carry copy is the only real cost in this phase.
 
@@ -253,6 +253,8 @@ matmul and a plan built silently from the warm-up hint.
 | The real size is bound into an argument slot at dispatch | torch-spyre runtime | [#4964](https://github.com/torch-spyre/torch-spyre/issues/4964) |
 | The device loop takes its bound from an input argument | deeptools | [#4397](https://github.com/torch-spyre/torch-spyre/issues/4397), [#1522](https://github.com/torch-spyre/torch-spyre/issues/1522) |
 | The size supplied is within range and a multiple of the granularity | caller | [#4384](https://github.com/torch-spyre/torch-spyre/issues/4384) |
+| Autopilot is enabled in the backend | deeptools | with it disabled every loop must be fully unrolled, and a non-constant trip count cannot be, so a symbolic bound becomes a compile error |
+| The frontend guarantees the buffer matches the declared maximum | torch-spyre frontend | the backend takes the SDSC's declared shape and address on trust and does not check the allocation behind them. Invariant 11 |
 
 Core division is not on that list. Work division operates on the loop body, which is a static tile, so it divides a fixed extent across cores exactly as it does for a static kernel.
 
@@ -278,6 +280,13 @@ Four more invariants, all read out of the backend source rather than negotiated,
 | 9 | **The loop's lower bound is 0 and its step is a constant** | the backend computes `(ub - lb) / step` unconditionally. That is free only in this form; any other lower bound or a non-constant step puts a real division in the lowered program |
 | 10 | **The declared minimum is above 8** | the serving plugin's own linear wrapper branches on a row count below 8. Under a symbolic row count that is a branch on the symbol. It is safe today only because our minimum happens to exceed it, and a rule that holds by luck should be written down |
 
+Two further invariants, both established by running a chained-region fixture rather than by reading source.
+
+| # | Invariant | Where it comes from |
+|---|---|---|
+| 11 | **A tensor carrying a declaration has storage at the declared maximum** | geometry is built from the maximum, so a declaration over a smaller allocation addresses memory that is not there, and nothing downstream catches it. Today the invariant holds by construction: the only writer of the declaration also performs the allocation, and the two paths that propagate it share storage. Any mechanism that attaches a declaration to a tensor it did not allocate has to verify this, and that makes it a precondition on the work in Section 7.3 rather than a note |
+| 12 | **The granularity divides the dimension value, on the backend side too** | invariant 3 states this from the frontend side. The backend computes the device loop's trip count and its compile-time slot enumeration with a floor divide, while the runtime trip-count symbol built for a program correction uses a ceiling divide. The two agree only while the granularity divides exactly. Latent while addresses stay static, and a trap for any later work that puts a symbol in an address |
+
 Invariant 3 needs one addition about **who enforces it**, because the two halves have different owners and the document used to blur them. That `max` is a multiple of `G` is checked by the backend at compile time and will fire. That the runtime size is a multiple of `G` is checked by **nobody** downstream: the device evaluates the trip count as a plain truncating integer divide with no remainder check and no diagnostic anywhere on the host or the device. So the host-side check of Section 12 is the only thing standing between a non-conforming size and silent data loss. That makes it a correctness requirement, not an ergonomic one.
 
 ### 7.3 The user-facing interface
@@ -301,7 +310,9 @@ The call does three things of different kinds. It **allocates** a buffer with ca
 
 Today only the first survives. The buffer is reserved at the max and the dimension is marked, and **nothing carries min, max or granularity into the trace**. The reason is structural rather than an oversight: `.to()` runs eagerly, outside the traced region, before the symbol exists, while the contract has to be asserted inside the trace for the `ShapeEnv` to learn it. Something has to bridge those two moments.
 
-The consequence is not a missing refusal. It is a **silent wrong answer**. With the range undeclared, a plain module with a marked dimension compiles, reuses one binary across every size, refuses nothing, warns nothing, and returns a correctly shaped tensor whose rows beyond the warm-up size are garbage. With the same contract declared by hand inside the traced function, the same kernel refuses loudly at compile time with a precise message. Every experiment in this work that looked safe was safe only because a test re-declared the contract by hand, and no real consumer would do that.
+The consequence is a refusal. With the range undeclared the trip count reaches codegen as a symbol with no finite upper bound, and the extent computation refuses because there is nothing to size the tiled dimension against. The message names the symbol and says to declare the range in the traced region. Verified on a four-region chain written without the in-region declaration: it refuses at the first region.
+
+An earlier revision of this section argued the consequence was a silent wrong answer, a correctly shaped tensor whose rows past the warm-up size are garbage. That is not what happens, and the reason is structural: geometry built from the declared maximum reaches the SDSC through a path that demands a finite bound, so its absence is caught before anything is emitted. The item remains the most important open one in this document, because the interface does nothing useful without it. It is not a safety requirement.
 
 So the requirement is three-part:
 
@@ -348,6 +359,14 @@ the two things that have to decide a granularity before a loop exists: the regio
 
 A second consequence: marking a dimension dynamic with no declared range should itself be refused, rather than trusted to be caught downstream. Today that configuration silently miscomputes, and the refusal only arrives once a range exists, which is backwards.
 
+#### The range has to reach every region, not only the first
+
+The re-keying above runs once per compile and covers the graph that has a declared input. A model is not one graph. Both consumer repositories compile one block at a time, so an N-layer model is N regions, and region k's input is region k-1's output, created on the device and never passed through the transfer.
+
+Measured on a chained-region fixture: the symbol crosses the boundary intact and the range does not. Region 2 therefore refuses for want of a ceiling rather than specialising, which is itself the proof that the symbol arrived. The intermediate's buffer is already at the declared maximum, because every structural parameter it was built from resolved to the maximum, so re-declaring that tensor by hand changes nothing. What is missing is the range, not the reservation.
+
+So the reader has a second half. A device-born tensor has to carry enough for the range to be recovered in the region that consumes it, and across a region boundary the tensor is the only available carrier.
+
 #### Where the declaration lives when there is no host tensor
 
 The design constraint raised in review is that this must not be host-tensor-centric: the contract has to be expressible in source, not only as a property carried on a tensor. The eager-versus-traced problem above says the same thing from the implementation side, and both point at separating the **declaration** from the **binding**.
@@ -365,7 +384,7 @@ k = k.to("spyre", dynamic={0: KV})
 v = v.to("spyre", dynamic={0: KV})
 ```
 
-That is what fixes the identity problem, and it is also readable by the bridge at AOT time by identity, which matters because the bridge is a decomposition and cannot call `.to()`. Three carriers, one registry: the transfer interface for graph inputs, a source-level declaration for everything else, and `for_each_tile` taking its tile from the same object instead of a bare literal, which is what would have made the granularity mismatch of Section 10.3 unrepresentable.
+Identity does not strictly require it. Two tensors declared separately and tied with a `torch._check` equality compile to one binary across the range, measured. So the shared object removes a manual step and makes the tie unforgeable rather than enabling something otherwise impossible. What it does enable is the AOT path, because the bridge is a decomposition and cannot call `.to()`, so it needs a declaration it can resolve by identity. Three carriers, one registry: the transfer interface for graph inputs, a source-level declaration for everything else, and `for_each_tile` taking its tile from the same object instead of a bare literal, which is what would have made the granularity mismatch of Section 10.3 unrepresentable.
 
 Both consumer repositories already have a natural home for the declaration. One has a well-established convention of model-level attributes set during device preparation and read by the drivers, so a load-time keyword that is stashed and read at the compile call is declarative and tensor-free. The other has a single place where every input tensor is converted after host padding and before the compiled call.
 
@@ -1234,7 +1253,7 @@ The single granularity above is the **contract** granularity: it defines which s
 
 The second constraint is what keeps the user-facing contract still while the compiler is free to pick a tile that fits the scratchpad, or a smaller one that leaves room to double buffer. A chooser also needs one more rule, from a failure rather than from theory: the contract granularity divided by the execution granularity should be at least 2, so the smallest legal input is provably more than one trip. That removes a whole class of single-tile edge cases without excluding anything from the caller's contract, and Section 13 has the measurement.
 
-Two practical notes on the numbers. The granularity has no floor at a stick: the default minimum is 4, so a dynamic batch with a granularity of 8 or 16 is admissible and the chooser's range is wider than a stick width. And the cap on how many steps fit in a range, `max` divided by `G`, is currently 32, which is a limit inherited from the bucketing design rather than anything this design needs. It is low enough to block the highest-value serving scenario and should be revisited as a constant, not designed around.
+Two practical notes on the numbers. The granularity has no floor at a stick: the default minimum is 4, so a dynamic batch with a granularity of 8 or 16 is admissible and the chooser's range is wider than a stick width. And the cap on how many steps fit in a range, `max` divided by `G`, is currently 32. That cap bounds a real per-call cost and is not an inherited constant, which is how an earlier revision of this section described it. The backend enumerates the candidate correction slots from the declared `max` at compile time, so the slot space is sized by `max` divided by the step and the host walks the surviving entries on every dispatch. The actual size passed only selects which slot is read, never how many exist. So the per-call overhead grows with the declared range divided by the granularity, and raising the cap is a per-call tax rather than a free unlock. Two things follow for a caller. Declaring a tight `max` is a performance decision and not hygiene, and the largest granularity the sizes allow is the cheaper choice at the same range and the same memory. A caller who needs a wide range should raise the granularity before raising the cap.
 
 One correction to "band blind", which is true of the dispatcher and the bundle but not of the chooser. Once there are two granularities, the chooser has to respect the band's contract granularity when picking an execution tile, so the band structure is visible to exactly one component below the dispatcher. Everything else stays blind.
 
@@ -1242,6 +1261,8 @@ One correction to "band blind", which is true of the dispatcher and the bundle b
 ### 11.2 Why the addresses stay static
 
 Tile `i` sits at `base + i * G * row_stride`, and the row stride does not depend on the varying axis. So every tile address is a compile-time constant and a smaller runtime size does not move anything, it only makes fewer tiles live.
+
+Binary reuse follows from the layout rather than from the declaration. Dynamo guards every device tensor entering a graph on its device layout, and a buffer reserved at the maximum presents the same layout at every runtime size, so the guard holds. The declaration's role is to cause the reservation; after that the constant layout does the work. A buffer whose device extents track the runtime size fails that guard and costs a retrace, which is loud and measurable. An intermediate inside a graph is not guarded at all, which is why invariant 11 has to be enforced where the declaration is attached.
 
 **This is a hard prerequisite with no fallback, not an optimisation.** The current backend pipeline
 **refuses** an address correction for a call inside a loop and fails the pass, with a message about
@@ -1323,6 +1344,7 @@ Three rules it has to hold, and the third is the one that was learned rather tha
 - The execution granularity **divides** the contract granularity, so the caller's contract does not move.
 - It fits the scratchpad for that kernel, which is the point of the exercise.
 - The contract granularity divided by the execution granularity is **at least 2**.
+- It is priced, not just fitted. The loop's step is the execution granularity, so a finer execution tile multiplies the correction slot space of Section 11.1 and adds per-call host overhead at every size. The rule above puts that multiplier at 2 or more by construction, so a chooser that only maximises scratchpad fit will trade device time it can see for host time it cannot. Both belong in the objective.
 
 That third rule is worth the space because it buys more than it looks like. It makes the smallest legal input at least two trips, which keeps a trip-count comparison on one side of its boundary for every admissible size. Single-tile inputs are the one remaining rough edge on otherwise-passing scenarios, and they degrade asymmetrically: in map mode a single tile is numerically correct but costs an extra binary, from an upstream contiguity guard rather than from anything of ours, while in reduction mode it is a hard compile error. Making the rule part of the chooser removes both without narrowing the caller's contract by a single size.
 
@@ -1408,6 +1430,8 @@ One finding worth carrying, from ref [#4581](https://github.com/torch-spyre/torc
 ## 15. Integrating with spyre-inference and hf-adapters
 
 Both consumers already pad an input up to a chosen size and already track the real length separately from the padded one, which is the structure this design needs. Integration is mostly replacing a list of sizes with a range.
+
+One structural point that changes the scope of that work. Both compile one block at a time rather than the whole model, so a model is N compiled regions and the declaration has to serve all of them and not only the region holding the transferred tensor. Section 7.3. Both also apply at least one eager operation between regions, and an eager allocation is sized to the call, so a tensor crossing a boundary that way loses both its reservation and its symbol and the region after it specialises.
 
 ### 15.1 What changes on the consumer side
 
@@ -1784,6 +1808,14 @@ of the procedure, not an optimisation: that cache is not cleared by the obvious 
 wrapper makes a pass change look like it is not running.
 
 ## 20. Risks and open items
+
+**Three failures that block a real model before the interface is exercised.** All three are implementation defects rather than design questions, and all three surfaced from running a chained-region fixture rather than from inspection.
+
+Cloning a declared tensor raises a constraint violation. The transfer marks the dimension with the strict form of the marker, while the device-to-device copy is an internal compiled op whose stated purpose is one binary per exact shape, so the two contradict each other directly. One consumer clones once per layer and that clone is mandatory there, so under a declaration it fails outright rather than specialising. The non-strict marker is the candidate fix and needs measuring, since it also weakens what it marks.
+
+A Python float captured by a tiled body is lifted into the scan subgraph and refused, because the higher-order op accepts tensors and integers only. Every compiled block in one consumer passes an attention scale explicitly, and that scale cannot be dropped without breaking head-padded models, so this is universal rather than occasional. A zero-dimensional tensor is the available substitute and one model in that repository already uses the pattern for an unrelated reason.
+
+The query tile selection in the attention decomposition calls an integer-only method on the sequence length. Section 5.3.
 
 **The widest risk: any pass that keys on something tiling moves.** This is the one to carry forward, because it has already produced two confirmed bugs and it will keep producing them one real model at a time. Moving an op inside a loop body changes its resolved name, its layout context and the extent visible on its operands. Any compiler pass that keys a decision on one of those can silently change its mind about an op that did not change.
 
