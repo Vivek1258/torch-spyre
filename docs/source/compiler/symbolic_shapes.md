@@ -78,9 +78,7 @@ flowchart TB
 
 The varying size must not reach address arithmetic, and the reason is stronger than it first appears.
 
-Addresses are already runtime symbols, and an earlier version of this document said the host patches
-them when the allocation changes, which is rare. That is wrong, and the correction makes the case for
-this design rather than weakening it. **There is no per-allocation patching in the pipeline at all.**
+Addresses are already runtime symbols. **There is no per-allocation patching in the pipeline.**
 Correction is a ComputeOnHost command inside the job plan and it runs on **every dispatch**, in three
 pieces: a host patch of the program image, a transfer of the patched tensor to the device, and a
 device scatter program with its dummy. Only symbols already constant at the call site are lifted out
@@ -192,13 +190,13 @@ Adds SDPA and the Phase 1 ops on the sequence axis. Sequence length varies per r
 
 Technically deeper, and partly already done, so it is worth separating what is hard from what has simply not been attempted.
 
-**Already working.** The flash-style inner loop over a symbolic KV length runs on one binary at 256, 384 and 512, carrying three running values, in a single bundle. That is the piece this section used to call the core of Phase 2, and it was never a design limit: the blocker turned out to be a whole-operand transfer inside the loop that carried the full symbolic extent instead of the declared maximum. So the cross-tile machinery for attention exists and is exercised.
+**Already working.** The flash-style inner loop over a symbolic KV length runs on one binary at 256, 384 and 512, carrying three running values, in a single bundle. That is the piece commonly taken to be the core of Phase 2, and it was never a design limit: the blocker was a whole-operand transfer inside the loop that carried the full symbolic extent instead of the declared maximum. So the cross-tile machinery for attention exists and is exercised.
 
 **The real Phase 2 obstacle is allocation, not reduction.** The sequence sits under the batch dimension, so every stride above it is computed from its maximum and the tensor has to be stored sparsely at max stride. That is the nested allocation question, and it is the one thing the reservation layer does not do today: the reservation call takes a dimension to reserve and the wrapper passes 0, so a dynamic dimension anywhere else is simply not reserved and its device geometry tracks the runtime size. A dynamic sequence therefore needs that one parameter plumbed through before anything else in this phase can be judged. Section 9.3 has the same conclusion arrived at from the matmul side.
 
 **Still genuinely open.** The sequence sits on both axes of the score matrix, so one symbol has to tile through two axes of the same operand, and the encoder case is square and therefore harder than the decoder's two independent dimensions. The attention decomposition also computes block counts with plain integer arithmetic, which will silently specialise a symbolic length rather than fail, so every such site has to be found and made symbol-safe. One site is worse than that: the query tile selection calls an integer-only method on the length and raises outright, so it is reached before any of the silent ones.
 
-**Settled, and it is cheaper than this section used to claim.** Online softmax does **not** need a second pass over the data. The working implementation carries a running maximum, a running denominator and an accumulator through the loop, and then divides the accumulator by the denominator **once, after the loop**, on the output tile. That is one elementwise divide on a tile-sized buffer, not a second traversal of the KV data. So the normalisation cost is negligible and the carry copy is the only real cost in this phase.
+**Online softmax needs no second pass over the data.** The working implementation carries a running maximum, a running denominator and an accumulator through the loop, and then divides the accumulator by the denominator **once, after the loop**, on the output tile. That is one elementwise divide on a tile-sized buffer, not a second traversal of the KV data. So the normalisation cost is negligible and the carry copy is the only real cost in this phase.
 
 ## 6. Where a symbol may legally live
 
@@ -271,7 +269,7 @@ Core division is not on that list. Work division operates on the loop body, whic
 
 On invariant 2, the earlier symbolic-SDSC route did the opposite: the symbolic dimension stayed inside one op's iteration space and the SDSC was emitted at the maximum. With an explicit loop the body op is tile-sized, so nothing symbolic reaches the SDSC.
 
-Four more invariants, all read out of the backend source rather than negotiated, and none of them was in earlier versions of this document.
+Four more invariants, read out of the backend source rather than negotiated.
 
 | # | Invariant | Where it comes from |
 |---|---|---|
@@ -312,7 +310,7 @@ Today only the first survives. The buffer is reserved at the max and the dimensi
 
 The consequence is a refusal. With the range undeclared the trip count reaches codegen as a symbol with no finite upper bound, and the extent computation refuses because there is nothing to size the tiled dimension against. The message names the symbol and says to declare the range in the traced region. Verified on a four-region chain written without the in-region declaration: it refuses at the first region.
 
-An earlier revision of this section argued the consequence was a silent wrong answer, a correctly shaped tensor whose rows past the warm-up size are garbage. That is not what happens, and the reason is structural: geometry built from the declared maximum reaches the SDSC through a path that demands a finite bound, so its absence is caught before anything is emitted. The item remains the most important open one in this document, because the interface does nothing useful without it. It is not a safety requirement.
+The refusal is structural rather than incidental: geometry built from the declared maximum reaches the SDSC through a path that demands a finite bound, so its absence is caught before anything is emitted. The item is still the most important open one here, because the interface does nothing useful without it.
 
 So the requirement is three-part:
 
@@ -320,7 +318,7 @@ So the requirement is three-part:
 2. mark the dimension, which already happens,
 3. **record the contract where the compiler can read it.** Without this the interface is decorative.
 
-#### How the third part is carried. Settled 5 Oct 2025
+#### How the third part is carried
 
 The declaration lives in **one** place, a map on the device tensor, written by the transfer call:
 
@@ -335,7 +333,7 @@ is paired with the real tensor it came from and the contract is filed under the 
 in that dimension. From there everything downstream asks by symbol name, because by then the
 tensor is gone.
 
-Two things about that choice are load-bearing and were both arrived at the hard way.
+Two things about that choice are load-bearing.
 
 **It has to be a field on the tensor, not a side table keyed by the tensor.** A Python dictionary
 keyed by object identity was the first design. Dynamo's tensor-guard path goes through `.detach()`,
@@ -468,9 +466,8 @@ The three address parameters are on every bundle today and `symbol_ids` carries 
 
 #### A non-empty `symbol_ids` is not a violation, and not a cost signal
 
-This needs saying plainly, because an earlier version of this document used "an empty symbol list"
-as shorthand for "addresses are static", and that shorthand is wrong in a way that leads a reader to
-the opposite of the right conclusion. By that test every bundle ever emitted violates the design,
+"An empty symbol list" is not a test for "addresses are static", and reading it that way leads to
+the opposite of the right conclusion: by that test every bundle ever emitted violates the design,
 since none of them has an empty list.
 
 Two different things are both called symbols in this area.
@@ -488,9 +485,8 @@ be **recomputed from the runtime size** cannot be resolved at the call site, and
 in the per-dispatch correction of Section 16.3.
 
 So when reviewing a bundle or an SDSC, the question is never "is the symbol list empty". It is
-whether any address or stride is a function of the varying dimension. Reading a populated
-`symbol_ids` or an `isStartAddrSymbolic_: 1` as evidence of a violation is a mistake this document
-has now made once and it should not be made again.
+whether any address or stride is a function of the varying dimension. A populated `symbol_ids` or an
+`isStartAddrSymbolic_: 1` is not evidence of a violation.
 
 One thing left open deliberately. The exact conditions under which the backend materialises a
 program correction, as opposed to resolving a symbol at the call site, are theirs and we have not
@@ -513,9 +509,8 @@ It is the contract, written once where both sides read it. `granularity` says wh
 
 #### Two loops on one dimension, and where the declared granularity comes from
 
-An earlier version of this section said the form "lets one dimension parameter drive two loops with
-different tile sizes, because each derives its own count". That is half right and the half it gets
-wrong is a wrong-answer trap, so it is worth stating properly.
+The form appears to let one dimension parameter drive two loops with different tile sizes, each
+deriving its own count. That is half true, and the half that is not is a wrong-answer trap.
 
 The **MLIR mechanics** do support it. The bound is the same `%dim_s0` for both loops and each
 carries its own `step` constant, so each derives its own count with no extra machinery.
@@ -811,11 +806,11 @@ A matmul is the op where the generic rule has to be stated carefully, because it
 | K, the contraction | a reduction axis by definition | reduction | **works on one binary, but only in one layout.** See below |
 | the batch of a `bmm` | an outer axis above both | map | same as M |
 
-The K case is the interesting one and the earlier version of this document got it wrong, so it is worth being precise. A dynamic contraction axis was recorded as structurally impossible. It is not. Supplying `A` transposed, as `[K, M]`, so that K is **dim 0 of both operands**, reaches one binary across the whole range with correct numbers. Leaving K as A's inner dimension emits a binary per size.
+The K case needs stating precisely, because a dynamic contraction axis looks structurally impossible and is not. Supplying `A` transposed, as `[K, M]`, so that K is **dim 0 of both operands**, reaches one binary across the whole range with correct numbers. Leaving K as A's inner dimension emits a binary per size.
 
-The reason is the useful part, because it generalises past matmul. Nothing about reduction mode was the obstacle. The obstacle was that with K inner, the marked dimension is not the dimension the buffer was **reserved** along, so `stride(0)` is computed from the symbol, and a stride derived from the varying size is exactly what invariant 1 forbids. Move K to dim 0 and the stride becomes a constant again.
+The reason generalises past matmul. Reduction mode is not the obstacle. The obstacle is that with K inner, the marked dimension is not the dimension the buffer was **reserved** along, so `stride(0)` is computed from the symbol, and a stride derived from the varying size is what invariant 1 forbids. Move K to dim 0 and the stride is a constant again.
 
-So the law is not "the varying axis must be outermost", which is how this was first written and which was right for the wrong reason. The law is:
+So the law is not "the varying axis must be outermost". It is:
 
 > **The marked dimension must be the dimension the buffer was reserved along.**
 
@@ -1080,25 +1075,23 @@ type-checks for. If that is what happens, the reload path refuses a loop it had 
 code interpreting such a value must accept every spelling the round trip can produce, at **one**
 interpretation point.
 
-#### Where the declared granularity actually comes from. Settled 5 Oct 2025
+#### Where the declared granularity comes from
 
-An earlier version of this section said the granularity is inferred from the symbol's derived lower
-bound, that a bound can be raised by an unrelated op's guard during tracing, and that Section 7.3
-was where the fix belonged. The first two are correct and that is exactly how a bundle came to
-declare 128 while its loop stepped 64. The conclusion was wrong.
+Inferring the granularity from the symbol's derived lower bound does not work. That bound can be
+raised by an unrelated op's guard during tracing, which is how a bundle came to declare 128 while
+its loop stepped 64.
 
-The fix is not to read the declared contract here. It is that **the granularity is already in the
-trip count**. A region is built with `for_each_tile(tile_size=G)`, so the count arrives as
+The declared contract is not the answer either. **The granularity is already in the trip count.** A region is built with `for_each_tile(tile_size=G)`, so the count arrives as
 `FloorDiv(s, G)` and the emitter extracts `G` from it exactly, with no inference and no choice to
 make. The bundle's `granularity=` and the loop's own `step` then come from the same expression and
 cannot disagree.
 
-That is strictly better than reading a better source, because it makes the mismatch
-**unrepresentable** rather than merely unlikely. It is the same reasoning as handing
-`for_each_tile` its tile size from the declared contract rather than a bare literal.
+That makes the mismatch **unrepresentable** rather than merely unlikely, which is the same
+reasoning as handing `for_each_tile` its tile size from the declared contract rather than a bare
+literal.
 
-Two consequences. The old inference path, `compute_granularity` reading a derived lower bound,
-serves only the older symbolic-SDSC route and the loop route never calls it. And the contract is
+Two consequences. The inference path, `compute_granularity` reading a derived lower bound, serves
+only the older symbolic-SDSC route and the loop route never calls it. And the contract is
 not on the critical path for the mechanism at all. It is needed only where a granularity must be
 chosen **before** a loop exists, which is the region builder and the host check. Sections 7.3
 and 7.5.
@@ -1130,7 +1123,7 @@ def forward(x, W1, g, b, W2):
     return n @ W2
 ```
 
-**Stage 1, the annotation.** `x = x.to("spyre", dynamic={0: dict(min=64, max=512, granularity=64)})`. The buffer is allocated with capacity for 512 rows. The device layout that comes back is sized from the maximum and not from the first call: a stick split plus layout axes giving `device_size=[2, 512, 64]` with `stride_map=[64, 128, 1]`. The 512 is the declared max. Had it been the warm-up size, every later size would have needed its own binary, and that failure mode has appeared three separate times in this work, each time as "sized from the hint, not the max".
+**Stage 1, the annotation.** `x = x.to("spyre", dynamic={0: dict(min=64, max=512, granularity=64)})`. The buffer is allocated with capacity for 512 rows. The device layout that comes back is sized from the maximum and not from the first call: a stick split plus layout axes giving `device_size=[2, 512, 64]` with `stride_map=[64, 128, 1]`. The 512 is the declared max. Had it been the warm-up size, every later size would have needed its own binary.
 
 `W1`, `g`, `b` and `W2` are moved plainly and never marked. The audit confirms this holds: through the whole region exactly one graph input is symbolic, the activation, and no weight or bias geometry depends on the varying size.
 
@@ -1156,11 +1149,11 @@ norm_mean = spyre.layernormscale(mean, eps)
 out       = spyre.layernormnorm(input, mean, norm_mean, weight, bias)
 ```
 
-with ones and zeros substituted if `weight` or `bias` is absent. Two consequences fall straight out of that listing. `layernormscale` takes the *mean*, not the affine parameters, so it is the epsilon scale and not the scale-and-shift. And because the decomposition substitutes defaults, an `elementwise_affine=False` norm produces the **same three ops** plus a constant fill, so it is not a simpler path. Both of those were learned the expensive way.
+with ones and zeros substituted if `weight` or `bias` is absent. Two consequences fall straight out of that listing. `layernormscale` takes the *mean*, not the affine parameters, so it is the epsilon scale and not the scale-and-shift. And because the decomposition substitutes defaults, an `elementwise_affine=False` norm produces the **same three ops** plus a constant fill, so it is not a simpler path. Neither is obvious from the op signature.
 
 **Stage 5, scan to WhileLoop.** `for_each_tile` builds a combine function and calls `scan`, which decomposes to the WhileLoop IR. The trip count arrives as `FloorDiv(s33, 64)`.
 
-**Stage 6, `splice_while_loops`.** The body is inlined and `loop_info` is stamped on every stage of it. This is the moment the invariant of Section 3 becomes literal: after the splice, every extent inside the body is the concrete 64, and `s33` survives in exactly one place, the loop's trip count. Anything that still holds a symbolic extent at this point is a bug, and the audit that checks it has to look at graph inputs and their device layouts as well as the operations, because an earlier version walked only the operations and reported a clean state while a load was reading a symbolic stride.
+**Stage 6, `splice_while_loops`.** The body is inlined and `loop_info` is stamped on every stage of it. This is the moment the invariant of Section 3 becomes literal: after the splice, every extent inside the body is the concrete 64, and `s33` survives in exactly one place, the loop's trip count. Anything that still holds a symbolic extent at this point is a bug, and an audit that checks it has to look at graph inputs and their device layouts as well as the operations: walking the operations alone reports a clean state while a load is reading a symbolic stride.
 
 **Stage 7, stickification and layouts.** The body is a concrete 64 x 256 tile, so layouts are chosen exactly as for a static kernel. This is where the region's one genuine difficulty lives. `layernormnorm` is a multi-argument op whose operands do not share an element arrangement:
 
@@ -1253,7 +1246,7 @@ The single granularity above is the **contract** granularity: it defines which s
 
 The second constraint is what keeps the user-facing contract still while the compiler is free to pick a tile that fits the scratchpad, or a smaller one that leaves room to double buffer. A chooser also needs one more rule, from a failure rather than from theory: the contract granularity divided by the execution granularity should be at least 2, so the smallest legal input is provably more than one trip. That removes a whole class of single-tile edge cases without excluding anything from the caller's contract, and Section 13 has the measurement.
 
-Two practical notes on the numbers. The granularity has no floor at a stick: the default minimum is 4, so a dynamic batch with a granularity of 8 or 16 is admissible and the chooser's range is wider than a stick width. And the cap on how many steps fit in a range, `max` divided by `G`, is currently 32. That cap bounds a real per-call cost and is not an inherited constant, which is how an earlier revision of this section described it. The backend enumerates the candidate correction slots from the declared `max` at compile time, so the slot space is sized by `max` divided by the step and the host walks the surviving entries on every dispatch. The actual size passed only selects which slot is read, never how many exist. So the per-call overhead grows with the declared range divided by the granularity, and raising the cap is a per-call tax rather than a free unlock. Two things follow for a caller. Declaring a tight `max` is a performance decision and not hygiene, and the largest granularity the sizes allow is the cheaper choice at the same range and the same memory. A caller who needs a wide range should raise the granularity before raising the cap.
+Two practical notes on the numbers. The granularity has no floor at a stick: the default minimum is 4, so a dynamic batch with a granularity of 8 or 16 is admissible and the chooser's range is wider than a stick width. And the cap on how many steps fit in a range, `max` divided by `G`, is currently 32. That cap bounds a real per-call cost rather than being an inherited constant. The backend enumerates the candidate correction slots from the declared `max` at compile time, so the slot space is sized by `max` divided by the step and the host walks the surviving entries on every dispatch. The actual size passed only selects which slot is read, never how many exist. So the per-call overhead grows with the declared range divided by the granularity, and raising the cap is a per-call tax rather than a free unlock. Two things follow for a caller. Declaring a tight `max` is a performance decision and not hygiene, and the largest granularity the sizes allow is the cheaper choice at the same range and the same memory. A caller who needs a wide range should raise the granularity before raising the cap.
 
 One correction to "band blind", which is true of the dispatcher and the bundle but not of the chooser. Once there are two granularities, the chooser has to respect the band's contract granularity when picking an execution tile, so the band structure is visible to exactly one component below the dispatcher. Everything else stays blind.
 
@@ -1369,8 +1362,8 @@ document should be read without it.
 | **sequence** | softmax over the key sequence, the value product and pooling all land on it at once. Needs a carry across iterations and a defined pad, so it is Phase 2 |
 | **hidden**, or a head dimension | every reduction in the model is over these. Not a target |
 
-Phase 1 is dim 0 for two independent reasons that happen to agree, and conflating them has already
-cost us. The buffer is reserved along dim 0 because the reservation call is passed a literal zero,
+Phase 1 is dim 0 for two independent reasons that happen to agree, and they are worth keeping
+apart. The buffer is reserved along dim 0 because the reservation call is passed a literal zero,
 which is a current limitation. And dim 0 is where batch and token counts sit in the layouts the
 consumers use, which is the axis that is actually clean. The first is fixable in one line, the
 second is a property of transformers. Section 9.3 is the measurement that separated them.
@@ -1510,11 +1503,8 @@ The dynamic tensor's buffer needs capacity for the declared maximum, and for an 
 
 At dispatch the runtime binds base addresses and the real size into the argument slots. Ref [#4964](https://github.com/torch-spyre/torch-spyre/issues/4964), superseding [#221](https://github.com/torch-spyre/torch-spyre/issues/221).
 
-An earlier version of this section said most of this already exists and that the dispatch path
-already binds a dimension from a launch tensor. That was too generous, and the correction matters
-because it moves a real item onto the critical path.
-
-What exists is the **shape** of the mechanism, not the mechanism. The symbolic-argument kind for a
+What exists is the **shape** of the mechanism, not the mechanism, and the difference puts a real
+item on the critical path. The symbolic-argument kind for a
 dimension is defined, the payload struct carries both a tensor index and a dimension index, and the
 header documents what the dimension kind is for. What does **not** exist is the resolution: the
 launch path asserts `kind == kAddress` and refuses a dimension argument with
@@ -1556,9 +1546,9 @@ Base addresses are patched either way, that is normal and it is not what this de
 
 What crosses the boundary is the size, not the count, for the reason in Section 7.5. **We author no division.** The bundle emits `to <dim> step <G>` and the device derives the trip count itself.
 
-An earlier version of this section said the bundle derives the bound with a `ceildivsi` which deeptools was adding. That is wrong twice over and the correction matters, because the wrong version would send the loop down a different backend path.
+A `ceildivsi` as the bound would send the loop down a different backend path, and it is worth being precise about why, because the operation is not rejected outright.
 
-A `ceildivsi` is not rejected outright: it round-trips correctly inside a **symbol expression**, which is a different channel. What it cannot be is the `scf.for` bound itself. The instruction that builds the device loop counter switches on the bound's defining operation, and only a constant, a query-map result or a symbol-creation result becomes a true symbolic loop count. Anything else, a `ceildivsi` included, falls through to a generic dynamic-loop path. So "author no divide" is still right, and the reason is which operation the bound is, not a reject list.
+A `ceildivsi` it round-trips correctly inside a **symbol expression**, which is a different channel. What it cannot be is the `scf.for` bound itself. The instruction that builds the device loop counter switches on the bound's defining operation, and only a constant, a query-map result or a symbol-creation result becomes a true symbolic loop count. Anything else, a `ceildivsi` included, falls through to a generic dynamic-loop path. So "author no divide" is still right, and the reason is which operation the bound is, not a reject list.
 
 #### What the device side already does
 
@@ -1584,8 +1574,6 @@ That turns max-strided reservation from an optimisation into a **hard prerequisi
 Loop support is tracked on the deeptools side as two options, by repeating programs ([#1520](https://github.com/torch-spyre/torch-spyre/issues/1520)) and by program looping with a symbolic bound ([#1522](https://github.com/torch-spyre/torch-spyre/issues/1522)). The second is the one this design needs. Our ask [#4397](https://github.com/torch-spyre/torch-spyre/issues/4397) describes the same capability plus a request for an example bundle and SDSC pair, so it likely folds into #1522, ref [#4380](https://github.com/torch-spyre/torch-spyre/issues/4380).
 
 #### The cost argument, stated correctly
-
-The per-dispatch cost claim needs restating, and the honest version is **stronger** than the one this document used to make.
 
 There is no per-allocation patching cache. The correction is a host-compute command inside the job plan, so when it exists it runs on **every dispatch of that job**, in three parts: a host patch that evaluates every symbol and rewrites every location, a transfer of the patched tensor to the device, and a device scatter program with its companion. Only symbols already constant at the call site are lifted out, at compile time. So keeping addresses independent of the varying size does not avoid an occasional patch, it removes an unconditional per-dispatch cost in its entirety. The design goal is that no address is a function of the varying dimension, which is not the same as a bundle carrying no symbols. Section 7.5.
 
@@ -1638,7 +1626,7 @@ for the project rather than a sequence of improvements.
 | **A.2** | the ergonomics: the contract reader, the automatic region builder, and the in-trace assertions, so a model needs no code change | front end | ~2200 lines |
 | **R** | the host admissibility check with a usable message | guards | small |
 
-One sequencing decision is worth stating because an earlier version of this plan had it wrong. The
+One sequencing decision is worth stating explicitly. The
 declaration channel sits **inside** this gate and not in the guard stage that follows. It is not a
 guard. Without it the documented interface compiles, reuses one binary, refuses nothing, warns
 nothing, and returns garbage above the warm-up size. A path that lacks it is not shippable even as a
@@ -1710,8 +1698,7 @@ Stage 1 makes it work and makes it honest. Stage 2 makes the **failure modes** g
 
 Two specifics for this stage, both from measurement. A non-conforming size currently surfaces as a fake-tensor error from deep inside the tracer, which is a diagnosis task rather than a message. And the host validator has to check **every** marked dimension, not one: a split-K kernel reads its trip count from one operand's dimension while nothing validates the other, so a mismatch between two marked operands is not caught by checking either in isolation.
 
-And the reason this gates exposure is stronger than a message-quality argument, which is how it was
-first written. A size that fails a guard does not simply raise. It triggers a recompile, and when a
+The reason this gates exposure goes beyond message quality. A size that fails a guard does not simply raise. It triggers a recompile, and when a
 frame exceeds PyTorch's recompile limit, PyTorch marks that frame **skipped and discards every
 compiled entry for it permanently**. So a client sending a handful of non-conforming sizes does not
 get a handful of errors, it takes the model off the device path for the life of the process, which
@@ -1749,7 +1736,7 @@ That runs with no hardware and is how the front end is proven before the deeptoo
 
 #### This is not a hypothetical trap
 
-It has happened repeatedly during this work, and in the measurement tooling rather than in the compiler, which is what makes the rule above worth enforcing instead of merely stating. Six instances, all the same family:
+Six instances in the measurement tooling, all the same family:
 
 - bundle counting that could report binary reuse that did not happen, which is the project's headline claim,
 - probe cases that returned a fixed verdict and could never fail,
@@ -1817,14 +1804,11 @@ A Python float captured by a tiled body is lifted into the scan subgraph and ref
 
 The query tile selection in the attention decomposition calls an integer-only method on the sequence length. Section 5.3.
 
-**The widest risk: any pass that keys on something tiling moves.** This is the one to carry forward, because it has already produced two confirmed bugs and it will keep producing them one real model at a time. Moving an op inside a loop body changes its resolved name, its layout context and the extent visible on its operands. Any compiler pass that keys a decision on one of those can silently change its mind about an op that did not change.
-
-Two instances so far, both found on real models rather than by inspection, and **both now fixed**.
-Neither pass was wrong on its own. Both were correct until composed with the loop.
+**The widest risk: any pass that keys on something tiling moves.** Moving an op inside a loop body changes its resolved name, its layout context and the extent visible on its operands. Any compiler pass that keys a decision on one of those can silently change its mind about an op that did not change. Two confirmed instances so far, **both fixed**, and neither pass was wrong on its own: both were correct until composed with the loop.
 
 A whole-operand transfer inside the loop carried the full symbolic extent instead of the declared
-maximum, which broke attention and transposed split-K. It surfaced a long way downstream as
-"symbolic stick dim is not supported yet", which sent us after layouts for a session. The fix
+maximum, which broke attention and transposed split-K. It surfaces a long way downstream as
+"symbolic stick dim is not supported yet", which points at layouts rather than at the cause. The fix
 concretises a loop-invariant whole-operand copy to the declared maximum, which is valid at every
 runtime size because the reservation has already padded the buffer to it.
 
@@ -1833,21 +1817,18 @@ because a subgraph buffer's origin resolves to the enclosing loop's node, so eve
 tiled body is named for the loop. The exemption that exists specifically to permit layer norm could
 therefore never fire. The fix asks the whole origin **set** rather than the one resolved name, which
 is also order-free, since the origin collection is unordered and picking "the first non-loop origin"
-would make a compile decision depend on iteration order. Confirmed on device by a dump of the
-inspected op: skip-by-name false, skip-by-origin true, arrangements incompatible so it had to be
-exempted or raise.
+would make a compile decision depend on iteration order.
 
 The response to the class is an audit rather than a bug at a time. The name-keyed decision sets are
 the place to start, and the general question to ask of each pass is whether its key still means the
 same thing for a buffer inside a subgraph.
 
-**The reload path is a second class with the same shape, and it has bitten four times.** An object
+**The reload path is a second class with the same shape.** An object
 round-trips through *generated source*: the compiler writes a Python file and the file is
 re-executed later. The round trip silently loses a field or a type, and the bug never shows in a
 direct test, only on the reload. A value that has to survive needs four things and missing any one
 is a defect: the field, the provenance-schema entry, the **cache-key** entry and the serializer
-line. Section 10.3 has the two live instances, one confirmed missing and one suspected type change
-through sympy's own re-parsing of `//`.
+line. Section 10.3 has the two live instances.
 
 **A size comparison inside a tiled construct is a guard on the symbol.** The tiling helper used by
 the SDPA decomposition short-circuits with `if sliced_operand.size(sliced_dim) == tile_size` and
@@ -1913,9 +1894,9 @@ Sizes 128, 256, 320, 448 and 512 unless stated, with 320 as the warm-up. "One bi
 | A size equal to one granularity | map mode: correct, one extra binary. Reduction mode: hard compile error. Section 13 |
 | A marked dimension with **no** declared range | compiles, one binary, **silently wrong** above the warm-up size. Section 7.3 |
 
-### A.3 What the device runs cost us to learn
+### A.3 Results that changed the design
 
-Four results that changed the design rather than confirming it, kept because each one was expensive and none is obvious.
+Five results that changed the design rather than confirming it. None is obvious from the code.
 
 **Geometry has to come from the declared maximum, everywhere.** Three separate scenarios failed above the warm-up size because something had been sized from the first call's hint instead of the declared maximum. It is the same defect each time and it is always invisible at the warm-up size.
 
@@ -1927,22 +1908,20 @@ Four results that changed the design rather than confirming it, kept because eac
 
 **A tile-local op can be refused for a reason that has nothing to do with the varying axis.** The
 aten `layer_norm` path failed inside a tiled body and the failure looked like a layout problem.
-Bisection **inverted** the prediction that had been written down: the version with no affine
-parameters still failed, and a hand-written mean, variance and reciprocal square root **with**
-affine passed. That eliminated the reduction and the affine broadcast from both directions at once
-and left only the decomposition, which is what led to the name-resolution cause in Section 20.
+Bisection inverted the obvious prediction: the version with no affine parameters still failed, and
+a hand-written mean, variance and reciprocal square root **with** affine passed. That eliminated the
+reduction and the affine broadcast from both directions at once and left only the decomposition,
+which is the name-resolution cause in Section 20.
 
-Two process lessons came out of it and both have been paid for. A two-outcome prediction table has
-now missed the actual outcome twice, so the "neither" case has to be enumerated before the run.
-And a diagnostic placed at a level that never emitted was briefly read as evidence about the thing
-it was meant to measure: the logger defaults mean a decisive diagnostic belongs at warning level,
-gated behind an environment variable, and nothing else can be trusted to appear.
+Two procedural points follow. A two-outcome prediction table has to enumerate the "neither" case
+before the run. And a decisive diagnostic belongs at warning level behind an environment variable,
+because the logger defaults mean anything quieter never emits and its silence then reads as
+evidence.
 
-**Untiled is refused, and a refusal message was read as a capability.** A stock pointwise model
-with a marked dimension and no region was recorded in three documents as compiling and running
-across the range with no code changes. Measured, it is refused at every size, because an untiled
-symbolic dimension takes the older route of Section 6.1 and that route is gated at the compile
-boundary. The claim came from reading a work-division refusal that describes which ops *that pass*
-accepts and says nothing about what the compile boundary does afterwards. There is no
+**Untiled is refused.** A stock pointwise model with a marked dimension and no region looks like it
+should compile and run across the range with no code changes. Measured, it is refused at every size,
+because an untiled symbolic dimension takes the older route of Section 6.1 and that route is gated at
+the compile boundary. The work-division refusal that appears to permit it describes which ops *that
+pass* accepts and says nothing about what the compile boundary does afterwards. There is no
 zero-code-change path until the region builder lands.
 | one compile, several sizes | served 8, 12, 16 and 40 correctly, refused 10 | the symbolic trip count works, and the divisibility guard is inherited from the reshape |
