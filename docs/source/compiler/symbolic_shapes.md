@@ -130,7 +130,7 @@ Three consequences, and the rest of the document works them out.
 
 This is measured rather than argued. One binary serves 128, 256, 320, 448 and 512 for pointwise work, for two operands both marked, for a matmul with a varying outer axis, for nested loops, for a reduction inside the tile body, and for a seven-stage `nn.Module` region that includes two matmuls with a tile-sized intermediate, a layer norm and a residual branch. Attention runs on one binary at 256, 384 and 512 with a three-value carry. Weights stay static throughout, and a size that is not a multiple of the granularity is refused rather than quietly truncated.
 
-One correction to how this was first stated, because it affects Phase 2 planning. The constraint is not that the varying axis must be **outermost**. It is that the varying axis must be the one the buffer was **reserved** along, which today is dim 0 only because the reservation wrapper passes 0 as a literal. Section 9.3 has the evidence, a dynamic contraction axis that works when the layout puts it at dim 0 of both operands and emits a binary per size when it does not.
+The constraint is not that the varying axis must be **outermost** in the abstract. It is that the axis must be the one the buffer was **reserved** along, and the reservation accepts any axis that is effectively outermost in the host layout, meaning every dimension above it is of size 1. An axis with a real extent above it is refused at the transfer, because the device layout cannot describe a padded axis sitting underneath one, and the innermost axis is refused outright, since padding a stick dimension changes the stride map for every dimension above it. Invariant 13. Section 9.3 has the matmul evidence, a dynamic contraction axis that works when the layout puts it at dim 0 of both operands and emits a binary per size when it does not.
 
 ## 4. Reusing PyTorch's symbolic machinery
 
@@ -192,9 +192,13 @@ Technically deeper, and partly already done, so it is worth separating what is h
 
 **Already working.** The flash-style inner loop over a symbolic KV length runs on one binary at 256, 384 and 512, carrying three running values, in a single bundle. That is the piece commonly taken to be the core of Phase 2, and it was never a design limit: the blocker was a whole-operand transfer inside the loop that carried the full symbolic extent instead of the declared maximum. So the cross-tile machinery for attention exists and is exercised.
 
-**The real Phase 2 obstacle is allocation, not reduction.** The sequence sits under the batch dimension, so every stride above it is computed from its maximum and the tensor has to be stored sparsely at max stride. That is the nested allocation question, and it is the one thing the reservation layer does not do today: the reservation call takes a dimension to reserve and the wrapper passes 0, so a dynamic dimension anywhere else is simply not reserved and its device geometry tracks the runtime size. A dynamic sequence therefore needs that one parameter plumbed through before anything else in this phase can be judged. Section 9.3 has the same conclusion arrived at from the matmul side.
+**The real Phase 2 obstacle is allocation, not reduction.** The sequence sits under the batch dimension, so every stride above it is computed from its maximum and the tensor has to be stored sparsely at max stride. That is the nested allocation question and it is the one thing the reservation layer does not do today. The reservation does take the dimension to reserve, and it does reserve along it, but it refuses an axis with a real extent above it, because the device layout cannot describe a padded axis underneath one. So a dynamic sequence works while the batch is one and is refused as soon as the batch is real, which is the shape every serving workload has. Invariant 13, and Section 9.3 reaches the same conclusion from the matmul side.
 
-**Still genuinely open.** The sequence sits on both axes of the score matrix, so one symbol has to tile through two axes of the same operand, and the encoder case is square and therefore harder than the decoder's two independent dimensions. The attention decomposition also computes block counts with plain integer arithmetic, which will silently specialise a symbolic length rather than fail, so every such site has to be found and made symbol-safe. One site is worse than that: the query tile selection calls an integer-only method on the length and raises outright, so it is reached before any of the silent ones.
+**Still genuinely open.** The sequence sits on both axes of the score matrix, so one symbol has to tile through two axes of the same operand, and the encoder case is square and therefore harder than the decoder's two independent dimensions.
+
+The attention decomposition's tile selection is the other open item, and it is one defect rather than a family. The strategy **searches** the extent for a count whose quotient is an exact divisor, then recovers the tile size by dividing the extent by that count. A search over the divisors of a symbol cannot run, and the recovered size is a symbol rather than a literal, so the first thing a symbolic length reaches is a deduplication set keyed on that recovered size, which refuses because a symbol is not hashable. The integer-only method on the length and the parity test on the batch sit behind it and are never reached.
+
+So the fix is the direction of derivation, not a sweep for unsafe arithmetic: **declare the tile size and let the count be the consequence**. Patching the search alone does not help, because the call sites divide the extent by the count to recover the size again. This is the same correction that Section 8.2's view spellings make for the same reason, where trimming to a whole number of tiles before splitting is what keeps the extent a literal instead of re-deriving it as the extent divided by the count.
 
 **Online softmax needs no second pass over the data.** The working implementation carries a running maximum, a running denominator and an accumulator through the loop, and then divides the accumulator by the denominator **once, after the loop**, on the output tile. That is one elementwise divide on a tile-sized buffer, not a second traversal of the KV data. So the normalisation cost is negligible and the carry copy is the only real cost in this phase.
 
@@ -263,7 +267,7 @@ Core division is not on that list. Work division operates on the loop body, whic
 | 1 | No address or stride is **computed from** the varying dimension | an address derived from the size has to be recomputed on every call, which is what creates a per-dispatch program correction. Note the invariant is about derivation, not about whether the bundle carries symbols: base addresses are symbolic on every bundle and that is free. Section 7.5 |
 | 2 | **The SDSC describes one tile and is fully static** | the tile is the loop body, so its geometry is the tile size. The maximum belongs in the bundle argument and in the HBM layout, not in the SDSC |
 | 3 | The runtime size is within range and a multiple of the granularity | the tile count floor silently drops the tail and the answer is quietly wrong |
-| 4 | One symbolic count per kernel per nesting level | two independently marked operands give two symbols and two counts, which cannot be launched |
+| 4 | **At most one symbolic count per dimension.** Inner levels over that dimension are static | a nest over one dimension cannot produce a second symbol, because an inner level is handed the enclosing level's tile and its extent is therefore a literal, so its trip count is a literal too. A nest over two separate dimensions does produce two symbols, and that reaches the launch boundary rather than codegen. Section 11.4 |
 | 5 | The caller reads only the real extent of the output | the buffer has capacity for the maximum, so anything past the real extent is whatever was in HBM |
 | 6 | A tail that will be read holds the reduction's identity, or is removed by a select | multiplying by a 0/1 mask does not clean it, because NaN times zero is still NaN |
 
@@ -276,14 +280,15 @@ Four more invariants, read out of the backend source rather than negotiated.
 | 7 | **Exactly one symbol per symbolic loop** | the backend asserts it directly. Two symbols on one loop is not a degraded case, it is a check failure |
 | 8 | **A symbolic loop may not take part in a loop condition** | an explicit backend refusal. Worth a test against the attention fixture, which has a carry and is currently assumed to be clear of this |
 | 9 | **The loop's lower bound is 0 and its step is a constant** | the backend computes `(ub - lb) / step` unconditionally. That is free only in this form; any other lower bound or a non-constant step puts a real division in the lowered program |
-| 10 | **The declared minimum is above 8** | the serving plugin's own linear wrapper branches on a row count below 8. Under a symbolic row count that is a branch on the symbol. It is safe today only because our minimum happens to exceed it, and a rule that holds by luck should be written down |
+| 10 | **The declared minimum stays above the serving plugin's row-padding threshold** | that wrapper pads short row blocks for throughput and branches on the row count to decide, so a symbolic row count specialises there. The consequence is one binary per size with correct numbers and no reuse, which makes this a performance rule rather than a correctness one. The runtime's own floor on a reservable dimension happens to be the same number and is a separate constraint |
 
-Two further invariants, both established by running a chained-region fixture rather than by reading source.
+Three further invariants, established by running fixtures rather than by reading source.
 
 | # | Invariant | Where it comes from |
 |---|---|---|
 | 11 | **A tensor carrying a declaration has storage at the declared maximum** | geometry is built from the maximum, so a declaration over a smaller allocation addresses memory that is not there, and nothing downstream catches it. Today the invariant holds by construction: the only writer of the declaration also performs the allocation, and the two paths that propagate it share storage. Any mechanism that attaches a declaration to a tensor it did not allocate has to verify this, and that makes it a precondition on the work in Section 7.3 rather than a note |
 | 12 | **The granularity divides the dimension value, on the backend side too** | invariant 3 states this from the frontend side. The backend computes the device loop's trip count and its compile-time slot enumeration with a floor divide, while the runtime trip-count symbol built for a program correction uses a ceiling divide. The two agree only while the granularity divides exactly. Latent while addresses stay static, and a trap for any later work that puts a symbol in an address |
+| 13 | **The declared axis is effectively outermost: every dimension above it is of size 1** | the reservation pads that axis to the declared maximum, and the host-to-device layout mapping cannot describe a padded axis with a real extent above it, so the transfer refuses. The innermost axis is refused separately, because padding a stick dimension changes the stride map for every dimension above it. Both refusals are at the transfer, before anything is traced, so this is a scope limit rather than a hazard. It is also the reason three of the four declaration sites in the encoder consumer cannot be expressed today: they are rank two with the sequence as the innermost axis |
 
 Invariant 3 needs one addition about **who enforces it**, because the two halves have different owners and the document used to blur them. That `max` is a multiple of `G` is checked by the backend at compile time and will fire. That the runtime size is a multiple of `G` is checked by **nobody** downstream: the device evaluates the trip count as a plain truncating integer divide with no remainder check and no diagnostic anywhere on the host or the device. So the host-side check of Section 12 is the only thing standing between a non-conforming size and silent data loss. That makes it a correctness requirement, not an ergonomic one.
 
@@ -365,6 +370,8 @@ Measured on a chained-region fixture: the symbol crosses the boundary intact and
 
 So the reader has a second half. A device-born tensor has to carry enough for the range to be recovered in the region that consumes it, and across a region boundary the tensor is the only available carrier.
 
+This does not depend on how the regions are spelled. The same chain was built four ways, as separately defined functions, as one closure instantiated per stage so that every stage shares a code object, as one compiled function called repeatedly, and as that last form with the first stage taking a different branch. All four behave identically, down to the same refusal naming the same symbol. So the fact that both consumer repositories build their per-layer blocks in a loop, and therefore share one code object across layers, changes nothing here.
+
 #### Where the declaration lives when there is no host tensor
 
 The design constraint raised in review is that this must not be host-tensor-centric: the contract has to be expressible in source, not only as a property carried on a tensor. The eager-versus-traced problem above says the same thing from the implementation side, and both point at separating the **declaration** from the **binding**.
@@ -382,7 +389,9 @@ k = k.to("spyre", dynamic={0: KV})
 v = v.to("spyre", dynamic={0: KV})
 ```
 
-Identity does not strictly require it. Two tensors declared separately and tied with a `torch._check` equality compile to one binary across the range, measured. So the shared object removes a manual step and makes the tie unforgeable rather than enabling something otherwise impossible. What it does enable is the AOT path, because the bridge is a decomposition and cannot call `.to()`, so it needs a declaration it can resolve by identity. Three carriers, one registry: the transfer interface for graph inputs, a source-level declaration for everything else, and `for_each_tile` taking its tile from the same object instead of a bare literal, which is what would have made the granularity mismatch of Section 10.3 unrepresentable.
+Identity does not strictly require it. Two tensors declared separately and tied with a `torch._check` equality compile to one binary across the range, measured. So the shared object removes a manual step and makes the tie unforgeable rather than enabling something otherwise impossible. What it does enable is the AOT path, because the bridge is a decomposition and cannot call `.to()`, so it needs a declaration it can resolve by identity. Three carriers, one registry: the transfer interface for graph inputs, a source-level declaration for everything else, and the region builder reading the same object when it chooses its tile.
+
+One qualification on that third carrier, and it is load-bearing for Phase 2. The declaration holds a **contract** granularity, which describes which values of the dimension are admissible. A loop level needs an **execution** tile, which is a quantity in the units of the tensor that level receives. Those are different kinds, and Section 11.1 keeps them apart. So the region builder may read the declaration to choose the **outermost** level's tile, which has to divide the contract granularity. It must not hand that number to an inner level, whose extent is the enclosing tile rather than the host dimension. Section 11.4.
 
 Both consumer repositories already have a natural home for the declaration. One has a well-established convention of model-level attributes set during device preparation and read by the drivers, so a load-time keyword that is stashed and read at the compile call is declarative and tensor-free. The other has a single place where every input tensor is converted after host padding and before the compiled call.
 
@@ -814,7 +823,7 @@ So the law is not "the varying axis must be outermost". It is:
 
 > **The marked dimension must be the dimension the buffer was reserved along.**
 
-Today that is dim 0, because the reservation call takes a dimension and the wrapper passes 0 as a literal. That one line of code is what makes "dim 0" look like a design law rather than a current limitation, and lifting it is what Phase 2 needs. The cost of the working K form is one pre-transpose of A outside the loop, which is a caller layout choice, plus a tile transpose inside the body, which is supported.
+The reservation does take the dimension and does reserve along it, so dim 0 is not written into the call. What limits it is the layout: an axis with a real extent above it cannot be described once it is padded to the maximum, so the transfer refuses, and in practice that means the marked axis has to be effectively outermost. Invariant 13. Lifting that is what Phase 2 needs, and it is runtime work rather than a change to this design. The cost of the working K form is one pre-transpose of A outside the loop, which is a caller layout choice, plus a tile transpose inside the body, which is supported.
 
 ### 9.4 Sum along the varying axis, which is Phase 2
 
@@ -1250,6 +1259,12 @@ Two practical notes on the numbers. The granularity has no floor at a stick: the
 
 One correction to "band blind", which is true of the dispatcher and the bundle but not of the chooser. Once there are two granularities, the chooser has to respect the band's contract granularity when picking an execution tile, so the band structure is visible to exactly one component below the dispatcher. Everything else stays blind.
 
+**Where the two are enforced, and what a disagreement costs.** They are checked in different places by different owners and nothing connects them. The contract granularity is validated at the transfer, against the declared maximum and against the size being transferred. The execution tile is stated inside the region, against the extent of the operand the level receives. The compiler never reads the contract granularity at all, because the bundle's granularity is recovered from the trip-count expression rather than looked up.
+
+That separation is safe in the direction the constraint allows. With the execution tile a divisor of the contract granularity, every admissible size is a multiple of both and the region accepts everything the transfer accepted. In the other direction a size can be legal under the contract and not tileable by the region, and that produces a refusal from the region rather than a dropped tail, so a disagreement costs a failed compile and never a wrong answer.
+
+What the refusal does not do is name the contract granularity, because the region has no access to it. A caller who declared one step and met a region tiled at another sees only the region's number. That is the strongest argument for the shared declaration object of Section 7.3: not that identity is otherwise impossible, but that the two numbers currently cannot be reported together.
+
 
 ### 11.2 Why the addresses stay static
 
@@ -1296,6 +1311,22 @@ flowchart LR
 Phase 1 is correct under one condition, that nothing reads those rows. Inside the graph no op does, because every op reads only its own tile. Outside, the caller reads the extent it asked for.
 
 Phase 2 is where this stops being free. Once something reduces along the varying axis, invariant 6 applies: the region has to hold the reduction's identity, or be removed with a select. Not multiplied by a mask, because an uninitialised region can hold a NaN bit pattern and NaN times zero is still NaN. [GSPMD](https://arxiv.org/abs/2105.04663) reaches the same conclusion from production experience.
+
+### 11.4 Nesting, and whose units a tile is in
+
+Nesting is where a tiling design usually acquires its worst class of bug, so it is worth stating why this one does not, and what the remaining limit actually is.
+
+A tile size is only meaningful together with the extent it divides. A design that lets a size be **declared** in one place and **resolved** in another has to map between them, and if that map depends on the shape, the same declared number means different things in different programs. That is how a declared tile of 1 ends up applied to an extent of 64.
+
+This construct has no such map. A level is handed its operands and divides them, so its tile is in the units of the tensor it received and its trip count is that tensor's extent divided by the tile. A nested level is handed the enclosing level's **tile**, so its units are the enclosing tile's units for the same reason, by data flow rather than by a lookup that could resolve wrongly. There is nothing to get wrong because there is nothing to resolve.
+
+Two consequences, both measured.
+
+**A nest over one dimension carries only one symbol.** The outer level's count is the dimension divided by the outer tile, which is symbolic. The inner level's extent is the outer tile and its tile is a literal, so its count is a literal too, and one binary serves the whole range. This is what invariant 4 states and it is why nesting on one dimension needs no new machinery.
+
+**A nest over two separate dimensions produces two symbols**, one per level, which is also what invariant 4 permits. That form reaches codegen intact, with both trip counts emitted, and is then refused at the launch boundary by a job-plan check that expects a single host-compute step followed by a compute step. So the limit on two symbolic levels today is a validation assumption rather than anything in the lowering, and relaxing it is the first thing Phase 2 needs after the allocation work of Section 5.3.
+
+Breaking the units rule is loud rather than silent. A tile that does not divide the extent it was given is refused by the level that received it, naming both the extent and the tile, which also covers the case of a contract granularity mistakenly handed to an inner level.
 
 ## 12. Guards and graceful exit
 
@@ -1802,7 +1833,9 @@ Cloning a declared tensor raises a constraint violation. The transfer marks the 
 
 A Python float captured by a tiled body is lifted into the scan subgraph and refused, because the higher-order op accepts tensors and integers only. Every compiled block in one consumer passes an attention scale explicitly, and that scale cannot be dropped without breaking head-padded models, so this is universal rather than occasional. A zero-dimensional tensor is the available substitute and one model in that repository already uses the pattern for an unrelated reason.
 
-The query tile selection in the attention decomposition calls an integer-only method on the sequence length. Section 5.3.
+The attention decomposition's tile selection searches the extent for an exact divisor and then recovers the tile size by dividing the extent by the resulting count. A symbolic length has no divisors to search and the recovered size is a symbol, so the first thing it reaches is a deduplication set keyed on that size, which refuses because a symbol is not hashable. Section 5.3 has the fix, which is the direction of derivation rather than a sweep for unsafe arithmetic.
+
+**A fourth blocker, in scope rather than in code.** The declared axis has to be effectively outermost, invariant 13, and three of the four declaration sites in the encoder consumer are rank two with the sequence as the innermost axis. So that path cannot be annotated at all until the reservation accepts an axis with a real extent above it. This is the item that gates a real model, and it is runtime work.
 
 **The widest risk: any pass that keys on something tiling moves.** Moving an op inside a loop body changes its resolved name, its layout context and the extent visible on its operands. Any compiler pass that keys a decision on one of those can silently change its mind about an op that did not change. Two confirmed instances so far, **both fixed**, and neither pass was wrong on its own: both were correct until composed with the loop.
 
@@ -1849,7 +1882,79 @@ it without narrowing the caller's contract.
 
 **Memory accounting has no owner, and it is the only item here that fails silently and destructively.** On the vLLM serving path there is no device-memory query at all: the function that reports available memory returns a configured constant derived from host memory, its own comments say as much, and there is no profile run and no activation term anywhere. So a max-sized reservation is noticed by nobody until the device allocator faults. There is no activation budget to extend, which makes this a new interface needing an owner before this feature reaches a serving path rather than after. The consequence for the user-facing contract is stated in Section 15.6 and bears repeating here: an over-large maximum is a device abort, so choosing the maximum is a correctness instruction and not advice.
 
-## 21. References
+## 21. Questions raised in review
+
+The questions that have actually been asked about this design, with the answers that were measured rather than argued. Most of them have a section that goes deeper, named at the end of the answer.
+
+**If a tensor is created on the device, where does its contract come from?**
+
+Today it has none. The contract has one writer and that writer runs inside the host-to-device transfer, so a tensor produced by a kernel never passes it. The important part of the answer is that this matters less than it looks: an intermediate allocated by our own codegen is already sized at the declared maximum, because its device layout was built from the maximum and the allocator takes the larger of the host and device footprints. So the tensor does not need a contract for its buffer to be right. What needs the contract is the **region** that consumes it. Section 7.3.
+
+**Does the declared range have to reach every compiled region, or is the first one enough?**
+
+Every region. Across a region boundary the **symbol** survives and the **range** does not, so a later region refuses for want of a ceiling rather than quietly specialising, and the refusal names the dimension. This was measured four ways, with the regions written as separate functions, as one closure instantiated per stage, as one compiled function called repeatedly, and with the first stage taking a different branch. All four behave the same, so the answer does not depend on how a model happens to build its layers. Section 7.3.
+
+**Can a contract sit on a buffer that is not sized at the declared maximum?**
+
+Not through any path that exists. Nine ways of producing or deriving a tensor were measured and exactly two carry a contract, the declaring transfer and `detach`, both at the maximum. Views, plain transfers, `empty_like` and arithmetic on a declared tensor carry none. That makes invariant 11 cheap to hold and it has to be held deliberately, because the backend takes the declared shape on trust and performs no check of its own.
+
+**Which axis can carry a declaration?**
+
+One that is effectively outermost, meaning every dimension above it is of size 1. An axis with a real extent above it is refused at the transfer, and the innermost axis is refused outright. Both refusals happen before anything is traced, so this is a scope limit and not a hazard, but it is the limit that gates the encoder path, where the sequence is the innermost axis of a rank-two tensor. Invariant 13.
+
+**What happens if the declared granularity and the executed tile disagree?**
+
+With the execution tile a divisor of the contract granularity, nothing: every admissible size is a multiple of both. In the other direction a size can be legal under the contract and not tileable by the region, and the region refuses. So a disagreement costs a failed compile rather than a dropped tail. What the refusal does not do is name the contract granularity, because the region cannot see it. Section 11.1.
+
+**Does a nested loop inherit the wrong units?**
+
+No, and it cannot. A level is handed its operands and divides them, and a nested level is handed the enclosing level's tile, so its units follow from the data rather than from a map that could resolve wrongly. A tile that does not divide the extent it was given is refused by the level that received it, naming both numbers. Section 11.4.
+
+**Can two loop levels both be symbolic?**
+
+Over one dimension the question does not arise, because an inner level's extent is the enclosing tile and its count is therefore a literal. Over two separate dimensions two symbols do appear, one per level, and that form lowers correctly and is then refused at the launch boundary by a check that expects a single host-compute step. So the present limit is a validation assumption rather than anything in the design. Section 11.4.
+
+**Why not just compile with dynamic shapes turned on?**
+
+Because that marks every dimension, including the innermost one, and a symbol there lands in a stride rather than in a trip count, which is precisely what invariant 1 forbids. The declaration marks one axis deliberately and leaves the rest alone. Section 7.3.
+
+**Why not declare the range through the standard dynamic-marking interface?**
+
+Its range argument installs a strict constraint, which promises every value in the range is valid. Adding a divisibility requirement on top then looks like a violation of that promise and raises, so a range and a granularity cannot be expressed together that way. That is the concrete reason a separate interface exists rather than a preference. Section 7.3.
+
+**What does a caller see when a size is out of range or misaligned?**
+
+At the transfer, a clear refusal naming the size, the range and the granularity, and in the case of a missing granularity a message that also explains the cost of the resulting step count. Inside the region, something much worse: a fake-tensor failure raised from inside the tracer, which is a diagnosis task rather than a message. Improving the second case is the whole of the guard work in Section 12, and it is a message problem rather than a missing check.
+
+**Does a model need code changes?**
+
+Beyond the transfer call, not in the end state, but today yes. A region has to state the range inside itself for the compiler to see it, which is what the contract reader removes. There is no zero-change path before that lands, and an untiled symbolic dimension takes the older route and is refused at the compile boundary. Section 18.1.
+
+**Is reserving at the maximum wasteful?**
+
+For the Phase 1 case it is capacity rather than waste: nothing strides over the varying axis, so the data stays dense and the buffer simply has room for the largest size. The nested case is the one that genuinely pays, because every stride above the varying axis is computed from its maximum and the tensor is stored sparsely. Section 11.3.
+
+**Does the binary survive a process restart?**
+
+Yes. A declared symbolic kernel written to a warm cache is reloaded by a later process without recompiling and produces identical results, which matters because three things are known to be lost on that round trip: the expression's class, the symbol's assumptions, and the stability of its printed form. All three are handled by normalising the expression once before anything keys on it. Section 20 treats the reload as a defect class.
+
+**Could the layout belong to the kernel rather than to the tensor?**
+
+Half of it already should not belong to either. The **reservation** is physical and has to belong to the buffer, because strides cannot be retrofitted onto an allocation and a kernel cannot allocate something that existed before it ran. The **contract** belongs to the symbol, since several tensors can share one dimension, and holding it per tensor is what allows two copies to disagree. The kernel's declaration is then an assertion that can be checked against the contract rather than a source of truth. Section 7.3.
+
+**Why does this not repeat the tile-size work that was abandoned?**
+
+That work moved a tiling hint from declaring a count to declaring a size, which is the same direction this design takes, and it failed on the resolution step rather than on the direction. A size declared against an abstract name had to be resolved against an extent that depended on which loop variable the name landed on, and that mapping is shape dependent, so the same declared number meant different things in different programs. This construct has no name and no mapping. Section 11.4.
+
+**Why is a tiling strategy that searches for a divisor a problem?**
+
+Because a search over the divisors of a symbol cannot run, and because the size it finds is then recovered by dividing the extent by the count, which turns a literal back into an expression. Both halves disappear if the size is declared and the count derived. This is the same correction the view spellings make for the same reason. Sections 5.3 and 8.2.
+
+**What blocks a real model today?**
+
+Four things, none of them design questions. The declared axis has to be effectively outermost and the encoder path's axis is not. Cloning a declared tensor raises a constraint violation and one consumer clones once per layer. A Python float captured by a tiled body is refused by the higher-order op and every compiled block in that consumer passes one. And the attention tile selection needs the derivation reversed. Section 20.
+
+## 22. References
 
 [Orca](https://www.usenix.org/conference/osdi22/presentation/yu) on continuous batching, [vLLM](https://arxiv.org/abs/2309.06180) on paged attention, [Triton dynamic batching](https://docs.nvidia.com/deeplearning/triton-inference-server/user-guide/docs/tutorials/Conceptual_Guide/Part_2-improving_resource_utilization/README.html), [CoRa](https://arxiv.org/abs/2110.10221) on ragged tensors, [Nimble](https://arxiv.org/abs/2006.03031) and [DISC](https://arxiv.org/abs/2103.05288) on dynamic-shape compilation, the [PyTorch 2 paper](https://dl.acm.org/doi/10.1145/3620665.3640366), [Inductor's define-by-run IR](https://dev-discuss.pytorch.org/t/torchinductor-a-pytorch-native-compiler-with-define-by-run-ir-and-symbolic-shapes/747/3), [GSPMD](https://arxiv.org/abs/2105.04663) on identity padding and select masking, [PyTorch/XLA bounded dynamic shapes](https://github.com/pytorch/xla/issues/3884) and its [docs](https://docs.pytorch.org/xla/master/learn/dynamic_shape.html), [torch.nested](https://docs.pytorch.org/docs/2.8/nested.html), and [MegaBlocks](https://arxiv.org/abs/2211.15841).
 
