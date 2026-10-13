@@ -222,7 +222,7 @@ them apart is the most important structural decision in the implementation.
 | `dimension` | the older symbolic-SDSC route. The symbol stays inside one op's iteration space and lives in the SDSC's `dimToSymbolMapping_` | yes | **gated at the compile boundary** |
 | `loop_dimension` | this design. The loop is explicit, the body is a static tile, and the dimension exists only as a bundle parameter | **never** | the route being built |
 
-The gate is a refusal in `execution/async_compile.py` on any bundle carrying a `dimension` symbol,
+The gate is a refusal at the compile boundary on any bundle carrying a `dimension` symbol,
 and its own comment gives the reason: submitting such a bundle would reach the backend with a
 mismatched `inputSym_` slot count, because that route's runtime payload was never implemented.
 
@@ -288,7 +288,7 @@ Three further invariants, established by running fixtures rather than by reading
 |---|---|---|
 | 11 | **A tensor carrying a declaration has storage at the declared maximum** | geometry is built from the maximum, so a declaration over a smaller allocation addresses memory that is not there, and nothing downstream catches it. Today the invariant holds by construction: the only writer of the declaration also performs the allocation, and the two paths that propagate it share storage. Any mechanism that attaches a declaration to a tensor it did not allocate has to verify this, and that makes it a precondition on the work in Section 7.3 rather than a note |
 | 12 | **The granularity divides the dimension value, on the backend side too** | invariant 3 states this from the frontend side. The backend computes the device loop's trip count and its compile-time slot enumeration with a floor divide, while the runtime trip-count symbol built for a program correction uses a ceiling divide. The two agree only while the granularity divides exactly. Latent while addresses stay static, and a trap for any later work that puts a symbol in an address |
-| 13 | **The declared axis is effectively outermost: every dimension above it is of size 1** | the reservation pads that axis to the declared maximum, and the host-to-device layout mapping cannot describe a padded axis with a real extent above it, so the transfer refuses. The innermost axis is refused separately, because padding a stick dimension changes the stride map for every dimension above it. Both refusals are at the transfer, before anything is traced, so this is a scope limit rather than a hazard. It is also the reason three of the four declaration sites in the encoder consumer cannot be expressed today: they are rank two with the sequence as the innermost axis |
+| 13 | **The declared axis is effectively outermost: every dimension above it is of size 1** | the reservation pads that axis to the declared maximum, and the host-to-device layout mapping cannot describe a padded axis with a real extent above it, so the transfer refuses. The innermost axis is refused separately, because padding a stick dimension changes the stride map for every dimension above it. Both refusals are at the transfer, before anything is traced, so this is a scope limit rather than a hazard. It is why three of the four declaration sites in the encoder consumer cannot be expressed today: they are rank two with the sequence as the innermost axis |
 
 Invariant 3 needs one addition about **who enforces it**, because the two halves have different owners and the document used to blur them. That `max` is a multiple of `G` is checked by the backend at compile time and will fire. That the runtime size is a multiple of `G` is checked by **nobody** downstream: the device evaluates the trip count as a plain truncating integer divide with no remainder check and no diagnostic anywhere on the host or the device. So the host-side check of Section 12 is the only thing standing between a non-conforming size and silent data loss. That makes it a correctness requirement, not an ergonomic one.
 
@@ -317,10 +317,10 @@ The consequence is a refusal. With the range undeclared the trip count reaches c
 
 The refusal is structural rather than incidental: geometry built from the declared maximum reaches the SDSC through a path that demands a finite bound, so its absence is caught before anything is emitted. The item is still the most important open one here, because the interface does nothing useful without it.
 
-So the requirement is three-part:
+So the requirement is three-part. The first two are carried by the transfer, and the third is the open one:
 
-1. reserve at the max, which already happens,
-2. mark the dimension, which already happens,
+1. reserve at the max,
+2. mark the dimension,
 3. **record the contract where the compiler can read it.** Without this the interface is decorative.
 
 #### How the third part is carried
@@ -351,7 +351,7 @@ code for a missing contract.
 afterwards, so it is a re-keying with a one-compile lifetime rather than a parallel copy that can
 drift. The three numbers live in exactly one authoritative place.
 
-The pattern is not new here. `wsr/propagate_named_dims.py` already moves user-declared data across
+The pattern is not new here. The named-dimension propagation pass moves user-declared data across
 the same seam, with `zip(graph.graph_input_names, V.get_real_inputs())` inside a lowering pass.
 
 One scope note on what the contract is actually needed **for**, because it is narrower than it
@@ -648,18 +648,18 @@ obvious spelling reintroduces the bug silently.
 
 The piece that turns a marked dynamic dimension into a tiled loop is the bridge, and it is the main new work in this design. Ref [#4379](https://github.com/torch-spyre/torch-spyre/issues/4379).
 
-Where it sits is already decided by how `for_each_tile` works. It is not a graph node. It is ordinary Python in `wsr/for_each_tile.py` that builds a `combine_fn` and calls `scan`, so no pass can insert it as a node. What can call it is a decomposition, while AOT is tracing. The SDPA decomposition already does that in two places in `_inductor/decompositions.py`, and `for_each_tile` carries an explicit branch for being reached that way instead of through Dynamo.
+Where it sits is already decided by how `for_each_tile` works. It is not a graph node. It is ordinary Python that builds a `combine_fn` and calls `scan`, so no pass can insert it as a node. What can call it is a decomposition, while AOT is tracing. The SDPA decomposition does that in two places today, and `for_each_tile` carries an explicit branch for being reached that way instead of through Dynamo.
 
 So the bridge is two pieces. **Both are proposed, not built.** The op name below is a placeholder.
 
 | Piece | Where it goes | Status |
 |---|---|---|
 | Region selection: pick the ops that should share one loop, lift them into a submodule, replace them with a single `spyre.tiled_region` call | `CustomPreGradPasses`, the pre-grad FX extension point, empty today | proposed |
-| Loop construction: a decomposition of `spyre.tiled_region` that calls `for_each_tile` with `tile_size` set to the granularity | `_inductor/decompositions.py`, next to the SDPA ones | proposed, on an existing pattern |
+| Loop construction: a decomposition of `spyre.tiled_region` that calls `for_each_tile` with `tile_size` set to the granularity | a decomposition, next to the SDPA ones | proposed, on an existing pattern |
 
 Pre-grad and not post-grad, because decompositions run during AOT tracing and a post-grad pass is past that point.
 
-Region selection is modelled on `hints_to_coarse_tile_groups` in `wsr/coarse_tile_hints.py`, which already does this for the WSR 1.0 hint path: walk in topological order, collect consecutive ops that agree, break when they stop agreeing, hand out `(ops, levels)` groups. Same algorithm, different key. That one keys on a `spyre_hint()` the model author wrote, ours keys on the marked dimension.
+Region selection is modelled on `hints_to_coarse_tile_groups`, which does this for the WSR 1.0 hint path: walk in topological order, collect consecutive ops that agree, break when they stop agreeing, hand out `(ops, levels)` groups. Same algorithm, different key. That one keys on a `spyre_hint()` the model author wrote, ours keys on the marked dimension.
 
 ```mermaid
 flowchart TB
@@ -1261,7 +1261,7 @@ One correction to "band blind", which is true of the dispatcher and the bundle b
 
 **Where the two are enforced, and what a disagreement costs.** They are checked in different places by different owners and nothing connects them. The contract granularity is validated at the transfer, against the declared maximum and against the size being transferred. The execution tile is stated inside the region, against the extent of the operand the level receives. The compiler never reads the contract granularity at all, because the bundle's granularity is recovered from the trip-count expression rather than looked up.
 
-That separation is safe in the direction the constraint allows. With the execution tile a divisor of the contract granularity, every admissible size is a multiple of both and the region accepts everything the transfer accepted. In the other direction a size can be legal under the contract and not tileable by the region, and that produces a refusal from the region rather than a dropped tail, so a disagreement costs a failed compile and never a wrong answer.
+The separation is safe in one direction only. With the execution tile a divisor of the contract granularity, every admissible size is a multiple of both and the region accepts everything the transfer accepted. In the other direction a size can be legal under the contract and not tileable by the region, and that produces a refusal from the region rather than a dropped tail, so a disagreement costs a failed compile and never a wrong answer.
 
 What the refusal does not do is name the contract granularity, because the region has no access to it. A caller who declared one step and met a region tiled at another sees only the region's number. That is the strongest argument for the shared declaration object of Section 7.3: not that identity is otherwise impossible, but that the two numbers currently cannot be reported together.
 
@@ -1314,11 +1314,9 @@ Phase 2 is where this stops being free. Once something reduces along the varying
 
 ### 11.4 Nesting, and whose units a tile is in
 
-Nesting is where a tiling design usually acquires its worst class of bug, so it is worth stating why this one does not, and what the remaining limit actually is.
-
 A tile size is only meaningful together with the extent it divides. A design that lets a size be **declared** in one place and **resolved** in another has to map between them, and if that map depends on the shape, the same declared number means different things in different programs. That is how a declared tile of 1 ends up applied to an extent of 64.
 
-This construct has no such map. A level is handed its operands and divides them, so its tile is in the units of the tensor it received and its trip count is that tensor's extent divided by the tile. A nested level is handed the enclosing level's **tile**, so its units are the enclosing tile's units for the same reason, by data flow rather than by a lookup that could resolve wrongly. There is nothing to get wrong because there is nothing to resolve.
+This construct has no such map. A level is handed its operands and divides them, so its tile is in the units of the tensor it received and its trip count is that tensor's extent divided by the tile. A nested level is handed the enclosing level's **tile**, so its units are the enclosing tile's units for the same reason, by data flow rather than by a lookup that could resolve wrongly.
 
 Two consequences, both measured.
 
@@ -1508,7 +1506,7 @@ supporting it.
 
 The varying axis is the batch at dim 0, formed from whatever requests arrived.
 
-`assert_spyre_dimensions` in `hf_common.py` already validates that dimensions are stick multiples and raises a readable error when they are not. A granularity check is the same shape of validation, aimed at a different number, so it belongs next to that one rather than somewhere new. `AutoSpyreModelForCausalLM.from_pretrained` and its siblings are the natural place to surface the declaration, so a caller states the range once when the model is loaded rather than on every call.
+The adapter layer's `assert_spyre_dimensions` already validates that dimensions are stick multiples and raises a readable error when they are not. A granularity check is the same shape of validation, aimed at a different number, so it belongs next to that one rather than somewhere new. `AutoSpyreModelForCausalLM.from_pretrained` and its siblings are the natural place to surface the declaration, so a caller states the range once when the model is loaded rather than on every call.
 
 The encoder sequence axis is the harder one and is the second phase, because in-graph attention reduces along it. Batch first, sequence later.
 
@@ -1647,15 +1645,15 @@ flowchart TB
 
 ### 18.1 Stage 1, functional enablement, broken into the PRs that deliver it
 
-Four pieces of work, three owners. Nothing here delivers value alone, which is why this is the gate
+Four pieces of work across three components. Nothing here delivers value alone, which is why this is the gate
 for the project rather than a sequence of improvements.
 
-| PR | What it delivers | Owner | Rough size |
+| PR | What it delivers | Component | Rough size |
 |---|---|---|---|
 | **N** | the declaration and the reservation: the `dynamic={dim: {...}}` API, the per-dim contract map on the tensor, reservation and layout pinning at the declared maximum, the resize guard, and the accessor the compiler reads | runtime | medium |
-| **A.1** | the compiler mechanism: a symbolic trip count surviving tracing, reaching codegen, emitted as the loop form of Section 7.5, and bound at launch. Plus the four fundamental refusals | front end | ~2700 lines, 55% tests |
-| **A.2** | the ergonomics: the contract reader, the automatic region builder, and the in-trace assertions, so a model needs no code change | front end | ~2200 lines |
-| **R** | the host admissibility check with a usable message | guards | small |
+| **A.1** | the compiler mechanism: a symbolic trip count surviving tracing, reaching codegen, emitted as the loop form of Section 7.5, and bound at launch. Plus the four fundamental refusals | Inductor front end | ~2700 lines, 55% tests |
+| **A.2** | the ergonomics: the contract reader, the automatic region builder, and the in-trace assertions, so a model needs no code change | Inductor front end | ~2200 lines |
+| **R** | the host admissibility check with a usable message | dispatch guards | small |
 
 One sequencing decision is worth stating explicitly. The
 declaration channel sits **inside** this gate and not in the guard stage that follows. It is not a
@@ -1716,7 +1714,7 @@ The deeptools row is in better shape than this plan used to assume. The device-s
 implemented end to end in their compiler and we have run against it repeatedly, so the open item is
 a specification gap and a reference bundle rather than an unstarted feature. Section 16.3. The
 strategic exposure is that our load-bearing dependency has no regression test in the repository that
-owns it, so a refactor there would break us with nothing on their side catching it. Getting a
+owns it, so a refactor there would break this design with nothing in that repository catching it. Getting a
 symbolic-bound bundle into their golden set is cheap insurance and is a conversation, not a PR.
 
 The front end proves what it can against structure rather than numbers, so it does not stall on
@@ -1870,7 +1868,7 @@ either specialise or install an inequality that makes the artifact invalid at ex
 is the mechanism behind the single-tile rough edge of Section 13, and the chooser rule there removes
 it without narrowing the caller's contract.
 
-**In the front end.** The tile extent is a sympy expression and not an int, so any integer type check or interval reasoning on it will misbehave. The tail contract depends on the caller reading only what it asked for, and if a caller forgets, the wrong answer is silent, so it needs a test on their side too. The tile advance must stay in static geometry and never become a bundle symbol. A pooled scratch intermediate inside a symbolic loop body is a new path that has been exercised only at the warm-up size.
+**In the front end.** The tile extent is a sympy expression and not an int, so any integer type check or interval reasoning on it will misbehave. The tail contract depends on the caller reading only what it asked for, and if a caller forgets, the wrong answer is silent, so it needs a test in the consumer as well. The tile advance must stay in static geometry and never become a bundle symbol. A pooled scratch intermediate inside a symbolic loop body is a new path that has been exercised only at the warm-up size.
 
 **Any audit must say what it did not check.** The symbolic-range audit reported a clean state while a load was reading a symbolic stride, because it walked the operations and never the graph inputs and their device layouts. A guard that reports "0 problems" without stating its scope is worse than no guard, because it is believed.
 
@@ -1878,17 +1876,17 @@ it without narrowing the caller's contract.
 
 **A second symbolic mechanism is in flight.** [#4370](https://github.com/torch-spyre/torch-spyre/issues/4370) resolves a dimension symbol per launch through the SuperDSC symbol table, for cases a loop bound cannot express such as indirect access. It is not a competing answer, but the two need to stay separable so a kernel of this shape does not pick up a dimension symbol it does not need.
 
-**deeptools.** The device loop capability is implemented end to end on their side, so this is no longer an unstarted dependency. What remains is a written-contract gap, their bundle specification still describing a symbolic loop bound as a future revision item, and the reference bundle and SDSC pair, which is what lets both sides build to the same artefact. Separately, two in-loop correction implementations exist and the current one refuses, so which the reference targets needs settling. Section 16.3. Whether a dimension symbol can be ingested on the other mechanism is still open on [PR #4911](https://github.com/torch-spyre/torch-spyre/pull/4911).
+**deeptools.** The device loop capability is implemented end to end in the backend compiler, so this is no longer an unstarted dependency. What remains is a written-contract gap, with the bundle specification still describing a symbolic loop bound as a future revision item, and the reference bundle and SDSC pair, which is what lets both sides build to the same artefact. Separately, two in-loop correction implementations exist and the current one refuses, so which the reference targets needs settling. Section 16.3. Whether a dimension symbol can be ingested on the other mechanism is still open on [PR #4911](https://github.com/torch-spyre/torch-spyre/pull/4911).
 
 **Memory accounting has no owner, and it is the only item here that fails silently and destructively.** On the vLLM serving path there is no device-memory query at all: the function that reports available memory returns a configured constant derived from host memory, its own comments say as much, and there is no profile run and no activation term anywhere. So a max-sized reservation is noticed by nobody until the device allocator faults. There is no activation budget to extend, which makes this a new interface needing an owner before this feature reaches a serving path rather than after. The consequence for the user-facing contract is stated in Section 15.6 and bears repeating here: an over-large maximum is a device abort, so choosing the maximum is a correctness instruction and not advice.
 
 ## 21. Questions raised in review
 
-The questions that have actually been asked about this design, with the answers that were measured rather than argued. Most of them have a section that goes deeper, named at the end of the answer.
+The questions that have been asked about this design, with the answers that were measured rather than argued.
 
 **If a tensor is created on the device, where does its contract come from?**
 
-Today it has none. The contract has one writer and that writer runs inside the host-to-device transfer, so a tensor produced by a kernel never passes it. The important part of the answer is that this matters less than it looks: an intermediate allocated by our own codegen is already sized at the declared maximum, because its device layout was built from the maximum and the allocator takes the larger of the host and device footprints. So the tensor does not need a contract for its buffer to be right. What needs the contract is the **region** that consumes it. Section 7.3.
+Today it has none. The contract has one writer and that writer runs inside the host-to-device transfer, so a tensor produced by a kernel never passes it. That matters less than it looks. An intermediate allocated by our own codegen is already sized at the declared maximum, because its device layout was built from the maximum and the allocator takes the larger of the host and device footprints. So the tensor does not need a contract for its buffer to be right. What needs the contract is the **region** that consumes it. Section 7.3.
 
 **Does the declared range have to reach every compiled region, or is the first one enough?**
 
@@ -1900,7 +1898,7 @@ Not through any path that exists. Nine ways of producing or deriving a tensor we
 
 **Which axis can carry a declaration?**
 
-One that is effectively outermost, meaning every dimension above it is of size 1. An axis with a real extent above it is refused at the transfer, and the innermost axis is refused outright. Both refusals happen before anything is traced, so this is a scope limit and not a hazard, but it is the limit that gates the encoder path, where the sequence is the innermost axis of a rank-two tensor. Invariant 13.
+One that is effectively outermost, meaning every dimension above it is of size 1. An axis with a real extent above it is refused at the transfer, and the innermost axis is refused outright. Both refusals happen before anything is traced, so this is a scope limit rather than a hazard, and it is the limit that gates the encoder path, where the sequence is the innermost axis of a rank-two tensor. Invariant 13.
 
 **What happens if the declared granularity and the executed tile disagree?**
 
