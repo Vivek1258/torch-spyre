@@ -1,20 +1,36 @@
-# Symbolic shapes: three questions
+# Symbolic shapes: design concerns
 
-Everything below was measured on device. Where something is unmeasured it says so.
+Three concerns raised in review, each answered from measurements on device. Where something is
+unmeasured it says so.
 
 ---
 
-# Q1. Does the symbol flow across kernels and intermediate tensors
+# 1. Does the contract survive across kernels and across compiled regions
 
-Two different boundaries, two different answers.
+Two different boundaries, with two different answers.
 
-## Kernel to kernel, inside one compile
+## Kernel to kernel
 
-The chain raised in review was `host -> HBM -> kernel 1 -> (op) -> HBM -> kernel 2 -> fails`. The
-concern was real: the contract has exactly one writer, inside the transfer, so a tensor born on the
-device never passes it.
+The concern was structural. The contract has exactly one writer, inside the host-to-device transfer,
+so a tensor born on the device never passes it. A model is a chain of kernels handing tensors to each
+other, so if the contract is lost at the first hand-off the feature is useless.
 
-Four-stage chain, measured:
+The chain under test:
+
+```python
+blk1 = torch.compile(region(), backend="inductor", fullgraph=True)
+blk2 = torch.compile(region(), backend="inductor", fullgraph=True)
+
+for rows in (128, 256, 384, 512):
+    x = host.to("spyre", dynamic={0: dict(min=128, max=512, granularity=64)})
+
+    mid = blk1(x, W)        # device born. Never passed through .to()
+    out = blk2(mid, W)      # consumes a tensor that carries no declaration
+
+    print(rows, nbytes(mid), get_reserved_dims(mid), misses())
+```
+
+Measured over a four-stage version of this:
 
 | What | Result |
 |---|---|
@@ -24,18 +40,18 @@ Four-stage chain, measured:
 | numbers | worst relative error 0.0040 |
 | with an ATen fallback in the chain | correct, one kernel for the whole range |
 
-**The `-> fails` step did not happen on any constructible path.**
+The chain did not fail at any size, with any form of intermediate.
 
 Why a device-born tensor with no contract is harmless:
 
 > **Binary reuse follows from layout constancy, not from the declaration.**
 
 Dynamo guards every device tensor on its device layout. The buffer is reserved at the maximum, so it
-presents the **same layout at every size**, the guard passes and the binary is reused. The
-intermediate does not need the contract. It needs the same shape of memory, which it has, because our
-codegen sized it at the maximum.
+presents the **same layout at every size**, the guard passes, and the binary is reused. The
+intermediate does not need to carry the contract. It needs the same shape of memory, which it has,
+because our codegen sizes it at the maximum.
 
-## Compile to compile
+## Compiled region to compiled region
 
 Here the answer splits, and this is the result that matters most.
 
@@ -71,9 +87,9 @@ traced region
 **The refusal is the proof the symbol arrived.** A region that had seen a concrete size would have
 compiled happily.
 
-### Why the symbol crosses but the range does not
+### Why the symbol crosses and the range does not
 
-The marks are different, and this was measured with two distinct code objects so it is not Dynamo's
+The two marks are different. Measured with two distinct code objects, so the result is not Dynamo's
 per-code-object automatic dynamic:
 
 ```python
@@ -83,8 +99,8 @@ def stage2(x): return torch.nn.functional.relu(x) * 2.0
 x = torch.randn(256, 64)
 torch._dynamo.mark_dynamic(x, 0)
 
-torch.compile(stage1, dynamic=None)(x)   # -> stage2 then sees ['s77']
-stage1(x)                                # -> stage2 then sees []
+torch.compile(stage1, dynamic=None)(x)   # stage2 then sees ['s77']
+stage1(x)                                # stage2 then sees []
 ```
 
 ```
@@ -99,7 +115,7 @@ The range was never on the mark. The mark is bare on purpose, because passing bo
 constraint that the granularity check then appears to violate. The range lives as `torch._check` facts
 inside one region's ShapeEnv, and **a ShapeEnv does not leave its compile.**
 
-| Property | Crosses? |
+| Property | Crosses a compiled region boundary |
 |---|---|
 | allocation and layout | **yes**, the buffer is physically max strided |
 | dynamism, that this dim varies | **yes**, the weak mark rides on the tensor |
@@ -113,39 +129,33 @@ into each region's own ShapeEnv. **That is the whole of it.** The interface does
 
 ---
 
-# Q2. Does this end up like the hint PR
+# 2. How this differs from the named-dimension hint approach
 
-## What killed that one
+## The design difference
 
-It moved hints from declaring a trip **count** to declaring a tile **size**. Same direction this needs.
-It took a month and did not merge.
+| | named-dimension hints | this design |
+|---|---|---|
+| what is declared | a tile **size**, against an abstract name | a **range**, against a tensor dimension |
+| how it reaches a tensor | name, to operation dim, to tensor axis. Indirect | the loop level is handed the operand and divides it |
+| what crosses into the compiler | a size, whose meaning depends on which loop variable the name lands on | a count |
+| what can go wrong | the same declared number means different things in different programs | there is no name, so there is nothing to resolve |
 
-The reviewer named the root cause:
-
-> Spyre hints tile **abstract dimensions** not tensors. The mapping of loop dimensions to operation
-> dimensions to tensor dimensions is **indirect** via named dimensions.
-
-The author's own conclusion, after deleting every special case he had added, net minus 41 lines:
-*"every special case I was adding was an artifact of measuring the wrong thing."*
-
-The sentence that transfers:
+The one sentence that separates them:
 
 > **A count is invariant to which loop var a name lands on. A size is not.**
 
-`[B,H]` with `B=1` folds onto one loop var of extent 8, so inspecting the op recovers 8 for `B` when
-the answer is 1. Hardware caught the end state: `declared tile_size 1 vs derived extent 64`.
-
-## Why the mechanism cannot recur
+`[B,H]` with `B=1` folds onto one loop var of extent 8, so inspecting the operation recovers 8 for `B`
+when the answer is 1. That is how a declared tile of 1 ended up applied to an extent of 64.
 
 ```mermaid
 flowchart TB
-    subgraph OLD["hints: declare a SIZE against a NAME"]
+    subgraph OLD["declare a SIZE against a NAME"]
         N["named dimension"] --> M["map: name to operation dim<br/>to tensor axis"]
         M --> X["the size is resolved against<br/>whatever extent the map lands on"]
         X --> BAD["declared tile_size 1<br/>vs derived extent 64"]
     end
 
-    subgraph NEW["this design: declare a RANGE on a TENSOR"]
+    subgraph NEW["declare a RANGE against a TENSOR"]
         T["the tensor, which has the dimension"] --> L["the level is HANDED the tensor<br/>and divides it"]
         L --> GOOD["count = extent // tile<br/>nothing to resolve"]
     end
@@ -154,11 +164,13 @@ flowchart TB
     style GOOD fill:#d8f5d8,stroke:#2a7
 ```
 
-Three reasons, each verified in the tree rather than argued.
+## Why the failure mode cannot arise here
 
-**There is no name, so nothing to resolve.** `for_each_tile` is handed its operands and divides the
-tensor in hand. Zero references to `named_dim`, `spyre_hint`, `declare_tensor_dim`,
-`num_tiles_per_dim` or `tile_size_per_dim` in the construct or its lowering.
+Three properties, each verified in the tree rather than argued.
+
+**There is no name.** `for_each_tile` is handed its operands and divides the tensor in hand. Zero
+references to `named_dim`, `spyre_hint`, `declare_tensor_dim`, `num_tiles_per_dim` or
+`tile_size_per_dim` in the construct or its lowering.
 
 **A nested level is handed the enclosing level's tile**, so its units are correct by data flow rather
 than by a lookup that could resolve wrongly.
@@ -167,57 +179,67 @@ than by a lookup that could resolve wrongly.
 The granularity is recovered out of `FloorDiv(s, G)`, so the bundle's declared granularity and the
 loop's step come from one expression and cannot disagree.
 
-And hints were being retired for higher-order operators anyway. `for_each_tile` is the construct that
-replaced them, so this is built on the replacement rather than on the thing that failed.
+Also worth stating: hints were being retired for higher-order operators in any case, and
+`for_each_tile` is the construct that replaced them.
 
-## Where it can still reach us
+## What this means for paged attention and SDPA
 
-Four places, worth saying before anyone finds them.
+**Paged KV decode is already in the right shape.** That path already runs on `for_each_tile` by
+default. The tiled axis is dim 0 of the block index and its mask, so the varying size already reaches
+only the trip count. Paged attention is a custom op, so it does not route through the attention
+decomposition at all. Declaring the block table's row count is therefore an extension of what that
+code already does, not a change to how it tiles.
 
-**The attention tile-size search is the live instance.** The chooser searches an extent for an exact
-divisor, and a search over divisors cannot survive a symbolic extent. The fix is that PR's own thesis
-applied at the call sites: declare the size, derive the count. Phase 1 does not route through it.
-Phase 2 does.
+**SDPA is the one place the old failure mode could reach us.** The tile chooser searches an extent for
+an exact divisor, and a search over divisors cannot survive a symbolic extent. It is the same category
+of mistake: recovering a size by inspection rather than taking it as declared. The fix is the same
+correction, applied at the call sites, which is to declare the size and derive the count. One change
+in three call sites.
 
-**The follow-up region builder is a decomposition, so it cannot call `.to()`.** Identical shape to the
-withdrawn SDPA half of that PR.
+Phase 1 does not route through that chooser. Phase 2 does, which is why it is on the list.
 
-**Phase 1 is safe by narrowness, not by construction.** With dim 0, outermost, one level, the tensor
-axis and the loop variable coincide. For nesting they do not.
+## Two other places to watch
 
-**One sentence in the design doc is currently the bug.** It has the region builder taking its tile
-"from the same object" as the declaration. At an inner level that is exactly the defect above. It was
-tested on device and refuses loudly, so a violation costs a failed compile rather than a wrong answer,
-but the sentence needs tightening before the builder is written.
+**The follow-up region builder is a decomposition, so it cannot call `.to()`.** It has to resolve a
+declaration by identity instead, which is why the declaration object needs to land before the builder
+is written.
 
-## The part worth taking seriously
+**Phase 1 is safe by narrowness rather than by construction.** With dim 0, outermost, one level, the
+tensor axis and the loop variable coincide. For nesting they do not, so the rule has to be written down
+rather than relied on.
 
-That PR was technically correct at the end, hardware verified, net negative lines, and it still did
-not merge. **What cost the month was implementing before the semantics were agreed.** What turned it
-round was one page of semantics.
+## The process point
 
-So before the follow-up: one page saying which quantity is declared, which derived, in what units, and
-a single policy for a non-dividing extent. Agreed first, built second.
+That work was technically correct at the end, hardware verified, and still did not merge, because it
+was implemented before the semantics were agreed. The cheap insurance is one page first: which quantity
+is declared, which is derived, in what units, and a single policy for a non-dividing extent. Agreed,
+then built.
 
 ---
 
-# Q3. Is Phase 2 an extension, including nested symbolic loops
+# 3. Is Phase 2 an extension of Phase 1
 
-Phase 2's actual shape was run on device. Five arms:
+Phase 2's shape was run on device. Five arms:
 
 | arm | verdict | trip counts per level |
 |---|---|---|
 | one level | REUSE | `('floor(s77/64)',)` |
 | two symbolic dimensions | REFUSE at launch | `('floor(s77/64)', 'floor(s17/64)')` |
-| same dim, 64 then 32 | REUSE | **`('floor(s77/64)', '2')`** |
-| same dim, inner 48 does not divide | REFUSE, names both numbers | - |
+| same dimension, 64 then 32 | REUSE | **`('floor(s77/64)', '2')`** |
+| same dimension, inner 48 does not divide | REFUSE, names both numbers | - |
 | inner level handed the contract granularity | REFUSE, same message | - |
 
-## The two nesting cases
+## The two shapes a nest can take
+
+Both are real. A nest over the **same** dimension is what coarse tiling already produces today: the
+pass wraps a group of operations in one or more nested counted loops, carrying `loop_count` as a list
+of trip counts, one per nesting level from outermost to innermost. The outer level exists to bring the
+working set inside a memory budget, and the inner level is the compute tile. A nest over **different**
+dimensions is the attention shape, query tiles over KV blocks.
 
 ```mermaid
 flowchart TB
-    subgraph SAME["CASE A: two levels over the SAME dimension"]
+    subgraph SAME["SAME dimension: coarse level plus compute tile"]
         direction TB
         A1["outer: gets x, rows = s77<br/>tiles at 64<br/>count = s77 // 64   SYMBOLIC"]
         A2["inner: is HANDED the 64-row tile<br/>tiles at 32<br/>count = 2   LITERAL"]
@@ -225,7 +247,7 @@ flowchart TB
         A1 --> A2 --> A3
     end
 
-    subgraph DIFF["CASE B: two levels over DIFFERENT dimensions"]
+    subgraph DIFF["DIFFERENT dimensions: the attention shape"]
         direction TB
         B1["outer: gets x, rows = s77<br/>tiles at 64<br/>count = s77 // 64   SYMBOLIC"]
         B2["inner: is handed y WHOLE, rows = s17<br/>tiles at 64<br/>count = s17 // 64   SYMBOLIC"]
@@ -240,23 +262,24 @@ flowchart TB
 The code difference is one argument, and it is the whole argument:
 
 ```python
-# CASE A: the inner level receives the TILE
+# SAME dimension: the inner level receives the TILE
 def outer_body(_c, tiles):
     x_tile, w_whole = tiles                  # x_tile is 64 rows, a literal
     _ic, out = for_each_tile(inner_body, (x_tile, w_whole),
                              dims=(0, None), tile_size=32, out_dim=0)
+    return None, out
 
-# CASE B: the inner level receives the WHOLE other tensor
+# DIFFERENT dimensions: the inner level receives the WHOLE other tensor
 def outer_body(_c, tiles):
-    x_tile, y_whole = tiles                  # y untouched, still carries its symbol
+    x_tile, y_whole = tiles                  # y untouched, still carries its own symbol
 ```
 
-A level divides the tensor it was handed. In case A it was handed a tile, so its units are the tile's.
-In case B it was handed a whole tensor, so its units are that tensor's. **Neither resolves a name, so
-neither can be in the wrong units.**
+A level divides the tensor it was handed. In the first case it was handed a tile, so its units are the
+tile's and its trip count is a literal. In the second it was handed a whole tensor, so its units are
+that tensor's. **Neither resolves a name, so neither can be in the wrong units.**
 
-Addresses stay safe too. A two-level nest's affine map is `base + i*stride_i + j*stride_j`, and both
-strides are static because the buffer is max strided.
+Addresses stay safe in both. A two-level nest's affine map is `base + i*stride_i + j*stride_j`, and
+both strides are static because the buffer is max strided.
 
 ## When two symbols are actually needed
 
@@ -271,7 +294,7 @@ Less often than it looks.
 | full prefill, query and KV both varying | 2 **unless tied**, and in a full prefill they are equal, so an equality check collapses them to 1 |
 
 The genuinely two-symbol case is chunked prefill with an independently varying chunk size and KV
-length. Real, but narrower than "any attention model".
+length. Real, but narrower than any attention model.
 
 ## What Phase 2 waits on, none of it design
 
@@ -284,10 +307,10 @@ writing the fix.
 
 Reversing the derivation in the attention decomposition, one change in three call sites.
 
-## Why this is unlike the WSR 1 to WSR 2 transition
+## Why this is unlike the earlier WSR transition
 
-WSR 1 needed a redesign because the **mechanism** was wrong: an indirect, lossy map from names to
-tensor axes. The fix was a different addressing model, not a capability.
+That needed a redesign because the **mechanism** was wrong: an indirect, lossy map from names to tensor
+axes. The fix was a different addressing model, not a capability.
 
 Here the addressing model is "a level divides the tensor it was handed", and nesting is the same
 operation applied to the result. There is no map to get wrong, so there is nothing for a later phase to
@@ -314,15 +337,17 @@ more of that kind, each a hard-coded shape in a validator rather than anything i
 
 # The position in three lines
 
-**Cross-kernel.** Data and layout flow correctly, intermediates land at the maximum, and binaries are
-reused. Only the range needs carrying, and that is one follow-up PR that does not change the interface.
+**Across boundaries.** Data and layout flow correctly, intermediates land at the maximum, and binaries
+are reused. Only the range needs carrying, and that is one follow-up that does not change the
+interface.
 
-**The hint PR.** Its failure was name resolution through a lossy map. There is no name here, a level is
-handed its tensor, and the compiler never reads the declaration. The lesson worth keeping is the
-process one: agree the semantics on one page before building.
+**Against the hint approach.** That declared a size against a name and resolved it through an indirect
+map. This declares a range against a tensor, and a loop level is handed its operand, so there is
+nothing to resolve. The one place the same category of mistake could reach us is the attention tile
+search, and the correction there is known.
 
-**Phase 2.** Not a redesign. Its shape was run on device, the lowering produced the right thing, and
-what stopped it was an assertion we wrote ourselves.
+**Phase 2.** An extension. Its shape was run on device, the lowering produced the right thing, and what
+stopped it was an assertion we wrote ourselves.
 
 Eight experiments. **Every failure mode found is a refusal or a retrace. No path was found that
 compiles, runs and returns a wrong answer.**
