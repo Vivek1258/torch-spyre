@@ -21,6 +21,55 @@ One precision, because it is the thing people misread. The rule is about **deriv
 whether symbols appear. Base addresses are symbolic on every Spyre bundle including ours, and that is
 free. Our verified bundle carries `symbol_ids=[-1]`.
 
+```mermaid
+flowchart LR
+    S["runtime size<br/>128 / 256 / 384 / 512"]
+    TC["loop trip count<br/>s // 64"]
+    ADDR["any address or stride"]
+    ONE["ONE binary<br/>only the loop bound changes"]
+    COST["recomputed every dispatch<br/>about 795us of correction"]
+
+    S -->|"the only road"| TC
+    S -.->|"forbidden"| ADDR
+    TC --> ONE
+    ADDR -.-> COST
+
+    style TC fill:#d8f5d8,stroke:#2a7
+    style ONE fill:#d8f5d8,stroke:#2a7
+    style ADDR fill:#fadbd8,stroke:#c0392b
+    style COST fill:#fadbd8,stroke:#c0392b
+```
+
+### What that looks like in memory
+
+The buffer is reserved once, at the declared maximum, with max strides. The loop walks a prefix of it.
+
+```mermaid
+flowchart TB
+    subgraph BUF["one HBM buffer, reserved at max = 512 rows, strides fixed"]
+        direction LR
+        T0["tile 0"] --- T1["tile 1"] --- T2["tile 2"] --- T3["tile 3"] --- T4["tile 4"] --- T5["tile 5"] --- T6["tile 6"] --- T7["tile 7"]
+    end
+    C128["call at 128 rows<br/>trip count 2"] --> T0
+    C512["call at 512 rows<br/>trip count 8"] --> T0
+
+    style T0 fill:#d8f5d8,stroke:#2a7
+    style T1 fill:#d8f5d8,stroke:#2a7
+    style T2 fill:#eee,stroke:#999
+    style T3 fill:#eee,stroke:#999
+    style T4 fill:#eee,stroke:#999
+    style T5 fill:#eee,stroke:#999
+    style T6 fill:#eee,stroke:#999
+    style T7 fill:#eee,stroke:#999
+```
+
+Green is what a 128-row call touches. A 512-row call touches all eight. **Same buffer, same strides,
+same addresses, same binary.** The only difference is where the loop stops.
+
+That is also why the maximum has to be in the allocation. Geometry is built for eight tiles, so if the
+buffer were only two tiles long the eighth address would point at memory that does not belong to it,
+and nothing downstream would catch it.
+
 Everything below is a consequence of that one rule, or a test of it.
 
 ---
@@ -142,6 +191,30 @@ and the same with stage 0 taking a different branch.
 | range on stage 0 only | refuse at stage 2 | refuse at stage 2 | refuse at stage 2 | refuse at stage 2 |
 
 Identical behaviour, byte-identical message. Region identity is irrelevant.
+
+### The split, in one picture
+
+```mermaid
+flowchart LR
+    subgraph R1["compiled region 1"]
+        A["symbol s77<br/>range 128..512 lives here<br/>as ShapeEnv facts"]
+    end
+    MID["intermediate tensor<br/>max sized, 65536 bytes<br/>device layout identical at every size<br/>weak dynamic mark on dim 0<br/>NO declaration"]
+    subgraph R2["compiled region 2"]
+        B["FRESH symbol<br/>range 2..infinity<br/>refuses: no finite upper bound"]
+    end
+
+    A -->|"tensor flows"| MID
+    MID -->|"dim 0 is dynamic here"| B
+    A -.->|"the range cannot travel<br/>a ShapeEnv does not leave its compile"| B
+
+    style A fill:#d8f5d8,stroke:#2a7
+    style MID fill:#d8f5d8,stroke:#2a7
+    style B fill:#fadbd8,stroke:#c0392b
+```
+
+The data path is green all the way. The dotted line is the only thing missing, and it is the whole of
+the follow-up work.
 
 ### The split, stated as a design property
 
@@ -402,9 +475,71 @@ Reversing the derivation in the attention decomposition, one change in three cal
 
 ## 8. What happens with two or three symbolic dimensions
 
-The two cases get conflated and behave differently.
+The two cases get conflated and behave very differently.
 
-**Same dimension, two levels.** One symbol. The inner count is a literal. Nothing new.
+```mermaid
+flowchart TB
+    subgraph SAME["CASE A: two levels over the SAME dimension"]
+        direction TB
+        A1["outer level<br/>gets x, rows = s77<br/>tiles at 64<br/>count = s77 // 64   SYMBOLIC"]
+        A2["inner level<br/>is HANDED the 64-row tile<br/>tiles at 32<br/>count = 2   LITERAL"]
+        A3["ONE symbol in the kernel<br/>one binary for the whole range"]
+        A1 --> A2 --> A3
+    end
+
+    subgraph DIFF["CASE B: two levels over DIFFERENT dimensions"]
+        direction TB
+        B1["outer level<br/>gets x, rows = s77<br/>tiles at 64<br/>count = s77 // 64   SYMBOLIC"]
+        B2["inner level<br/>is handed y WHOLE, rows = s17<br/>tiles at 64<br/>count = s17 // 64   SYMBOLIC"]
+        B3["TWO symbols<br/>lowers correctly, both counts emitted<br/>refused at launch by our own step check"]
+        B1 --> B2 --> B3
+    end
+
+    style A3 fill:#d8f5d8,stroke:#2a7
+    style B3 fill:#fdebd0,stroke:#d68910
+```
+
+**Case A is free.** The inner level's extent is the outer tile, which is a literal, so its count is a
+literal. Nothing symbolic is added.
+
+**Case B is the real Phase 2 shape.** It is amber rather than red because the compiler already does it
+correctly. What stops it is one assertion we wrote.
+
+### The code, from the arms that were run
+
+Case A, the same-dimension nest. Notice the inner call receives `x_tile`, not `x`:
+
+```python
+def outer_body(_c, tiles):
+    x_tile, w_whole = tiles          # x_tile is 64 rows, a literal
+
+    def inner_body(_ic, inner):
+        xi, wi = inner
+        return None, xi + torch.nn.functional.gelu(xi @ wi)
+
+    _ic, inner_out = for_each_tile(
+        inner_body, (x_tile, w_whole),   # <- the TILE is the operand
+        dims=(0, None), tile_size=inner_tile, out_dim=0,
+    )
+    return None, inner_out
+```
+
+Case B, two different dimensions. The inner level receives `y_whole`, so it sees `y`'s full extent and
+there is no units shift at all:
+
+```python
+def outer_body(_c, tiles):
+    x_tile, y_whole = tiles          # y is untouched by the outer level
+
+    def inner_body(acc, inner):
+        (y_tile,) = inner
+        return acc + y_tile.sum(0), None
+    ...
+```
+
+**That contrast is the whole argument.** A level divides the tensor it was handed. In case A it was
+handed a tile, so its units are the tile's. In case B it was handed a whole tensor, so its units are
+that tensor's. Neither one resolves a name, so neither can be in the wrong units.
 
 **Different dimensions, both symbolic.** Two symbols, both emitted correctly. The data flow argument
 still holds: level 2 receives a tensor whose dim 0 has already been reduced to the outer tile, a
@@ -543,6 +678,63 @@ Whether the device cost model prices the declared maximum rather than the call.
 Whether three nested symbolic levels work, and whether anything needs them.
 
 ---
+
+## The experiments, and what each one settled
+
+```mermaid
+flowchart TB
+    Q["Does the design hold?"]
+
+    Q --> E1["1. cross-kernel chain<br/>no failure. intermediates land at max"]
+    Q --> E2["2. four design decisions<br/>range needed in every region"]
+    Q --> E3["3. region identity<br/>irrelevant. four spellings, same result"]
+    Q --> E4["4. which axis<br/>effectively outermost only"]
+    Q --> E5["5. cache reload<br/>symbolic survives. static does not"]
+    Q --> E6["6. attention extent<br/>ONE defect, not three"]
+    Q --> E7["7. granularity mismatch<br/>always refuses. no cross-check needed"]
+    Q --> E8["8. nesting units<br/>safe structurally. one symbol per dimension"]
+
+    E1 --> V["Every failure mode found is<br/>a REFUSAL or a RETRACE.<br/>Nothing compiles, runs and<br/>returns a wrong answer."]
+    E2 --> V
+    E3 --> V
+    E4 --> V
+    E5 --> V
+    E6 --> V
+    E7 --> V
+    E8 --> V
+
+    style V fill:#d8f5d8,stroke:#2a7
+```
+
+## Where the work stands
+
+```mermaid
+flowchart LR
+    subgraph BUILT["built and measured"]
+        P1["one symbolic dimension<br/>outermost axis<br/>one or more loop levels<br/>one binary across the range"]
+    end
+    subgraph CAP["capability work, not design"]
+        C1["reservation on a<br/>non-outermost axis"]
+        C2["relax our own<br/>job-plan step check"]
+    end
+    subgraph DEF["one defect"]
+        D1["attention derivation<br/>one change, three call sites"]
+    end
+    subgraph P2["Phase 2"]
+        X["multi-dimensional symbolic<br/>variable sequence length"]
+    end
+
+    P1 --> C1 --> X
+    P1 --> C2 --> X
+    P1 --> D1 --> X
+
+    style BUILT fill:#d8f5d8,stroke:#2a7
+    style CAP fill:#fdebd0,stroke:#d68910
+    style DEF fill:#fdebd0,stroke:#d68910
+```
+
+Nothing in the amber boxes is a design question. Two are capabilities that were never built, one is a
+defect with a known fix.
 
 ## The summary that fits on one slide
 
