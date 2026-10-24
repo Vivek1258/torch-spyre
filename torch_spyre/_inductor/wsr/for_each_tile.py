@@ -329,7 +329,7 @@ def _stacked_to_full(ys: torch.Tensor, dim: int) -> torch.Tensor:
     That removes one source of the split, not the split itself: torch's own
     tensor-metadata extraction evaluates the same predicate eagerly further down,
     so a single-tile call still compiles separately.
-    
+
     """
     # as_strided takes the strides on trust, so only take it when the leading
     # axes are PROVABLY contiguous. statically_known_true so the test itself
