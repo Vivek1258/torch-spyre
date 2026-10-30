@@ -37,7 +37,11 @@ from torch._higher_order_ops.scan import scan
 from torch.fx.experimental.symbolic_shapes import statically_known_true
 from torch.utils._pytree import keystr, tree_leaves, tree_map_with_path
 
+from ..logging_utils import get_inductor_logger
+
 __all__ = ["Gather", "for_each_tile"]
+
+logger = get_inductor_logger("wsr.for_each_tile")
 
 
 @dataclass(frozen=True)
@@ -333,9 +337,24 @@ def _stacked_to_full(ys: torch.Tensor, dim: int) -> torch.Tensor:
     # as_strided takes the strides on trust, so only take it when the leading
     # axes are PROVABLY contiguous. statically_known_true so the test itself
     # installs no guard. Otherwise flatten: slower to specialise, never wrong.
-    if dim == 0 and statically_known_true(ys.stride(0) == ys.size(1) * ys.stride(1)):
-        folded = (ys.size(0) * ys.size(1), *ys.shape[2:])
-        return ys.as_strided(folded, ys.stride()[1:])
+    # as_strided keeps the storage offset, and a fold that only merges the two
+    # leading axes is an ordinary view, so eager and autograd see the same
+    # tensor either way.
+    if dim == 0:
+        if statically_known_true(ys.stride(0) == ys.size(1) * ys.stride(1)):
+            folded = (ys.size(0) * ys.size(1), *ys.shape[2:])
+            return ys.as_strided(folded, ys.stride()[1:])
+        # Eager only: a logger call while Dynamo traces is a graph break, which a
+        # fullgraph compile turns into an error. A traced fold of scan's stacked
+        # output always has provably contiguous leading axes, so the traced path
+        # does not reach this branch for an output for_each_tile builds itself.
+        if not torch.compiler.is_dynamo_compiling():
+            logger.debug(
+                "for_each_tile output fold: leading axes of shape %s, strides %s "
+                "are not provably contiguous, folding with flatten",
+                tuple(ys.shape),
+                tuple(ys.stride()),
+            )
     return _movedim(ys, 0, dim).flatten(dim, dim + 1)
 
 

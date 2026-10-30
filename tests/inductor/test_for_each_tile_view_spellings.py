@@ -45,6 +45,12 @@ from torch_spyre._inductor.wsr.for_each_tile import (
     _tile_size_vector,
     _xs_leaf,
 )
+from torch_spyre._inductor.wsr.for_each_tile import logger as fold_logger
+
+
+def _not_foldable_by_view():
+    """[4, 2, 6] whose two leading axes cannot merge by strides: stride 6 != 2 * 24."""
+    return torch.arange(2 * 4 * 6, dtype=torch.float32).reshape(2, 4, 6).transpose(0, 1)
 
 
 def _slice_spec(shape, dim, extent, num_tiles):
@@ -109,12 +115,71 @@ class TestConcreteBehaviourUnchanged(unittest.TestCase):
 
     def test_a_non_contiguous_leading_axis_falls_back_and_is_still_correct(self):
         # as_strided would take the strides on trust here and be wrong, so the
-        # contiguity test has to send this down the flatten path.
-        ys = torch.arange(4 * 2 * 6, dtype=torch.float32).reshape(4, 2, 6)[:, ::2]
+        # contiguity test has to send this down the flatten path. The log line
+        # proves the fallback was taken, not just that the values agree.
+        ys = _not_foldable_by_view()
+
+        with self.assertLogs(fold_logger, level="DEBUG") as captured:
+            folded = _stacked_to_full(ys, 0)
+
+        torch.testing.assert_close(folded, ys.flatten(0, 1))
+        self.assertTrue(any("folding with flatten" in m for m in captured.output))
+
+    def test_the_view_path_logs_nothing(self):
+        ys = torch.arange(4 * 2 * 6, dtype=torch.float32).reshape(4, 2, 6)
+
+        with self.assertNoLogs(fold_logger, level="DEBUG"):
+            _stacked_to_full(ys, 0)
+
+    def test_a_nonzero_storage_offset_is_kept(self):
+        base = torch.arange(5 * 2 * 6, dtype=torch.float32).reshape(5, 2, 6)
+        ys = base[1:]
+        self.assertGreater(ys.storage_offset(), 0)
 
         folded = _stacked_to_full(ys, 0)
 
         torch.testing.assert_close(folded, ys.flatten(0, 1))
+        self.assertEqual(folded.storage_offset(), ys.storage_offset())
+        self.assertIs(folded.untyped_storage(), ys.untyped_storage())
+
+    def test_non_contiguous_inner_axes_still_fold_as_a_view(self):
+        # Only the two leading axes have to merge. Inner strides are carried as-is.
+        base = torch.arange(4 * 2 * 6 * 5, dtype=torch.float32).reshape(4, 2, 6, 5)
+        ys = base.transpose(2, 3)
+        self.assertFalse(ys.is_contiguous())
+
+        folded = _stacked_to_full(ys, 0)
+
+        torch.testing.assert_close(folded, ys.flatten(0, 1))
+        self.assertEqual(tuple(folded.shape), (8, 5, 6))
+        self.assertIs(folded.untyped_storage(), ys.untyped_storage())
+
+    def test_autograd_through_the_view_path_matches_flatten(self):
+        base = torch.arange(4 * 2 * 6, dtype=torch.float32).reshape(4, 2, 6)
+        weight = torch.arange(8 * 6, dtype=torch.float32).reshape(8, 6)
+        ys = base.clone().requires_grad_(True)
+        ref = base.clone().requires_grad_(True)
+
+        (_stacked_to_full(ys, 0) * weight).sum().backward()
+        (ref.flatten(0, 1) * weight).sum().backward()
+
+        torch.testing.assert_close(ys.grad, ref.grad)
+
+
+class TestFoldInsideACompile(unittest.TestCase):
+    """The fallback's log line must not break a fullgraph compile.
+
+    A logger call while Dynamo traces is a graph break, which fullgraph=True
+    turns into an error, so the log is guarded to eager. This pins the guard.
+    """
+
+    def test_the_fallback_compiles_under_fullgraph(self):
+        ys = _not_foldable_by_view()
+        compiled = torch.compile(
+            lambda y: _stacked_to_full(y, 0), fullgraph=True, backend="eager"
+        )
+
+        torch.testing.assert_close(compiled(ys), ys.flatten(0, 1))
 
 
 class TestSymbolicTileExtent(unittest.TestCase):
