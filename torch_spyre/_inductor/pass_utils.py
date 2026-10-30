@@ -385,7 +385,7 @@ def compute_granularity(expr: Expr, max_size: int) -> int:
     Deprecated. The explicit-loop route supersedes this one and never calls it:
     there G comes from ``for_each_tile(tile_size=G)`` through the trip count, so
     the bundle's declared granularity and the loop's own step cannot disagree.
-    TODO(vivekmankar): remove with the rest of the symbolic-SDSC route.
+    TODO(issue#5890): remove with the rest of the symbolic-SDSC route.
 
     Admissible runtime values are ``{G, 2G, ..., max_size}``. If the
     user passed ``mark_dynamic(min=...)`` we honour it after validation;
