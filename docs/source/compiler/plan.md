@@ -1,13 +1,13 @@
 ```mermaid
 flowchart LR
-    subgraph done["Done on main"]
+    subgraph done["Done on main (phase 1 foundations)"]
         A["#5179 declaration<br/>5 Nov"] --> B["#5891 #5912 #5917 #6066<br/>one binary per declared range<br/>12 Nov"]
     end
 
     B --> C["Close out<br/>#5186 and the nine done issues"]
     B --> D["File three issues<br/>max_buckets default,<br/>compile half of #6232,<br/>reference test with #2279"]
 
-    subgraph p1["Phase 1. Exit: the serving team builds on torch-spyre main"]
+    subgraph p1["Phase 1 Exit: the serving team builds on torch-spyre main"]
         direction LR
         subgraph gopi1["Gopi"]
             G1["#5578 refuse dynamic=True<br/>changes requested"] --> G2["#6135 remove the old route<br/>out of draft, review"]
