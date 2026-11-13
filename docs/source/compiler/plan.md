@@ -20,6 +20,8 @@ flowchart LR
         end
         subgraph vivek1["Vivek"]
             V1["#6027 declaration with a custom layout"]
+        end
+            X["max_buckets default raised<br/>small PR, owner open"]
     end
 
     subgraph serving["Serving team"]
@@ -27,7 +29,6 @@ flowchart LR
     end
 
     subgraph p2["Phase 2"]
-        X["max_buckets default raised<br/>small PR, owner open"]
         G3["#5579 in-loop gather<br/>rebase onto main, Gopi"] --> G4["#6232 compile half<br/>device-read loop count, Gopi with the backend"]
         R3["#6026 slow partial copy<br/>Reeva"]
     end
