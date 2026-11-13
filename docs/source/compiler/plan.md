@@ -19,9 +19,9 @@ flowchart LR
             N1["#6029 contract across outputs<br/>raise the PR"] --> N2["#6030 clone on a declared tensor"]
         end
         subgraph vivek1["Vivek"]
-            V1["#6027 declaration with a custom layout"]
+            V1["#6027 declaration with a custom layout"] --> X["max_buckets default raised<br/>small PR, owner open"]
         end
-            X["max_buckets default raised<br/>small PR, owner open"]
+            
     end
 
     subgraph serving["Serving team"]
